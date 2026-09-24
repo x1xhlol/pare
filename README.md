@@ -1,6 +1,9 @@
 # Pare
 
-Video compression that runs entirely in the browser. Drop in a video and Pare:
+Video compression that runs entirely in the browser. It has two encoders:
+
+- **Thorough** (default): x264 compiled to WebAssembly (ffmpeg.wasm), at CRF 18/22/26. The video is split at frame midpoints into chunks, encoded by one single-threaded worker per spare core, then stitched with Mediabunny so every frame keeps its exact source timestamp.
+- **Fast**: the browser's built-in WebCodecs encoder (often hardware). Pare:
 
 1. Encodes a few short samples at different bitrates with the browser's own encoder (WebCodecs, via [Mediabunny](https://mediabunny.dev)) and scores each against the source with SSIM, searching for the lowest bitrate that meets the chosen quality target.
 2. Encodes the full video at that bitrate.

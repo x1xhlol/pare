@@ -169,6 +169,8 @@ export type Calibration = {
   target: number
   /** False when even the largest allowed bitrate fell short of the target. */
   reached: boolean
+  /** Set when the size comes from x264 at a constant rate factor instead of a bitrate search. */
+  crf?: number
 }
 
 type Segment = {

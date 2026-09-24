@@ -3,8 +3,12 @@ import type { AudioCodec, VideoCodec } from 'mediabunny'
 export type Preset = 'visually-lossless' | 'high' | 'compact' | 'copy'
 export type OutputCodec = 'avc' | 'hevc' | 'av1'
 
+/** 'thorough' runs x264 in WebAssembly; 'fast' uses the browser's built-in (often hardware) encoder. */
+export type Engine = 'thorough' | 'fast'
+
 export type Settings = {
   preset: Preset
+  engine: Engine
   codec: OutputCodec
   /** Target length of the short side in pixels, or null to keep the source resolution. */
   shortSide: number | null

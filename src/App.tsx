@@ -3,9 +3,10 @@ import { Choice, type Option } from './components/Choice'
 import { Compare } from './components/Compare'
 import * as fmt from './lib/format'
 import type { Calibration, Job, Progress, QualityReport } from './lib/media'
-import { CODEC_LABEL, outputSize, type OutputCodec, type Preset, type Probe, type Settings } from './lib/shared'
+import { CODEC_LABEL, outputSize, type Engine, type OutputCodec, type Preset, type Probe, type Settings } from './lib/shared'
 
 const media = () => import('./lib/media')
+const x264 = () => import('./lib/x264')
 
 type Phase =
   | { kind: 'empty'; error?: string }
@@ -17,7 +18,9 @@ type Phase =
 type Tuning = { round: number } | { result: Calibration } | { error: string }
 type CalibrationEntry = { promise: Promise<Calibration>; controller: AbortController; result?: Calibration }
 
-const settingsKey = (s: Settings) => `${s.preset}|${s.codec}|${s.shortSide}|${s.keepAudio}`
+const usesX264 = (s: Settings) => s.engine === 'thorough' && s.preset !== 'copy'
+const settingsKey = (s: Settings) =>
+  `${s.preset}|${usesX264(s) ? 'x264' : s.codec}|${s.shortSide}|${s.keepAudio}`
 const isAbort = (err: unknown) => err instanceof Error && (err.name === 'AbortError' || err.name === 'ConversionCanceledError')
 
 const supported = typeof window !== 'undefined' && 'VideoEncoder' in window && 'VideoDecoder' in window
@@ -37,6 +40,17 @@ const PRESETS: { value: Preset; label: string; hint: string }[] = [
   },
 ]
 
+const ENGINES: Option<Engine>[] = [
+  { value: 'thorough', label: 'Thorough' },
+  { value: 'fast', label: 'Fast' },
+]
+
+const ENGINE_HINT: Record<Engine, string> = {
+  thorough:
+    'x264, the encoder inside HandBrake and ffmpeg, running on every CPU core. The smallest files for the quality. H.264 output plays everywhere.',
+  fast: "Your browser's built-in encoder, often hardware-accelerated. Several times quicker, but files come out larger at the same quality.",
+}
+
 const CODEC_HINT: Record<OutputCodec, string> = {
   avc: 'Plays everywhere.',
   hevc: 'About 40% smaller than H.264. Plays on Apple devices, Windows, and Chrome.',
@@ -51,6 +65,7 @@ export default function App() {
   const [phase, setPhase] = useState<Phase>({ kind: 'empty' })
   const [settings, setSettings] = useState<Settings>({
     preset: 'visually-lossless',
+    engine: 'thorough',
     codec: 'avc',
     shortSide: null,
     keepAudio: true,
@@ -125,7 +140,13 @@ export default function App() {
     }
     const entry: CalibrationEntry = {
       controller,
-      promise: media().then((m) => m.calibrate(probe, settings, controller.signal, onRound)),
+      promise: usesX264(settings)
+        ? x264().then(async (m) => {
+            const size = await m.estimate(probe, settings, controller.signal)
+            const crf = m.CRF[settings.preset as Exclude<Preset, 'copy'>]
+            return { bitrate: 0, size, ssim: 0, target: 0, reached: true, crf }
+          })
+        : media().then((m) => m.calibrate(probe, settings, controller.signal, onRound)),
     }
     entry.promise.then(
       (result) => {
@@ -182,13 +203,24 @@ export default function App() {
       else setPhase({ kind: 'ready', probe })
     }
     setPhase({ kind: 'running', probe, progress: null })
+    const onProgress = (progress: Progress) => setPhase((p) => (p.kind === 'running' ? { ...p, progress } : p))
     try {
-      const { bitrate } = await ensureCalibration(probe, settings).promise
-      if (run.canceled) return
-      const { compress, measureQuality } = await media()
-      run.job = compress(probe, settings, bitrate, (progress) =>
-        setPhase((p) => (p.kind === 'running' ? { ...p, progress } : p)),
-      )
+      if (usesX264(settings)) {
+        // The size estimate competes with the encode for the same cores, so drop it if it's still running.
+        const pending = calibrations.current.get(key)
+        if (pending && !pending.result) {
+          pending.controller.abort()
+          calibrations.current.delete(key)
+        }
+        const engine = await x264()
+        if (run.canceled) return
+        run.job = engine.encode(probe, settings, onProgress)
+      } else {
+        const { bitrate } = await ensureCalibration(probe, settings).promise
+        if (run.canceled) return
+        run.job = (await media()).compress(probe, settings, bitrate, onProgress)
+      }
+      const { measureQuality } = await media()
       const blob = await run.job.promise
       const url = URL.createObjectURL(blob)
       setPhase({ kind: 'done', probe, blob, url, quality: settings.preset === 'copy' ? 'failed' : 'pending' })
@@ -196,7 +228,10 @@ export default function App() {
       const quality = await measureQuality(probe, blob).catch(() => 'failed' as const)
       setPhase((p) => (p.kind === 'done' && p.blob === blob ? { ...p, quality } : p))
     } catch (err) {
-      if (run.canceled && !run.job) return
+      if (run.canceled) {
+        if (run.job) setPhase({ kind: 'ready', probe })
+        return
+      }
       setPhase({ kind: 'ready', probe, error: isAbort(err) ? undefined : `Compression failed. ${message(err)}` })
     } finally {
       cancelRun.current = null
@@ -414,7 +449,7 @@ function Ready(props: {
   const copy = settings.preset === 'copy'
   const short = Math.min(probe.width, probe.height)
   const target = outputSize(probe, settings.shortSide)
-  const noEncoder = !copy && !probe.encodable[settings.codec]
+  const noEncoder = !copy && settings.engine === 'fast' && !probe.encodable[settings.codec]
 
   const resolutions: Option<string>[] = [
     { value: 'original', label: `Original` },
@@ -452,19 +487,24 @@ function Ready(props: {
           hint={PRESETS.find((p) => p.value === settings.preset)?.hint}
         />
         <Choice
-          legend="Format"
-          value={settings.codec}
-          options={codecs}
+          legend="Encoder"
+          value={settings.engine}
+          options={ENGINES}
           disabled={copy}
-          onChange={(codec) => setSettings((s) => ({ ...s, codec }))}
-          hint={
-            copy
-              ? `Keeps the original ${CODEC_LABEL[probe.videoCodec ?? ''] ?? 'video'} stream.`
-              : [CODEC_HINT[settings.codec], unavailable.length ? `${unavailable.join(' and ')} can't be encoded in this browser.` : '']
-                  .filter(Boolean)
-                  .join(' ')
-          }
+          onChange={(engine) => setSettings((s) => ({ ...s, engine }))}
+          hint={copy ? 'Not used. Nothing is re-encoded.' : ENGINE_HINT[settings.engine]}
         />
+        {settings.engine === 'fast' && !copy && (
+          <Choice
+            legend="Format"
+            value={settings.codec}
+            options={codecs}
+            onChange={(codec) => setSettings((s) => ({ ...s, codec }))}
+            hint={[CODEC_HINT[settings.codec], unavailable.length ? `${unavailable.join(' and ')} can't be encoded in this browser.` : '']
+              .filter(Boolean)
+              .join(' ')}
+          />
+        )}
         <Choice
           legend="Resolution"
           value={settings.shortSide ? String(settings.shortSide) : 'original'}
@@ -500,10 +540,14 @@ function Ready(props: {
           ) : tuning && 'error' in tuning ? (
             <span className="estimate-value unavailable">Not available</span>
           ) : (
-            <span className="estimate-value pending">Tuning to this video…</span>
+            <span className="estimate-value pending">
+              {settings.engine === 'thorough' && !copy ? 'Estimating…' : 'Tuning to this video…'}
+            </span>
           )}
           <span className="estimate-detail">
-            {result && !copy
+            {result?.crf
+              ? `x264 CRF ${result.crf}, from test clips`
+              : result && !copy
               ? `SSIM ${result.ssim.toFixed(3)} on test clips at ${fmt.bitrate(result.bitrate)}`
               : tuning && 'round' in tuning && tuning.round > 0
                 ? `Test encode ${tuning.round}`
@@ -523,6 +567,12 @@ function Ready(props: {
           {better.length
             ? `${better.map((c) => CODEC_LABEL[c]).join(' or ')} should do better.`
             : 'A lower quality setting will make it smaller.'}
+        </p>
+      )}
+      {result?.crf && result.size > probe.file.size * 0.95 && (
+        <p className="note">
+          This video is already compressed about as tightly as x264 manages at {presetLabel} quality. Compact or a
+          smaller resolution will shrink it.
         </p>
       )}
       {tuning && 'error' in tuning && (
