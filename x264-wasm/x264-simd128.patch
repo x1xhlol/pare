@@ -1,0 +1,1771 @@
+diff --git a/common/cpu.c b/common/cpu.c
+index 73900db..f07a942 100644
+--- a/common/cpu.c
++++ b/common/cpu.c
+@@ -106,6 +106,9 @@ const x264_cpu_name_t x264_cpu_names[] =
+ #elif ARCH_LOONGARCH
+     {"LSX",             X264_CPU_LSX},
+     {"LASX",            X264_CPU_LASX},
++#endif
++#if HAVE_SIMD128
++    {"SIMD128",         X264_CPU_SIMD128},
+ #endif
+     {"", 0},
+ };
+@@ -626,7 +629,11 @@ uint32_t x264_cpu_detect( void )
+ 
+ uint32_t x264_cpu_detect( void )
+ {
++#if HAVE_SIMD128
++    return X264_CPU_SIMD128;
++#else
+     return 0;
++#endif
+ }
+ 
+ #endif
+diff --git a/common/dct.c b/common/dct.c
+index b208e26..0f77427 100644
+--- a/common/dct.c
++++ b/common/dct.c
+@@ -474,6 +474,10 @@ static void add16x16_idct_dc( pixel *p_dst, dctcoef dct[16] )
+ /****************************************************************************
+  * x264_dct_init:
+  ****************************************************************************/
++#if HAVE_SIMD128 && !HIGH_BIT_DEPTH
++#include "wasm/dct-simd128.c"
++#endif
++
+ void x264_dct_init( uint32_t cpu, x264_dct_function_t *dctf )
+ {
+     dctf->sub4x4_dct    = sub4x4_dct;
+@@ -774,6 +778,10 @@ void x264_dct_init( uint32_t cpu, x264_dct_function_t *dctf )
+ #endif
+ 
+ #endif // HIGH_BIT_DEPTH
++#if HAVE_SIMD128 && !HIGH_BIT_DEPTH
++    if( cpu&X264_CPU_SIMD128 )
++        x264_dct_init_simd128( dctf );
++#endif
+ }
+ 
+ 
+diff --git a/common/deblock.c b/common/deblock.c
+index acd9459..30cc11e 100644
+--- a/common/deblock.c
++++ b/common/deblock.c
+@@ -684,6 +684,10 @@ void x264_macroblock_deblock( x264_t *h )
+ #include "loongarch/deblock.h"
+ #endif
+ 
++#if HAVE_SIMD128 && !HIGH_BIT_DEPTH
++#include "wasm/deblock-simd128.c"
++#endif
++
+ void x264_deblock_init( uint32_t cpu, x264_deblock_function_t *pf, int b_mbaff )
+ {
+     pf->deblock_luma[1] = deblock_v_luma_c;
+@@ -848,4 +852,8 @@ void x264_deblock_init( uint32_t cpu, x264_deblock_function_t *pf, int b_mbaff )
+     /* These functions are equivalent, so don't duplicate them. */
+     pf->deblock_chroma_422_mbaff = pf->deblock_h_chroma_420;
+     pf->deblock_chroma_422_intra_mbaff = pf->deblock_h_chroma_420_intra;
++#if HAVE_SIMD128 && !HIGH_BIT_DEPTH
++    if( cpu&X264_CPU_SIMD128 )
++        x264_deblock_init_simd128( pf );
++#endif
+ }
+diff --git a/common/mc.c b/common/mc.c
+index ae81ce4..62f081c 100644
+--- a/common/mc.c
++++ b/common/mc.c
+@@ -610,6 +610,10 @@ static void mbtree_fix8_unpack( float *dst, uint16_t *src, int count )
+         dst[i] = (int16_t)endian_fix16( src[i] ) * (1.0f/256.0f);
+ }
+ 
++#if HAVE_SIMD128 && !HIGH_BIT_DEPTH
++#include "wasm/mc-simd128.c"
++#endif
++
+ void x264_mc_init( uint32_t cpu, x264_mc_functions_t *pf, int cpu_independent )
+ {
+     pf->mc_luma   = mc_luma;
+@@ -694,6 +698,11 @@ void x264_mc_init( uint32_t cpu, x264_mc_functions_t *pf, int cpu_independent )
+     x264_mc_init_loongarch( cpu, pf );
+ #endif
+ 
++#if HAVE_SIMD128 && !HIGH_BIT_DEPTH
++    if( cpu&X264_CPU_SIMD128 )
++        x264_mc_init_simd128( pf );
++#endif
++
+     if( cpu_independent )
+     {
+         pf->mbtree_propagate_cost = mbtree_propagate_cost;
+diff --git a/common/pixel.c b/common/pixel.c
+index 2f91bd3..67c48a1 100644
+--- a/common/pixel.c
++++ b/common/pixel.c
+@@ -803,6 +803,10 @@ static int x264_pixel_ads1( int enc_dc[1], uint16_t *sums, int delta,
+ }
+ 
+ 
++#if HAVE_SIMD128 && !HIGH_BIT_DEPTH
++static void x264_pixel_init_simd128( x264_pixel_function_t *pixf );
++#endif
++
+ /****************************************************************************
+  * x264_pixel_init:
+  ****************************************************************************/
+@@ -1656,6 +1660,10 @@ void x264_pixel_init( uint32_t cpu, x264_pixel_function_t *pixf )
+         x264_pixel_init_altivec( pixf );
+     }
+ #endif
++#if HAVE_SIMD128 && !HIGH_BIT_DEPTH
++    if( cpu&X264_CPU_SIMD128 )
++        x264_pixel_init_simd128( pixf );
++#endif
+ 
+     pixf->ads[PIXEL_8x16] =
+     pixf->ads[PIXEL_8x4] =
+@@ -1663,3 +1671,7 @@ void x264_pixel_init( uint32_t cpu, x264_pixel_function_t *pixf )
+     pixf->ads[PIXEL_4x4] = pixf->ads[PIXEL_8x8];
+ }
+ 
++
++#if HAVE_SIMD128 && !HIGH_BIT_DEPTH
++#include "wasm/pixel-simd128.c"
++#endif
+diff --git a/common/quant.c b/common/quant.c
+index 21bb295..e7944ae 100644
+--- a/common/quant.c
++++ b/common/quant.c
+@@ -411,6 +411,10 @@ level_run(16)
+ #define INIT_TRELLIS(...)
+ #endif
+ 
++#if HAVE_SIMD128 && !HIGH_BIT_DEPTH
++#include "wasm/quant-simd128.c"
++#endif
++
+ void x264_quant_init( x264_t *h, uint32_t cpu, x264_quant_function_t *pf )
+ {
+     pf->quant_8x8 = quant_8x8;
+@@ -885,4 +889,8 @@ void x264_quant_init( x264_t *h, uint32_t cpu, x264_quant_function_t *pf )
+     pf->coeff_level_run[DCT_CHROMAU_4x4] = pf->coeff_level_run[DCT_CHROMAV_4x4] = pf->coeff_level_run[DCT_LUMA_4x4];
+     pf->coeff_level_run[DCT_CHROMA_AC]   = pf->coeff_level_run[DCT_CHROMAU_AC]  =
+     pf->coeff_level_run[DCT_CHROMAV_AC]  = pf->coeff_level_run[DCT_LUMA_AC];
++#if HAVE_SIMD128 && !HIGH_BIT_DEPTH
++    if( cpu&X264_CPU_SIMD128 )
++        x264_quant_init_simd128( pf );
++#endif
+ }
+diff --git a/common/wasm/dct-simd128.c b/common/wasm/dct-simd128.c
+new file mode 100644
+index 0000000..d3e8c08
+--- /dev/null
++++ b/common/wasm/dct-simd128.c
+@@ -0,0 +1,265 @@
++/*****************************************************************************
++ * dct-simd128.c: WebAssembly SIMD128 transforms (8-bit only)
++ *****************************************************************************
++ * Included from common/dct.c. The C transforms run a 1D pass, transpose, and
++ * run another 1D pass. Here every 1D pass is lane-wise across row vectors and
++ * the transposes are shuffles; two 4x4 blocks share one 8-lane vector.
++ * Intermediates fit in 16 bits for conforming streams, as in the x86 asm.
++ *****************************************************************************/
++
++#include <wasm_simd128.h>
++
++#define ALWAYS_INLINE static inline __attribute__((always_inline))
++
++/* Transposes the two 4x4 blocks held in lanes 0-3 and 4-7 of v[0..3]. */
++ALWAYS_INLINE void transpose4x4x2( v128_t v[4] )
++{
++    v128_t t0 = wasm_i16x8_shuffle( v[0], v[1], 0, 8, 1, 9, 4, 12, 5, 13 );
++    v128_t t1 = wasm_i16x8_shuffle( v[0], v[1], 2, 10, 3, 11, 6, 14, 7, 15 );
++    v128_t t2 = wasm_i16x8_shuffle( v[2], v[3], 0, 8, 1, 9, 4, 12, 5, 13 );
++    v128_t t3 = wasm_i16x8_shuffle( v[2], v[3], 2, 10, 3, 11, 6, 14, 7, 15 );
++    v[0] = wasm_i32x4_shuffle( t0, t2, 0, 4, 2, 6 );
++    v[1] = wasm_i32x4_shuffle( t0, t2, 1, 5, 3, 7 );
++    v[2] = wasm_i32x4_shuffle( t1, t3, 0, 4, 2, 6 );
++    v[3] = wasm_i32x4_shuffle( t1, t3, 1, 5, 3, 7 );
++}
++
++ALWAYS_INLINE void transpose8x8( v128_t v[8] )
++{
++    v128_t a[8], b[8];
++    for( int i = 0; i < 8; i += 2 )
++    {
++        a[i]   = wasm_i16x8_shuffle( v[i], v[i+1], 0, 8, 1, 9, 2, 10, 3, 11 );
++        a[i+1] = wasm_i16x8_shuffle( v[i], v[i+1], 4, 12, 5, 13, 6, 14, 7, 15 );
++    }
++    for( int i = 0; i < 8; i += 4 )
++    {
++        b[i]   = wasm_i32x4_shuffle( a[i],   a[i+2], 0, 4, 1, 5 );
++        b[i+1] = wasm_i32x4_shuffle( a[i],   a[i+2], 2, 6, 3, 7 );
++        b[i+2] = wasm_i32x4_shuffle( a[i+1], a[i+3], 0, 4, 1, 5 );
++        b[i+3] = wasm_i32x4_shuffle( a[i+1], a[i+3], 2, 6, 3, 7 );
++    }
++    for( int i = 0; i < 4; i++ )
++    {
++        v[2*i]   = wasm_i64x2_shuffle( b[i], b[i+4], 0, 2 );
++        v[2*i+1] = wasm_i64x2_shuffle( b[i], b[i+4], 1, 3 );
++    }
++}
++
++/****************************************************************************
++ * 4x4
++ ****************************************************************************/
++ALWAYS_INLINE void dct4_1d( v128_t v[4] )
++{
++    v128_t s03 = wasm_i16x8_add( v[0], v[3] ), s12 = wasm_i16x8_add( v[1], v[2] );
++    v128_t d03 = wasm_i16x8_sub( v[0], v[3] ), d12 = wasm_i16x8_sub( v[1], v[2] );
++    v[0] = wasm_i16x8_add( s03, s12 );
++    v[1] = wasm_i16x8_add( wasm_i16x8_shl( d03, 1 ), d12 );
++    v[2] = wasm_i16x8_sub( s03, s12 );
++    v[3] = wasm_i16x8_sub( d03, wasm_i16x8_shl( d12, 1 ) );
++}
++
++ALWAYS_INLINE void idct4_1d( v128_t v[4] )
++{
++    v128_t s02 = wasm_i16x8_add( v[0], v[2] ), d02 = wasm_i16x8_sub( v[0], v[2] );
++    v128_t s13 = wasm_i16x8_add( v[1], wasm_i16x8_shr( v[3], 1 ) );
++    v128_t d13 = wasm_i16x8_sub( wasm_i16x8_shr( v[1], 1 ), v[3] );
++    v[0] = wasm_i16x8_add( s02, s13 );
++    v[1] = wasm_i16x8_add( d02, d13 );
++    v[2] = wasm_i16x8_sub( d02, d13 );
++    v[3] = wasm_i16x8_sub( s02, s13 );
++}
++
++/* Forward transform of the 8x4 region at pix1/pix2 into two 4x4 coefficient blocks. */
++ALWAYS_INLINE void sub8x4_dct( dctcoef *dct_a, dctcoef *dct_b, const pixel *pix1, const pixel *pix2 )
++{
++    v128_t v[4];
++    for( int i = 0; i < 4; i++ )
++        v[i] = wasm_i16x8_sub( wasm_u16x8_load8x8( pix1 + i*FENC_STRIDE ), wasm_u16x8_load8x8( pix2 + i*FDEC_STRIDE ) );
++    dct4_1d( v );
++    transpose4x4x2( v );
++    dct4_1d( v );
++    for( int i = 0; i < 4; i++ )
++    {
++        wasm_v128_store64_lane( dct_a + i*4, v[i], 0 );
++        wasm_v128_store64_lane( dct_b + i*4, v[i], 1 );
++    }
++}
++
++static void sub4x4_dct_simd128( dctcoef dct[16], pixel *pix1, pixel *pix2 )
++{
++    ALIGNED_ARRAY_16( dctcoef, unused,[16] );
++    sub8x4_dct( dct, unused, pix1, pix2 );
++}
++
++static void sub8x8_dct_simd128( dctcoef dct[4][16], pixel *pix1, pixel *pix2 )
++{
++    sub8x4_dct( dct[0], dct[1], pix1, pix2 );
++    sub8x4_dct( dct[2], dct[3], pix1 + 4*FENC_STRIDE, pix2 + 4*FDEC_STRIDE );
++}
++
++static void sub16x16_dct_simd128( dctcoef dct[16][16], pixel *pix1, pixel *pix2 )
++{
++    sub8x8_dct_simd128( &dct[ 0], pix1,                  pix2 );
++    sub8x8_dct_simd128( &dct[ 4], pix1 + 8,              pix2 + 8 );
++    sub8x8_dct_simd128( &dct[ 8], pix1 + 8*FENC_STRIDE,     pix2 + 8*FDEC_STRIDE );
++    sub8x8_dct_simd128( &dct[12], pix1 + 8*FENC_STRIDE + 8, pix2 + 8*FDEC_STRIDE + 8 );
++}
++
++/* Inverse transform of two 4x4 blocks, added to the 8x4 region at dst. */
++ALWAYS_INLINE void add8x4_idct( pixel *dst, const dctcoef *dct_a, const dctcoef *dct_b )
++{
++    v128_t v[4];
++    for( int i = 0; i < 4; i++ )
++        v[i] = wasm_v128_load64_lane( dct_b + i*4, wasm_v128_load64_zero( dct_a + i*4 ), 1 );
++    idct4_1d( v );
++    transpose4x4x2( v );
++    idct4_1d( v );
++    const v128_t round = wasm_i16x8_splat( 32 );
++    for( int i = 0; i < 4; i++ )
++    {
++        v128_t res = wasm_i16x8_shr( wasm_i16x8_add( v[i], round ), 6 );
++        v128_t px = wasm_i16x8_add( wasm_u16x8_load8x8( dst + i*FDEC_STRIDE ), res );
++        wasm_v128_store64_lane( dst + i*FDEC_STRIDE, wasm_u8x16_narrow_i16x8( px, px ), 0 );
++    }
++}
++
++static void add4x4_idct_simd128( pixel *dst, dctcoef dct[16] )
++{
++    v128_t v[4];
++    for( int i = 0; i < 4; i++ )
++        v[i] = wasm_v128_load64_zero( dct + i*4 );
++    idct4_1d( v );
++    transpose4x4x2( v );
++    idct4_1d( v );
++    const v128_t round = wasm_i16x8_splat( 32 );
++    for( int i = 0; i < 4; i++ )
++    {
++        v128_t res = wasm_i16x8_shr( wasm_i16x8_add( v[i], round ), 6 );
++        v128_t px = wasm_i16x8_add( wasm_u16x8_load8x8( dst + i*FDEC_STRIDE ), res );
++        wasm_v128_store32_lane( dst + i*FDEC_STRIDE, wasm_u8x16_narrow_i16x8( px, px ), 0 );
++    }
++}
++
++static void add8x8_idct_simd128( pixel *dst, dctcoef dct[4][16] )
++{
++    add8x4_idct( dst, dct[0], dct[1] );
++    add8x4_idct( dst + 4*FDEC_STRIDE, dct[2], dct[3] );
++}
++
++static void add16x16_idct_simd128( pixel *dst, dctcoef dct[16][16] )
++{
++    add8x8_idct_simd128( dst,                     &dct[ 0] );
++    add8x8_idct_simd128( dst + 8,                 &dct[ 4] );
++    add8x8_idct_simd128( dst + 8*FDEC_STRIDE,     &dct[ 8] );
++    add8x8_idct_simd128( dst + 8*FDEC_STRIDE + 8, &dct[12] );
++}
++
++/****************************************************************************
++ * 8x8
++ ****************************************************************************/
++ALWAYS_INLINE void dct8_1d( v128_t v[8] )
++{
++    v128_t s07 = wasm_i16x8_add( v[0], v[7] ), s16 = wasm_i16x8_add( v[1], v[6] );
++    v128_t s25 = wasm_i16x8_add( v[2], v[5] ), s34 = wasm_i16x8_add( v[3], v[4] );
++    v128_t a0 = wasm_i16x8_add( s07, s34 ), a1 = wasm_i16x8_add( s16, s25 );
++    v128_t a2 = wasm_i16x8_sub( s07, s34 ), a3 = wasm_i16x8_sub( s16, s25 );
++    v128_t d07 = wasm_i16x8_sub( v[0], v[7] ), d16 = wasm_i16x8_sub( v[1], v[6] );
++    v128_t d25 = wasm_i16x8_sub( v[2], v[5] ), d34 = wasm_i16x8_sub( v[3], v[4] );
++    v128_t a4 = wasm_i16x8_add( wasm_i16x8_add( d16, d25 ), wasm_i16x8_add( d07, wasm_i16x8_shr( d07, 1 ) ) );
++    v128_t a5 = wasm_i16x8_sub( wasm_i16x8_sub( d07, d34 ), wasm_i16x8_add( d25, wasm_i16x8_shr( d25, 1 ) ) );
++    v128_t a6 = wasm_i16x8_sub( wasm_i16x8_add( d07, d34 ), wasm_i16x8_add( d16, wasm_i16x8_shr( d16, 1 ) ) );
++    v128_t a7 = wasm_i16x8_add( wasm_i16x8_sub( d16, d25 ), wasm_i16x8_add( d34, wasm_i16x8_shr( d34, 1 ) ) );
++    v[0] = wasm_i16x8_add( a0, a1 );
++    v[1] = wasm_i16x8_add( a4, wasm_i16x8_shr( a7, 2 ) );
++    v[2] = wasm_i16x8_add( a2, wasm_i16x8_shr( a3, 1 ) );
++    v[3] = wasm_i16x8_add( a5, wasm_i16x8_shr( a6, 2 ) );
++    v[4] = wasm_i16x8_sub( a0, a1 );
++    v[5] = wasm_i16x8_sub( a6, wasm_i16x8_shr( a5, 2 ) );
++    v[6] = wasm_i16x8_sub( wasm_i16x8_shr( a2, 1 ), a3 );
++    v[7] = wasm_i16x8_sub( wasm_i16x8_shr( a4, 2 ), a7 );
++}
++
++ALWAYS_INLINE void idct8_1d( v128_t v[8] )
++{
++    v128_t a0 = wasm_i16x8_add( v[0], v[4] ), a2 = wasm_i16x8_sub( v[0], v[4] );
++    v128_t a4 = wasm_i16x8_sub( wasm_i16x8_shr( v[2], 1 ), v[6] );
++    v128_t a6 = wasm_i16x8_add( wasm_i16x8_shr( v[6], 1 ), v[2] );
++    v128_t b0 = wasm_i16x8_add( a0, a6 ), b2 = wasm_i16x8_add( a2, a4 );
++    v128_t b4 = wasm_i16x8_sub( a2, a4 ), b6 = wasm_i16x8_sub( a0, a6 );
++    v128_t a1 = wasm_i16x8_sub( wasm_i16x8_sub( wasm_i16x8_sub( v[5], v[3] ), v[7] ), wasm_i16x8_shr( v[7], 1 ) );
++    v128_t a3 = wasm_i16x8_sub( wasm_i16x8_sub( wasm_i16x8_add( v[1], v[7] ), v[3] ), wasm_i16x8_shr( v[3], 1 ) );
++    v128_t a5 = wasm_i16x8_add( wasm_i16x8_add( wasm_i16x8_sub( v[7], v[1] ), v[5] ), wasm_i16x8_shr( v[5], 1 ) );
++    v128_t a7 = wasm_i16x8_add( wasm_i16x8_add( wasm_i16x8_add( v[3], v[5] ), v[1] ), wasm_i16x8_shr( v[1], 1 ) );
++    v128_t b1 = wasm_i16x8_add( wasm_i16x8_shr( a7, 2 ), a1 );
++    v128_t b3 = wasm_i16x8_add( a3, wasm_i16x8_shr( a5, 2 ) );
++    v128_t b5 = wasm_i16x8_sub( wasm_i16x8_shr( a3, 2 ), a5 );
++    v128_t b7 = wasm_i16x8_sub( a7, wasm_i16x8_shr( a1, 2 ) );
++    v[0] = wasm_i16x8_add( b0, b7 );
++    v[1] = wasm_i16x8_add( b2, b5 );
++    v[2] = wasm_i16x8_add( b4, b3 );
++    v[3] = wasm_i16x8_add( b6, b1 );
++    v[4] = wasm_i16x8_sub( b6, b1 );
++    v[5] = wasm_i16x8_sub( b4, b3 );
++    v[6] = wasm_i16x8_sub( b2, b5 );
++    v[7] = wasm_i16x8_sub( b0, b7 );
++}
++
++static void sub8x8_dct8_simd128( dctcoef dct[64], pixel *pix1, pixel *pix2 )
++{
++    v128_t v[8];
++    for( int i = 0; i < 8; i++ )
++        v[i] = wasm_i16x8_sub( wasm_u16x8_load8x8( pix1 + i*FENC_STRIDE ), wasm_u16x8_load8x8( pix2 + i*FDEC_STRIDE ) );
++    dct8_1d( v );
++    transpose8x8( v );
++    dct8_1d( v );
++    for( int i = 0; i < 8; i++ )
++        wasm_v128_store( dct + i*8, v[i] );
++}
++
++static void sub16x16_dct8_simd128( dctcoef dct[4][64], pixel *pix1, pixel *pix2 )
++{
++    sub8x8_dct8_simd128( dct[0], pix1,                     pix2 );
++    sub8x8_dct8_simd128( dct[1], pix1 + 8,                 pix2 + 8 );
++    sub8x8_dct8_simd128( dct[2], pix1 + 8*FENC_STRIDE,     pix2 + 8*FDEC_STRIDE );
++    sub8x8_dct8_simd128( dct[3], pix1 + 8*FENC_STRIDE + 8, pix2 + 8*FDEC_STRIDE + 8 );
++}
++
++static void add8x8_idct8_simd128( pixel *dst, dctcoef dct[64] )
++{
++    v128_t v[8];
++    for( int i = 0; i < 8; i++ )
++        v[i] = wasm_v128_load( dct + i*8 );
++    /* dct[0] += 32: rounding for the final >> 6, carried through both passes. */
++    v[0] = wasm_i16x8_add( v[0], wasm_i16x8_make( 32, 0, 0, 0, 0, 0, 0, 0 ) );
++    idct8_1d( v );
++    transpose8x8( v );
++    idct8_1d( v );
++    for( int i = 0; i < 8; i++ )
++    {
++        v128_t px = wasm_i16x8_add( wasm_u16x8_load8x8( dst + i*FDEC_STRIDE ), wasm_i16x8_shr( v[i], 6 ) );
++        wasm_v128_store64_lane( dst + i*FDEC_STRIDE, wasm_u8x16_narrow_i16x8( px, px ), 0 );
++    }
++}
++
++static void add16x16_idct8_simd128( pixel *dst, dctcoef dct[4][64] )
++{
++    add8x8_idct8_simd128( dst,                     dct[0] );
++    add8x8_idct8_simd128( dst + 8,                 dct[1] );
++    add8x8_idct8_simd128( dst + 8*FDEC_STRIDE,     dct[2] );
++    add8x8_idct8_simd128( dst + 8*FDEC_STRIDE + 8, dct[3] );
++}
++
++static void x264_dct_init_simd128( x264_dct_function_t *dctf )
++{
++    dctf->sub4x4_dct     = sub4x4_dct_simd128;
++    dctf->add4x4_idct    = add4x4_idct_simd128;
++    dctf->sub8x8_dct     = sub8x8_dct_simd128;
++    dctf->add8x8_idct    = add8x8_idct_simd128;
++    dctf->sub16x16_dct   = sub16x16_dct_simd128;
++    dctf->add16x16_idct  = add16x16_idct_simd128;
++    dctf->sub8x8_dct8    = sub8x8_dct8_simd128;
++    dctf->add8x8_idct8   = add8x8_idct8_simd128;
++    dctf->sub16x16_dct8  = sub16x16_dct8_simd128;
++    dctf->add16x16_idct8 = add16x16_idct8_simd128;
++}
+diff --git a/common/wasm/deblock-simd128.c b/common/wasm/deblock-simd128.c
+new file mode 100644
+index 0000000..3bf12e1
+--- /dev/null
++++ b/common/wasm/deblock-simd128.c
+@@ -0,0 +1,196 @@
++/*****************************************************************************
++ * deblock-simd128.c: WebAssembly SIMD128 in-loop deblocking (8-bit only)
++ *****************************************************************************
++ * Included from common/deblock.c. Normal (bS < 4) luma and chroma edges;
++ * bit-exact with the C filter (tools/checkasm). Edges across rows load
++ * directly; edges across columns are transposed into registers first.
++ *****************************************************************************/
++
++#include <wasm_simd128.h>
++
++#define ALWAYS_INLINE static inline __attribute__((always_inline))
++
++ALWAYS_INLINE v128_t db_absdiff( v128_t a, v128_t b )
++{
++    return wasm_i8x16_sub( wasm_u8x16_max( a, b ), wasm_u8x16_min( a, b ) );
++}
++
++/* (a + b) >> 1 without rounding up. */
++ALWAYS_INLINE v128_t db_avg_floor( v128_t a, v128_t b )
++{
++    return wasm_i8x16_sub( wasm_u8x16_avgr( a, b ), wasm_v128_and( wasm_v128_xor( a, b ), wasm_i8x16_splat( 1 ) ) );
++}
++
++/* clip3( ((q0 - p0)*4 + (p1 - q1) + 4) >> 3, -tc, tc ) applied to p0/q0 in 16 bits, returned as bytes. */
++ALWAYS_INLINE void db_p0q0( v128_t p1, v128_t p0, v128_t q0, v128_t q1, v128_t tc, v128_t *np0, v128_t *nq0 )
++{
++    v128_t out_p[2], out_q[2];
++    for( int half = 0; half < 2; half++ )
++    {
++        v128_t P1 = half ? wasm_u16x8_extend_high_u8x16( p1 ) : wasm_u16x8_extend_low_u8x16( p1 );
++        v128_t P0 = half ? wasm_u16x8_extend_high_u8x16( p0 ) : wasm_u16x8_extend_low_u8x16( p0 );
++        v128_t Q0 = half ? wasm_u16x8_extend_high_u8x16( q0 ) : wasm_u16x8_extend_low_u8x16( q0 );
++        v128_t Q1 = half ? wasm_u16x8_extend_high_u8x16( q1 ) : wasm_u16x8_extend_low_u8x16( q1 );
++        v128_t T  = half ? wasm_i16x8_extend_high_i8x16( tc ) : wasm_i16x8_extend_low_i8x16( tc );
++        v128_t d = wasm_i16x8_add( wasm_i16x8_shl( wasm_i16x8_sub( Q0, P0 ), 2 ), wasm_i16x8_sub( P1, Q1 ) );
++        d = wasm_i16x8_shr( wasm_i16x8_add( d, wasm_i16x8_splat( 4 ) ), 3 );
++        d = wasm_i16x8_min( wasm_i16x8_max( d, wasm_i16x8_neg( T ) ), T );
++        out_p[half] = wasm_i16x8_add( P0, d );
++        out_q[half] = wasm_i16x8_sub( Q0, d );
++    }
++    *np0 = wasm_u8x16_narrow_i16x8( out_p[0], out_p[1] );
++    *nq0 = wasm_u8x16_narrow_i16x8( out_q[0], out_q[1] );
++}
++
++/* Luma normal filter on 16 edge positions. tc0 holds one int8 per position (negative = skip). */
++ALWAYS_INLINE void db_luma( v128_t *p2, v128_t *p1, v128_t *p0, v128_t *q0, v128_t *q1, v128_t *q2,
++                            v128_t tc0, int alpha, int beta )
++{
++    const v128_t va = wasm_i8x16_splat( alpha ), vb = wasm_i8x16_splat( beta );
++    v128_t mask = wasm_v128_and( wasm_v128_and( wasm_u8x16_lt( db_absdiff( *p0, *q0 ), va ),
++                                                wasm_u8x16_lt( db_absdiff( *p1, *p0 ), vb ) ),
++                                 wasm_v128_and( wasm_u8x16_lt( db_absdiff( *q1, *q0 ), vb ),
++                                                wasm_i8x16_gt( tc0, wasm_i8x16_splat( -1 ) ) ) );
++    v128_t ap = wasm_v128_and( wasm_u8x16_lt( db_absdiff( *p2, *p0 ), vb ), mask );
++    v128_t aq = wasm_v128_and( wasm_u8x16_lt( db_absdiff( *q2, *q0 ), vb ), mask );
++    v128_t t0 = wasm_v128_and( tc0, mask ); /* tc0 where filtering, else 0 */
++
++    v128_t avg = wasm_u8x16_avgr( *p0, *q0 );
++    v128_t np1 = wasm_u8x16_min( wasm_u8x16_max( db_avg_floor( *p2, avg ), wasm_u8x16_sub_sat( *p1, t0 ) ),
++                                 wasm_u8x16_add_sat( *p1, t0 ) );
++    v128_t nq1 = wasm_u8x16_min( wasm_u8x16_max( db_avg_floor( *q2, avg ), wasm_u8x16_sub_sat( *q1, t0 ) ),
++                                 wasm_u8x16_add_sat( *q1, t0 ) );
++    /* tc = tc0 + (p2 test) + (q2 test); the masks are -1, so subtract them. */
++    v128_t tc = wasm_i8x16_sub( wasm_i8x16_sub( t0, ap ), aq );
++    v128_t np0, nq0;
++    db_p0q0( *p1, *p0, *q0, *q1, tc, &np0, &nq0 );
++
++    *p1 = wasm_v128_bitselect( np1, *p1, ap );
++    *q1 = wasm_v128_bitselect( nq1, *q1, aq );
++    *p0 = wasm_v128_bitselect( np0, *p0, mask );
++    *q0 = wasm_v128_bitselect( nq0, *q0, mask );
++}
++
++/* Chroma normal filter on 16 bytes (8 interleaved U/V pairs). tc <= 0 skips. */
++ALWAYS_INLINE void db_chroma( v128_t p1, v128_t *p0, v128_t *q0, v128_t q1, v128_t tc, int alpha, int beta )
++{
++    const v128_t va = wasm_i8x16_splat( alpha ), vb = wasm_i8x16_splat( beta );
++    v128_t mask = wasm_v128_and( wasm_v128_and( wasm_u8x16_lt( db_absdiff( *p0, *q0 ), va ),
++                                                wasm_u8x16_lt( db_absdiff( p1, *p0 ), vb ) ),
++                                 wasm_v128_and( wasm_u8x16_lt( db_absdiff( q1, *q0 ), vb ),
++                                                wasm_i8x16_gt( tc, wasm_i8x16_splat( 0 ) ) ) );
++    v128_t np0, nq0;
++    db_p0q0( p1, *p0, *q0, q1, wasm_v128_and( tc, mask ), &np0, &nq0 );
++    *p0 = wasm_v128_bitselect( np0, *p0, mask );
++    *q0 = wasm_v128_bitselect( nq0, *q0, mask );
++}
++
++/* tc0[0..3], each repeated over 4 consecutive bytes. */
++ALWAYS_INLINE v128_t db_tc4( const int8_t *tc0 )
++{
++    v128_t t = wasm_v128_load32_zero( tc0 );
++    return wasm_i8x16_shuffle( t, t, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3 );
++}
++
++static void deblock_v_luma_simd128( pixel *pix, intptr_t stride, int alpha, int beta, int8_t *tc0 )
++{
++    v128_t p2 = wasm_v128_load( pix - 3*stride ), p1 = wasm_v128_load( pix - 2*stride );
++    v128_t p0 = wasm_v128_load( pix - stride ),   q0 = wasm_v128_load( pix );
++    v128_t q1 = wasm_v128_load( pix + stride ),   q2 = wasm_v128_load( pix + 2*stride );
++    db_luma( &p2, &p1, &p0, &q0, &q1, &q2, db_tc4( tc0 ), alpha, beta );
++    wasm_v128_store( pix - 2*stride, p1 );
++    wasm_v128_store( pix - stride, p0 );
++    wasm_v128_store( pix, q0 );
++    wasm_v128_store( pix + stride, q1 );
++}
++
++/* 8x8 transpose of 16-bit lanes (as in dct-simd128.c). */
++ALWAYS_INLINE void db_transpose8x8( v128_t v[8] )
++{
++    v128_t a[8], b[8];
++    for( int i = 0; i < 8; i += 2 )
++    {
++        a[i]   = wasm_i16x8_shuffle( v[i], v[i+1], 0, 8, 1, 9, 2, 10, 3, 11 );
++        a[i+1] = wasm_i16x8_shuffle( v[i], v[i+1], 4, 12, 5, 13, 6, 14, 7, 15 );
++    }
++    for( int i = 0; i < 8; i += 4 )
++    {
++        b[i]   = wasm_i32x4_shuffle( a[i],   a[i+2], 0, 4, 1, 5 );
++        b[i+1] = wasm_i32x4_shuffle( a[i],   a[i+2], 2, 6, 3, 7 );
++        b[i+2] = wasm_i32x4_shuffle( a[i+1], a[i+3], 0, 4, 1, 5 );
++        b[i+3] = wasm_i32x4_shuffle( a[i+1], a[i+3], 2, 6, 3, 7 );
++    }
++    for( int i = 0; i < 4; i++ )
++    {
++        v[2*i]   = wasm_i64x2_shuffle( b[i], b[i+4], 0, 2 );
++        v[2*i+1] = wasm_i64x2_shuffle( b[i], b[i+4], 1, 3 );
++    }
++}
++
++/* 16 rows x 8 bytes -> 8 vectors of 16 bytes (one per column): interleave row pairs into 16-bit units,
++ * then transpose those as an 8x8 matrix. */
++static void deblock_h_luma_simd128( pixel *pix, intptr_t stride, int alpha, int beta, int8_t *tc0 )
++{
++    pixel *base = pix - 4;
++    v128_t c[8];
++    for( int k = 0; k < 8; k++ )
++    {
++        v128_t pair = wasm_v128_load64_lane( base + (2*k+1)*stride, wasm_v128_load64_zero( base + 2*k*stride ), 1 );
++        c[k] = wasm_i8x16_shuffle( pair, pair, 0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7, 15 );
++    }
++    db_transpose8x8( c ); /* c[j] = column j (p3 p2 p1 p0 q0 q1 q2 q3) across the 16 rows */
++    db_luma( &c[1], &c[2], &c[3], &c[4], &c[5], &c[6], db_tc4( tc0 ), alpha, beta );
++    db_transpose8x8( c );
++    for( int k = 0; k < 8; k++ )
++    {
++        v128_t rows = wasm_i8x16_shuffle( c[k], c[k], 0, 2, 4, 6, 8, 10, 12, 14, 1, 3, 5, 7, 9, 11, 13, 15 );
++        wasm_v128_store64_lane( base + 2*k*stride, rows, 0 );
++        wasm_v128_store64_lane( base + (2*k+1)*stride, rows, 1 );
++    }
++}
++
++static void deblock_v_chroma_simd128( pixel *pix, intptr_t stride, int alpha, int beta, int8_t *tc0 )
++{
++    v128_t p1 = wasm_v128_load( pix - 2*stride ), p0 = wasm_v128_load( pix - stride );
++    v128_t q0 = wasm_v128_load( pix ), q1 = wasm_v128_load( pix + stride );
++    db_chroma( p1, &p0, &q0, q1, db_tc4( tc0 ), alpha, beta );
++    wasm_v128_store( pix - stride, p0 );
++    wasm_v128_store( pix, q0 );
++}
++
++/* 8 rows of interleaved chroma around a vertical edge: each row is p1 p0 q0 q1 as 16-bit U/V units. */
++static void deblock_h_chroma_simd128( pixel *pix, intptr_t stride, int alpha, int beta, int8_t *tc0 )
++{
++    pixel *base = pix - 4;
++    v128_t r[4];
++    for( int k = 0; k < 4; k++ )
++        r[k] = wasm_v128_load64_lane( base + (2*k+1)*stride, wasm_v128_load64_zero( base + 2*k*stride ), 1 );
++    v128_t ab_p = wasm_i16x8_shuffle( r[0], r[1], 0, 4, 8, 12, 1, 5, 9, 13 );
++    v128_t ab_q = wasm_i16x8_shuffle( r[0], r[1], 2, 6, 10, 14, 3, 7, 11, 15 );
++    v128_t cd_p = wasm_i16x8_shuffle( r[2], r[3], 0, 4, 8, 12, 1, 5, 9, 13 );
++    v128_t cd_q = wasm_i16x8_shuffle( r[2], r[3], 2, 6, 10, 14, 3, 7, 11, 15 );
++    v128_t p1 = wasm_i64x2_shuffle( ab_p, cd_p, 0, 2 ), p0 = wasm_i64x2_shuffle( ab_p, cd_p, 1, 3 );
++    v128_t q0 = wasm_i64x2_shuffle( ab_q, cd_q, 0, 2 ), q1 = wasm_i64x2_shuffle( ab_q, cd_q, 1, 3 );
++    db_chroma( p1, &p0, &q0, q1, db_tc4( tc0 ), alpha, beta );
++    ab_p = wasm_i64x2_shuffle( p1, p0, 0, 2 );
++    cd_p = wasm_i64x2_shuffle( p1, p0, 1, 3 );
++    ab_q = wasm_i64x2_shuffle( q0, q1, 0, 2 );
++    cd_q = wasm_i64x2_shuffle( q0, q1, 1, 3 );
++    r[0] = wasm_i16x8_shuffle( ab_p, ab_q, 0, 4, 8, 12, 1, 5, 9, 13 );
++    r[1] = wasm_i16x8_shuffle( ab_p, ab_q, 2, 6, 10, 14, 3, 7, 11, 15 );
++    r[2] = wasm_i16x8_shuffle( cd_p, cd_q, 0, 4, 8, 12, 1, 5, 9, 13 );
++    r[3] = wasm_i16x8_shuffle( cd_p, cd_q, 2, 6, 10, 14, 3, 7, 11, 15 );
++    for( int k = 0; k < 4; k++ )
++    {
++        wasm_v128_store64_lane( base + 2*k*stride, r[k], 0 );
++        wasm_v128_store64_lane( base + (2*k+1)*stride, r[k], 1 );
++    }
++}
++
++static void x264_deblock_init_simd128( x264_deblock_function_t *pf )
++{
++    pf->deblock_luma[1] = deblock_v_luma_simd128;
++    pf->deblock_luma[0] = deblock_h_luma_simd128;
++    pf->deblock_chroma[1] = deblock_v_chroma_simd128;
++    pf->deblock_h_chroma_420 = deblock_h_chroma_simd128;
++}
+diff --git a/common/wasm/mc-simd128.c b/common/wasm/mc-simd128.c
+new file mode 100644
+index 0000000..5991d6a
+--- /dev/null
++++ b/common/wasm/mc-simd128.c
+@@ -0,0 +1,506 @@
++/*****************************************************************************
++ * mc-simd128.c: WebAssembly SIMD128 motion compensation (8-bit only)
++ *****************************************************************************
++ * Included from common/mc.c. Bit-exact with the C versions (tools/checkasm).
++ *****************************************************************************/
++
++#include <wasm_simd128.h>
++
++#define ALWAYS_INLINE static inline __attribute__((always_inline))
++
++/* dst = (a + b + 1) >> 1, which is exactly i8x16.avgr_u. Specialised by width so the row loops carry no
++ * width checks: this runs for every sub-pel candidate during motion search. */
++ALWAYS_INLINE void avg2_w16( pixel *dst, intptr_t i_dst, const pixel *a, intptr_t i_a,
++                             const pixel *b, intptr_t i_b, int h )
++{
++    for( int y = 0; y < h; y++, dst += i_dst, a += i_a, b += i_b )
++        wasm_v128_store( dst, wasm_u8x16_avgr( wasm_v128_load( a ), wasm_v128_load( b ) ) );
++}
++
++ALWAYS_INLINE void avg2_w8( pixel *dst, intptr_t i_dst, const pixel *a, intptr_t i_a,
++                            const pixel *b, intptr_t i_b, int h )
++{
++    /* Two rows per vector; motion search also asks for odd heights (bh+1), hence the tail. */
++    int y = 0;
++    for( ; y + 2 <= h; y += 2, dst += 2*i_dst, a += 2*i_a, b += 2*i_b )
++    {
++        v128_t va = wasm_v128_load64_lane( a + i_a, wasm_v128_load64_zero( a ), 1 );
++        v128_t vb = wasm_v128_load64_lane( b + i_b, wasm_v128_load64_zero( b ), 1 );
++        v128_t r = wasm_u8x16_avgr( va, vb );
++        wasm_v128_store64_lane( dst, r, 0 );
++        wasm_v128_store64_lane( dst + i_dst, r, 1 );
++    }
++    if( y < h )
++        wasm_v128_store64_lane( dst, wasm_u8x16_avgr( wasm_v128_load64_zero( a ), wasm_v128_load64_zero( b ) ), 0 );
++}
++
++ALWAYS_INLINE void avg2_w4( pixel *dst, intptr_t i_dst, const pixel *a, intptr_t i_a,
++                            const pixel *b, intptr_t i_b, int h )
++{
++    int y = 0;
++    for( ; y + 2 <= h; y += 2, dst += 2*i_dst, a += 2*i_a, b += 2*i_b )
++    {
++        v128_t va = wasm_v128_load32_lane( a + i_a, wasm_v128_load32_zero( a ), 1 );
++        v128_t vb = wasm_v128_load32_lane( b + i_b, wasm_v128_load32_zero( b ), 1 );
++        v128_t r = wasm_u8x16_avgr( va, vb );
++        wasm_v128_store32_lane( dst, r, 0 );
++        wasm_v128_store32_lane( dst + i_dst, r, 1 );
++    }
++    if( y < h )
++        wasm_v128_store32_lane( dst, wasm_u8x16_avgr( wasm_v128_load32_zero( a ), wasm_v128_load32_zero( b ) ), 0 );
++}
++
++static void avg2_wxh( pixel *dst, intptr_t i_dst, const pixel *a, intptr_t i_a,
++                      const pixel *b, intptr_t i_b, int w, int h )
++{
++    switch( w )
++    {
++        case 16: avg2_w16( dst, i_dst, a, i_a, b, i_b, h ); return;
++        case 8:  avg2_w8( dst, i_dst, a, i_a, b, i_b, h ); return;
++        case 4:  avg2_w4( dst, i_dst, a, i_a, b, i_b, h ); return;
++        case 20:
++            avg2_w16( dst, i_dst, a, i_a, b, i_b, h );
++            avg2_w4( dst + 16, i_dst, a + 16, i_a, b + 16, i_b, h );
++            return;
++        case 12:
++            avg2_w8( dst, i_dst, a, i_a, b, i_b, h );
++            avg2_w4( dst + 8, i_dst, a + 8, i_a, b + 8, i_b, h );
++            return;
++    }
++    for( int y = 0; y < h; y++, dst += i_dst, a += i_a, b += i_b )
++        for( int x = 0; x < w; x++ )
++            dst[x] = ( a[x] + b[x] + 1 ) >> 1;
++}
++
++ALWAYS_INLINE void copy_wxh( pixel *dst, intptr_t i_dst, const pixel *src, intptr_t i_src, int w, int h )
++{
++    for( int y = 0; y < h; y++, dst += i_dst, src += i_src )
++    {
++        int x = 0;
++        for( ; x + 16 <= w; x += 16 )
++            wasm_v128_store( dst + x, wasm_v128_load( src + x ) );
++        if( x + 8 <= w )
++        {
++            wasm_v128_store64_lane( dst + x, wasm_v128_load64_zero( src + x ), 0 );
++            x += 8;
++        }
++        if( x + 4 <= w )
++        {
++            wasm_v128_store32_lane( dst + x, wasm_v128_load32_zero( src + x ), 0 );
++            x += 4;
++        }
++        for( ; x < w; x++ )
++            dst[x] = src[x];
++    }
++}
++
++static void mc_luma_simd128( pixel *dst, intptr_t i_dst_stride, pixel *src[4], intptr_t i_src_stride,
++                             int mvx, int mvy, int i_width, int i_height, const x264_weight_t *weight )
++{
++    int qpel_idx = ((mvy&3)<<2) + (mvx&3);
++    int offset = (mvy>>2)*i_src_stride + (mvx>>2);
++    pixel *src1 = src[x264_hpel_ref0[qpel_idx]] + offset + ((mvy&3) == 3) * i_src_stride;
++
++    if( qpel_idx & 5 )
++    {
++        pixel *src2 = src[x264_hpel_ref1[qpel_idx]] + offset + ((mvx&3) == 3);
++        avg2_wxh( dst, i_dst_stride, src1, i_src_stride, src2, i_src_stride, i_width, i_height );
++        if( weight->weightfn )
++            mc_weight( dst, i_dst_stride, dst, i_dst_stride, weight, i_width, i_height );
++    }
++    else if( weight->weightfn )
++        mc_weight( dst, i_dst_stride, src1, i_src_stride, weight, i_width, i_height );
++    else
++        copy_wxh( dst, i_dst_stride, src1, i_src_stride, i_width, i_height );
++}
++
++static pixel *get_ref_simd128( pixel *dst, intptr_t *i_dst_stride, pixel *src[4], intptr_t i_src_stride,
++                               int mvx, int mvy, int i_width, int i_height, const x264_weight_t *weight )
++{
++    int qpel_idx = ((mvy&3)<<2) + (mvx&3);
++    int offset = (mvy>>2)*i_src_stride + (mvx>>2);
++    pixel *src1 = src[x264_hpel_ref0[qpel_idx]] + offset + ((mvy&3) == 3) * i_src_stride;
++
++    if( qpel_idx & 5 )
++    {
++        pixel *src2 = src[x264_hpel_ref1[qpel_idx]] + offset + ((mvx&3) == 3);
++        avg2_wxh( dst, *i_dst_stride, src1, i_src_stride, src2, i_src_stride, i_width, i_height );
++        if( weight->weightfn )
++            mc_weight( dst, *i_dst_stride, dst, *i_dst_stride, weight, i_width, i_height );
++        return dst;
++    }
++    else if( weight->weightfn )
++    {
++        mc_weight( dst, *i_dst_stride, src1, i_src_stride, weight, i_width, i_height );
++        return dst;
++    }
++    *i_dst_stride = i_src_stride;
++    return src1;
++}
++
++/* Bi-prediction: plain average when weight == 32, else (a*w + b*(64-w) + 32) >> 6, clipped.
++ * |a*w + b*(64-w)| stays below 2^15 for the implicit weights x264 uses (w in [-64, 128]). */
++ALWAYS_INLINE void avg_weight_wxh( pixel *dst, intptr_t i_dst, const pixel *a, intptr_t i_a,
++                                   const pixel *b, intptr_t i_b, int w, int h, int weight )
++{
++    if( weight == 32 )
++    {
++        avg2_wxh( dst, i_dst, a, i_a, b, i_b, w, h );
++        return;
++    }
++    const v128_t w1 = wasm_i16x8_splat( weight ), w2 = wasm_i16x8_splat( 64 - weight );
++    const v128_t round = wasm_i16x8_splat( 32 );
++    for( int y = 0; y < h; y++, dst += i_dst, a += i_a, b += i_b )
++    {
++        for( int x = 0; x < w; x += 8 )
++        {
++            v128_t va = wasm_u16x8_load8x8( a + x ), vb = wasm_u16x8_load8x8( b + x );
++            v128_t v = wasm_i16x8_add( wasm_i16x8_add( wasm_i16x8_mul( va, w1 ), wasm_i16x8_mul( vb, w2 ) ), round );
++            v128_t out = wasm_u8x16_narrow_i16x8( wasm_i16x8_shr( v, 6 ), v );
++            /* Blocks are 16, 8 or 4 wide; a 4-wide block reads 4 spare bytes, which x264's buffers always have. */
++            if( w - x >= 8 )
++                wasm_v128_store64_lane( dst + x, out, 0 );
++            else
++                wasm_v128_store32_lane( dst + x, out, 0 );
++        }
++    }
++}
++
++#define AVG_SIMD128( w, h ) \
++static void pixel_avg_##w##x##h##_simd128( pixel *pix1, intptr_t i1, pixel *pix2, intptr_t i2, \
++                                           pixel *pix3, intptr_t i3, int weight ) \
++{ \
++    avg_weight_wxh( pix1, i1, pix2, i2, pix3, i3, w, h, weight ); \
++}
++AVG_SIMD128( 16, 16 )
++AVG_SIMD128( 16, 8 )
++AVG_SIMD128( 8, 16 )
++AVG_SIMD128( 8, 8 )
++AVG_SIMD128( 8, 4 )
++AVG_SIMD128( 4, 16 )
++AVG_SIMD128( 4, 8 )
++AVG_SIMD128( 4, 4 )
++AVG_SIMD128( 4, 2 )
++
++static void mc_copy_w16_simd128( pixel *dst, intptr_t i_dst, pixel *src, intptr_t i_src, int h ) { copy_wxh( dst, i_dst, src, i_src, 16, h ); }
++static void mc_copy_w8_simd128( pixel *dst, intptr_t i_dst, pixel *src, intptr_t i_src, int h ) { copy_wxh( dst, i_dst, src, i_src, 8, h ); }
++static void mc_copy_w4_simd128( pixel *dst, intptr_t i_dst, pixel *src, intptr_t i_src, int h ) { copy_wxh( dst, i_dst, src, i_src, 4, h ); }
++
++/****************************************************************************
++ * Half-pel filter: 6-tap (1,-5,20,20,-5,1).
++ * h and v are computed in 16-bit (|tap| < 2^14); the centre pass filters the
++ * 16-bit vertical intermediates horizontally in 32-bit.
++ ****************************************************************************/
++ALWAYS_INLINE v128_t tap16( v128_t m2, v128_t m1, v128_t p0, v128_t p1, v128_t p2, v128_t p3 )
++{
++    /* m2 + p3 - 5*(m1 + p2) + 20*(p0 + p1) */
++    v128_t outer = wasm_i16x8_add( m2, p3 );
++    v128_t mid = wasm_i16x8_add( m1, p2 );
++    v128_t inner = wasm_i16x8_add( p0, p1 );
++    return wasm_i16x8_add( wasm_i16x8_sub( outer, wasm_i16x8_mul( mid, wasm_i16x8_splat( 5 ) ) ),
++                           wasm_i16x8_mul( inner, wasm_i16x8_splat( 20 ) ) );
++}
++
++ALWAYS_INLINE v128_t tap32( v128_t m2, v128_t m1, v128_t p0, v128_t p1, v128_t p2, v128_t p3 )
++{
++    v128_t outer = wasm_i32x4_add( m2, p3 );
++    v128_t mid = wasm_i32x4_add( m1, p2 );
++    v128_t inner = wasm_i32x4_add( p0, p1 );
++    return wasm_i32x4_add( wasm_i32x4_sub( outer, wasm_i32x4_mul( mid, wasm_i32x4_splat( 5 ) ) ),
++                           wasm_i32x4_mul( inner, wasm_i32x4_splat( 20 ) ) );
++}
++
++/* (v + 16) >> 5, clipped to 8 bits */
++ALWAYS_INLINE v128_t round5_u8( v128_t lo, v128_t hi )
++{
++    const v128_t r = wasm_i16x8_splat( 16 );
++    return wasm_u8x16_narrow_i16x8( wasm_i16x8_shr( wasm_i16x8_add( lo, r ), 5 ),
++                                    wasm_i16x8_shr( wasm_i16x8_add( hi, r ), 5 ) );
++}
++
++#define TAPFILTER(pix, d) ((pix)[x-2*d] + (pix)[x+3*d] - 5*((pix)[x-d] + (pix)[x+2*d]) + 20*((pix)[x] + (pix)[x+d]))
++
++static void hpel_filter_simd128( pixel *dsth, pixel *dstv, pixel *dstc, pixel *src,
++                                 intptr_t stride, int width, int height, int16_t *buf )
++{
++    for( int y = 0; y < height; y++ )
++    {
++        /* Vertical pass over [-2, width+3): dstv, plus 16-bit intermediates for the centre pass. */
++        int x = -2;
++        for( ; x + 16 <= width + 3; x += 16 )
++        {
++            v128_t r[6];
++            for( int k = 0; k < 6; k++ )
++                r[k] = wasm_v128_load( src + x + (k-2)*stride );
++            v128_t lo = tap16( wasm_u16x8_extend_low_u8x16( r[0] ), wasm_u16x8_extend_low_u8x16( r[1] ),
++                               wasm_u16x8_extend_low_u8x16( r[2] ), wasm_u16x8_extend_low_u8x16( r[3] ),
++                               wasm_u16x8_extend_low_u8x16( r[4] ), wasm_u16x8_extend_low_u8x16( r[5] ) );
++            v128_t hi = tap16( wasm_u16x8_extend_high_u8x16( r[0] ), wasm_u16x8_extend_high_u8x16( r[1] ),
++                               wasm_u16x8_extend_high_u8x16( r[2] ), wasm_u16x8_extend_high_u8x16( r[3] ),
++                               wasm_u16x8_extend_high_u8x16( r[4] ), wasm_u16x8_extend_high_u8x16( r[5] ) );
++            wasm_v128_store( dstv + x, round5_u8( lo, hi ) );
++            wasm_v128_store( buf + x + 2, lo );
++            wasm_v128_store( buf + x + 10, hi );
++        }
++        for( ; x < width + 3; x++ )
++        {
++            int v = TAPFILTER( src, stride );
++            dstv[x] = x264_clip_pixel( (v + 16) >> 5 );
++            buf[x+2] = v;
++        }
++
++        /* Centre: horizontal 6-tap over the vertical intermediates, (v + 512) >> 10. */
++        const int16_t *b = buf + 2;
++        x = 0;
++        for( ; x + 8 <= width; x += 8 )
++        {
++            v128_t out[2];
++            for( int half = 0; half < 2; half++ )
++            {
++                int o = x + half*4;
++                v128_t t[6];
++                for( int k = 0; k < 6; k++ )
++                    t[k] = wasm_i32x4_load16x4( b + o + k - 2 );
++                v128_t v = tap32( t[0], t[1], t[2], t[3], t[4], t[5] );
++                out[half] = wasm_i32x4_shr( wasm_i32x4_add( v, wasm_i32x4_splat( 512 ) ), 10 );
++            }
++            v128_t s16 = wasm_i16x8_narrow_i32x4( out[0], out[1] );
++            wasm_v128_store64_lane( dstc + x, wasm_u8x16_narrow_i16x8( s16, s16 ), 0 );
++        }
++        for( ; x < width; x++ )
++            dstc[x] = x264_clip_pixel( (TAPFILTER(b,1) + 512) >> 10 );
++
++        /* Horizontal pass. */
++        x = 0;
++        for( ; x + 16 <= width; x += 16 )
++        {
++            v128_t r[6];
++            for( int k = 0; k < 6; k++ )
++                r[k] = wasm_v128_load( src + x + k - 2 );
++            v128_t lo = tap16( wasm_u16x8_extend_low_u8x16( r[0] ), wasm_u16x8_extend_low_u8x16( r[1] ),
++                               wasm_u16x8_extend_low_u8x16( r[2] ), wasm_u16x8_extend_low_u8x16( r[3] ),
++                               wasm_u16x8_extend_low_u8x16( r[4] ), wasm_u16x8_extend_low_u8x16( r[5] ) );
++            v128_t hi = tap16( wasm_u16x8_extend_high_u8x16( r[0] ), wasm_u16x8_extend_high_u8x16( r[1] ),
++                               wasm_u16x8_extend_high_u8x16( r[2] ), wasm_u16x8_extend_high_u8x16( r[3] ),
++                               wasm_u16x8_extend_high_u8x16( r[4] ), wasm_u16x8_extend_high_u8x16( r[5] ) );
++            wasm_v128_store( dsth + x, round5_u8( lo, hi ) );
++        }
++        for( ; x < width; x++ )
++            dsth[x] = x264_clip_pixel( (TAPFILTER(src,1) + 16) >> 5 );
++
++        dsth += stride;
++        dstv += stride;
++        dstc += stride;
++        src += stride;
++    }
++}
++#undef TAPFILTER
++
++
++/****************************************************************************
++ * Chroma MC: bilinear 1/8-pel on interleaved UV, then split into U and V.
++ * cA+cB+cC+cD = 64, so every weighted sum fits in 16 bits.
++ ****************************************************************************/
++static void mc_chroma_simd128( pixel *dstu, pixel *dstv, intptr_t i_dst_stride, pixel *src, intptr_t i_src_stride,
++                               int mvx, int mvy, int i_width, int i_height )
++{
++    int d8x = mvx&0x07;
++    int d8y = mvy&0x07;
++    const v128_t cA = wasm_i16x8_splat( (8-d8x)*(8-d8y) );
++    const v128_t cB = wasm_i16x8_splat( d8x*(8-d8y) );
++    const v128_t cC = wasm_i16x8_splat( (8-d8x)*d8y );
++    const v128_t cD = wasm_i16x8_splat( d8x*d8y );
++    const v128_t round = wasm_i16x8_splat( 32 );
++
++    src += (mvy >> 3) * i_src_stride + (mvx >> 3)*2;
++    pixel *srcp = src + i_src_stride;
++
++    for( int y = 0; y < i_height; y++, dstu += i_dst_stride, dstv += i_dst_stride, src = srcp, srcp += i_src_stride )
++    {
++        /* Up to 8 output pixels per plane = 16 interleaved bytes. */
++        v128_t a = wasm_v128_load( src ), b = wasm_v128_load( src + 2 );
++        v128_t c = wasm_v128_load( srcp ), d = wasm_v128_load( srcp + 2 );
++        v128_t lo = wasm_i16x8_add( wasm_i16x8_add( wasm_i16x8_mul( wasm_u16x8_extend_low_u8x16( a ), cA ),
++                                                    wasm_i16x8_mul( wasm_u16x8_extend_low_u8x16( b ), cB ) ),
++                                    wasm_i16x8_add( wasm_i16x8_mul( wasm_u16x8_extend_low_u8x16( c ), cC ),
++                                                    wasm_i16x8_mul( wasm_u16x8_extend_low_u8x16( d ), cD ) ) );
++        v128_t hi = wasm_i16x8_add( wasm_i16x8_add( wasm_i16x8_mul( wasm_u16x8_extend_high_u8x16( a ), cA ),
++                                                    wasm_i16x8_mul( wasm_u16x8_extend_high_u8x16( b ), cB ) ),
++                                    wasm_i16x8_add( wasm_i16x8_mul( wasm_u16x8_extend_high_u8x16( c ), cC ),
++                                                    wasm_i16x8_mul( wasm_u16x8_extend_high_u8x16( d ), cD ) ) );
++        lo = wasm_u16x8_shr( wasm_i16x8_add( lo, round ), 6 );
++        hi = wasm_u16x8_shr( wasm_i16x8_add( hi, round ), 6 );
++        v128_t uv = wasm_u8x16_narrow_i16x8( lo, hi );
++        /* Even bytes are U, odd bytes are V. */
++        v128_t split = wasm_i8x16_shuffle( uv, uv, 0, 2, 4, 6, 8, 10, 12, 14, 1, 3, 5, 7, 9, 11, 13, 15 );
++        if( i_width == 8 )
++        {
++            wasm_v128_store64_lane( dstu, split, 0 );
++            wasm_v128_store64_lane( dstv, split, 1 );
++        }
++        else if( i_width == 4 )
++        {
++            wasm_v128_store32_lane( dstu, split, 0 );
++            wasm_v128_store32_lane( dstv, split, 2 );
++        }
++        else
++        {
++            wasm_v128_store16_lane( dstu, split, 0 );
++            wasm_v128_store16_lane( dstv, split, 4 );
++        }
++    }
++}
++
++/****************************************************************************
++ * Lookahead half-resolution planes. FILTER(a,b,c,d) = avg(avg(a,b), avg(c,d)),
++ * all rounding averages, i.e. nested i8x16.avgr_u.
++ ****************************************************************************/
++ALWAYS_INLINE v128_t even_bytes( v128_t lo, v128_t hi )
++{
++    return wasm_i8x16_shuffle( lo, hi, 0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30 );
++}
++
++ALWAYS_INLINE v128_t odd_bytes( v128_t lo, v128_t hi )
++{
++    return wasm_i8x16_shuffle( lo, hi, 1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31 );
++}
++
++static void frame_init_lowres_core_simd128( pixel *src0, pixel *dst0, pixel *dsth, pixel *dstv, pixel *dstc,
++                                            intptr_t src_stride, intptr_t dst_stride, int width, int height )
++{
++    for( int y = 0; y < height; y++ )
++    {
++        pixel *src1 = src0 + src_stride;
++        pixel *src2 = src1 + src_stride;
++        int x = 0;
++        for( ; x + 16 <= width; x += 16 )
++        {
++            const pixel *p0 = src0 + 2*x, *p1 = src1 + 2*x, *p2 = src2 + 2*x;
++            /* Vertical averages at columns 2x.. and 2x+1.. (the +1 copy supplies the right-hand neighbour). */
++            v128_t a_lo = wasm_u8x16_avgr( wasm_v128_load( p0 ),      wasm_v128_load( p1 ) );
++            v128_t a_hi = wasm_u8x16_avgr( wasm_v128_load( p0 + 16 ), wasm_v128_load( p1 + 16 ) );
++            v128_t b_lo = wasm_u8x16_avgr( wasm_v128_load( p0 + 1 ),  wasm_v128_load( p1 + 1 ) );
++            v128_t b_hi = wasm_u8x16_avgr( wasm_v128_load( p0 + 17 ), wasm_v128_load( p1 + 17 ) );
++            v128_t c_lo = wasm_u8x16_avgr( wasm_v128_load( p1 ),      wasm_v128_load( p2 ) );
++            v128_t c_hi = wasm_u8x16_avgr( wasm_v128_load( p1 + 16 ), wasm_v128_load( p2 + 16 ) );
++            v128_t d_lo = wasm_u8x16_avgr( wasm_v128_load( p1 + 1 ),  wasm_v128_load( p2 + 1 ) );
++            v128_t d_hi = wasm_u8x16_avgr( wasm_v128_load( p1 + 17 ), wasm_v128_load( p2 + 17 ) );
++            wasm_v128_store( dst0 + x, wasm_u8x16_avgr( even_bytes( a_lo, a_hi ), odd_bytes( a_lo, a_hi ) ) );
++            wasm_v128_store( dsth + x, wasm_u8x16_avgr( odd_bytes( a_lo, a_hi ), odd_bytes( b_lo, b_hi ) ) );
++            wasm_v128_store( dstv + x, wasm_u8x16_avgr( even_bytes( c_lo, c_hi ), odd_bytes( c_lo, c_hi ) ) );
++            wasm_v128_store( dstc + x, wasm_u8x16_avgr( odd_bytes( c_lo, c_hi ), odd_bytes( d_lo, d_hi ) ) );
++        }
++#define FILTER(a,b,c,d) ((((a+b+1)>>1)+((c+d+1)>>1)+1)>>1)
++        for( ; x < width; x++ )
++        {
++            dst0[x] = FILTER(src0[2*x  ], src1[2*x  ], src0[2*x+1], src1[2*x+1]);
++            dsth[x] = FILTER(src0[2*x+1], src1[2*x+1], src0[2*x+2], src1[2*x+2]);
++            dstv[x] = FILTER(src1[2*x  ], src2[2*x  ], src1[2*x+1], src2[2*x+1]);
++            dstc[x] = FILTER(src1[2*x+1], src2[2*x+1], src1[2*x+2], src2[2*x+2]);
++        }
++#undef FILTER
++        src0 += src_stride*2;
++        dst0 += dst_stride;
++        dsth += dst_stride;
++        dstv += dst_stride;
++        dstc += dst_stride;
++    }
++}
++
++/****************************************************************************
++ * Chroma (de)interleaving between NV12 and planar U/V
++ ****************************************************************************/
++static void plane_copy_interleave_simd128( pixel *dst, intptr_t i_dst, pixel *srcu, intptr_t i_srcu,
++                                           pixel *srcv, intptr_t i_srcv, int w, int h )
++{
++    for( int y = 0; y < h; y++, dst += i_dst, srcu += i_srcu, srcv += i_srcv )
++    {
++        int x = 0;
++        for( ; x + 16 <= w; x += 16 )
++        {
++            v128_t u = wasm_v128_load( srcu + x ), v = wasm_v128_load( srcv + x );
++            wasm_v128_store( dst + 2*x, wasm_i8x16_shuffle( u, v, 0, 16, 1, 17, 2, 18, 3, 19, 4, 20, 5, 21, 6, 22, 7, 23 ) );
++            wasm_v128_store( dst + 2*x + 16, wasm_i8x16_shuffle( u, v, 8, 24, 9, 25, 10, 26, 11, 27, 12, 28, 13, 29, 14, 30, 15, 31 ) );
++        }
++        for( ; x < w; x++ )
++        {
++            dst[2*x]   = srcu[x];
++            dst[2*x+1] = srcv[x];
++        }
++    }
++}
++
++static void plane_copy_deinterleave_simd128( pixel *dsta, intptr_t i_dsta, pixel *dstb, intptr_t i_dstb,
++                                             pixel *src, intptr_t i_src, int w, int h )
++{
++    for( int y = 0; y < h; y++, dsta += i_dsta, dstb += i_dstb, src += i_src )
++    {
++        int x = 0;
++        for( ; x + 16 <= w; x += 16 )
++        {
++            v128_t lo = wasm_v128_load( src + 2*x ), hi = wasm_v128_load( src + 2*x + 16 );
++            wasm_v128_store( dsta + x, even_bytes( lo, hi ) );
++            wasm_v128_store( dstb + x, odd_bytes( lo, hi ) );
++        }
++        for( ; x < w; x++ )
++        {
++            dsta[x] = src[2*x];
++            dstb[x] = src[2*x+1];
++        }
++    }
++}
++
++/* 8-wide macroblock chroma: one 16-byte NV12 row splits into 8 U and 8 V. */
++ALWAYS_INLINE void deinterleave8( pixel *dst, intptr_t i_dst, const pixel *src, intptr_t i_src, int height )
++{
++    for( int y = 0; y < height; y++, dst += i_dst, src += i_src )
++    {
++        v128_t v = wasm_i8x16_shuffle( wasm_v128_load( src ), wasm_v128_load( src ), 0, 2, 4, 6, 8, 10, 12, 14, 1, 3, 5, 7, 9, 11, 13, 15 );
++        wasm_v128_store64_lane( dst, v, 0 );
++        wasm_v128_store64_lane( dst + i_dst/2, v, 1 );
++    }
++}
++
++static void load_deinterleave_chroma_fenc_simd128( pixel *dst, pixel *src, intptr_t i_src, int height )
++{
++    deinterleave8( dst, FENC_STRIDE, src, i_src, height );
++}
++
++static void load_deinterleave_chroma_fdec_simd128( pixel *dst, pixel *src, intptr_t i_src, int height )
++{
++    deinterleave8( dst, FDEC_STRIDE, src, i_src, height );
++}
++
++static void store_interleave_chroma_simd128( pixel *dst, intptr_t i_dst, pixel *srcu, pixel *srcv, int height )
++{
++    for( int y = 0; y < height; y++, dst += i_dst, srcu += FDEC_STRIDE, srcv += FDEC_STRIDE )
++        wasm_v128_store( dst, wasm_i8x16_shuffle( wasm_v128_load64_zero( srcu ), wasm_v128_load64_zero( srcv ),
++                                                  0, 16, 1, 17, 2, 18, 3, 19, 4, 20, 5, 21, 6, 22, 7, 23 ) );
++}
++
++static void x264_mc_init_simd128( x264_mc_functions_t *pf )
++{
++    pf->mc_luma = mc_luma_simd128;
++    pf->get_ref = get_ref_simd128;
++    pf->avg[PIXEL_16x16] = pixel_avg_16x16_simd128;
++    pf->avg[PIXEL_16x8]  = pixel_avg_16x8_simd128;
++    pf->avg[PIXEL_8x16]  = pixel_avg_8x16_simd128;
++    pf->avg[PIXEL_8x8]   = pixel_avg_8x8_simd128;
++    pf->avg[PIXEL_8x4]   = pixel_avg_8x4_simd128;
++    pf->avg[PIXEL_4x16]  = pixel_avg_4x16_simd128;
++    pf->avg[PIXEL_4x8]   = pixel_avg_4x8_simd128;
++    pf->avg[PIXEL_4x4]   = pixel_avg_4x4_simd128;
++    pf->avg[PIXEL_4x2]   = pixel_avg_4x2_simd128;
++    pf->copy_16x16_unaligned = mc_copy_w16_simd128;
++    pf->copy[PIXEL_16x16] = mc_copy_w16_simd128;
++    pf->copy[PIXEL_8x8]   = mc_copy_w8_simd128;
++    pf->copy[PIXEL_4x4]   = mc_copy_w4_simd128;
++    pf->hpel_filter = hpel_filter_simd128;
++    pf->mc_chroma = mc_chroma_simd128;
++    pf->frame_init_lowres_core = frame_init_lowres_core_simd128;
++    pf->plane_copy_interleave = plane_copy_interleave_simd128;
++    pf->plane_copy_deinterleave = plane_copy_deinterleave_simd128;
++    pf->load_deinterleave_chroma_fenc = load_deinterleave_chroma_fenc_simd128;
++    pf->load_deinterleave_chroma_fdec = load_deinterleave_chroma_fdec_simd128;
++    pf->store_interleave_chroma = store_interleave_chroma_simd128;
++}
+diff --git a/common/wasm/pixel-simd128.c b/common/wasm/pixel-simd128.c
+new file mode 100644
+index 0000000..84dd1f3
+--- /dev/null
++++ b/common/wasm/pixel-simd128.c
+@@ -0,0 +1,483 @@
++/*****************************************************************************
++ * pixel-simd128.c: WebAssembly SIMD128 pixel metrics (8-bit only)
++ *****************************************************************************
++ * Included from common/pixel.c. Every function here must match its C
++ * counterpart bit for bit; tools/checkasm verifies that.
++ *****************************************************************************/
++
++#include <wasm_simd128.h>
++
++#define ALWAYS_INLINE static inline __attribute__((always_inline))
++
++ALWAYS_INLINE int hsum_u16x8( v128_t v )
++{
++    v128_t s = wasm_u32x4_extadd_pairwise_u16x8( v );
++    s = wasm_i32x4_add( s, wasm_i32x4_shuffle( s, s, 2, 3, 0, 1 ) );
++    s = wasm_i32x4_add( s, wasm_i32x4_shuffle( s, s, 1, 0, 3, 2 ) );
++    return wasm_i32x4_extract_lane( s, 0 );
++}
++
++ALWAYS_INLINE int hsum_i32x4( v128_t s )
++{
++    s = wasm_i32x4_add( s, wasm_i32x4_shuffle( s, s, 2, 3, 0, 1 ) );
++    s = wasm_i32x4_add( s, wasm_i32x4_shuffle( s, s, 1, 0, 3, 2 ) );
++    return wasm_i32x4_extract_lane( s, 0 );
++}
++
++ALWAYS_INLINE v128_t absdiff_u8( v128_t a, v128_t b )
++{
++    return wasm_i8x16_sub( wasm_u8x16_max( a, b ), wasm_u8x16_min( a, b ) );
++}
++
++/* Rows of a 16-, 8- or 4-wide block, packed so each vector holds 16 pixels. */
++ALWAYS_INLINE v128_t load_rows( const pixel *p, intptr_t stride, int w )
++{
++    if( w == 16 )
++        return wasm_v128_load( p );
++    if( w == 8 )
++        return wasm_v128_load64_lane( p + stride, wasm_v128_load64_zero( p ), 1 );
++    v128_t v = wasm_v128_load32_zero( p );
++    v = wasm_v128_load32_lane( p + stride, v, 1 );
++    v = wasm_v128_load32_lane( p + 2*stride, v, 2 );
++    return wasm_v128_load32_lane( p + 3*stride, v, 3 );
++}
++
++/****************************************************************************
++ * SAD
++ ****************************************************************************/
++ALWAYS_INLINE int sad_wxh( const pixel *p1, intptr_t s1, const pixel *p2, intptr_t s2, int w, int h )
++{
++    const int rows = 16 / w; /* rows consumed per vector */
++    v128_t acc = wasm_i16x8_splat( 0 );
++    for( int y = 0; y < h; y += rows, p1 += rows*s1, p2 += rows*s2 )
++        acc = wasm_i16x8_add( acc, wasm_u16x8_extadd_pairwise_u8x16(
++                  absdiff_u8( load_rows( p1, s1, w ), load_rows( p2, s2, w ) ) ) );
++    return hsum_u16x8( acc );
++}
++
++#define SAD_SIMD128( w, h ) \
++static int x264_pixel_sad_##w##x##h##_simd128( pixel *p1, intptr_t s1, pixel *p2, intptr_t s2 ) \
++{ \
++    return sad_wxh( p1, s1, p2, s2, w, h ); \
++}
++SAD_SIMD128( 16, 16 )
++SAD_SIMD128( 16, 8 )
++SAD_SIMD128( 8, 16 )
++SAD_SIMD128( 8, 8 )
++SAD_SIMD128( 8, 4 )
++SAD_SIMD128( 4, 16 )
++SAD_SIMD128( 4, 8 )
++SAD_SIMD128( 4, 4 )
++
++/* One pass over fenc, compared against 3 or 4 references. */
++ALWAYS_INLINE void sad_xn( const pixel *fenc, const pixel *r0, const pixel *r1, const pixel *r2, const pixel *r3,
++                           intptr_t stride, int scores[4], int w, int h, int n )
++{
++    const int rows = 16 / w;
++    v128_t a0 = wasm_i16x8_splat( 0 ), a1 = a0, a2 = a0, a3 = a0;
++    for( int y = 0; y < h; y += rows )
++    {
++        v128_t f = load_rows( fenc, FENC_STRIDE, w );
++        a0 = wasm_i16x8_add( a0, wasm_u16x8_extadd_pairwise_u8x16( absdiff_u8( f, load_rows( r0, stride, w ) ) ) );
++        a1 = wasm_i16x8_add( a1, wasm_u16x8_extadd_pairwise_u8x16( absdiff_u8( f, load_rows( r1, stride, w ) ) ) );
++        a2 = wasm_i16x8_add( a2, wasm_u16x8_extadd_pairwise_u8x16( absdiff_u8( f, load_rows( r2, stride, w ) ) ) );
++        if( n == 4 )
++            a3 = wasm_i16x8_add( a3, wasm_u16x8_extadd_pairwise_u8x16( absdiff_u8( f, load_rows( r3, stride, w ) ) ) );
++        fenc += rows*FENC_STRIDE;
++        r0 += rows*stride;
++        r1 += rows*stride;
++        r2 += rows*stride;
++        r3 += rows*stride;
++    }
++    scores[0] = hsum_u16x8( a0 );
++    scores[1] = hsum_u16x8( a1 );
++    scores[2] = hsum_u16x8( a2 );
++    if( n == 4 )
++        scores[3] = hsum_u16x8( a3 );
++}
++
++#define SAD_X_SIMD128( w, h ) \
++static void x264_pixel_sad_x3_##w##x##h##_simd128( pixel *fenc, pixel *p0, pixel *p1, pixel *p2, \
++                                                    intptr_t stride, int scores[3] ) \
++{ \
++    int s[4]; \
++    sad_xn( fenc, p0, p1, p2, p2, stride, s, w, h, 3 ); \
++    scores[0] = s[0]; scores[1] = s[1]; scores[2] = s[2]; \
++} \
++static void x264_pixel_sad_x4_##w##x##h##_simd128( pixel *fenc, pixel *p0, pixel *p1, pixel *p2, pixel *p3, \
++                                                    intptr_t stride, int scores[4] ) \
++{ \
++    sad_xn( fenc, p0, p1, p2, p3, stride, scores, w, h, 4 ); \
++}
++SAD_X_SIMD128( 16, 16 )
++SAD_X_SIMD128( 16, 8 )
++SAD_X_SIMD128( 8, 16 )
++SAD_X_SIMD128( 8, 8 )
++SAD_X_SIMD128( 8, 4 )
++SAD_X_SIMD128( 4, 8 )
++SAD_X_SIMD128( 4, 4 )
++
++/****************************************************************************
++ * SATD: sum of absolute 4x4 Hadamard coefficients, halved.
++ * The last butterfly uses |a+b| + |a-b| = 2*max(|a|,|b|), which also absorbs the halving.
++ ****************************************************************************/
++
++/* [x0+x1, x1-x0, x2+x3, x3-x2] in every group of four lanes. Sign flips are consistent per lane, and every
++ * coefficient ends up inside an abs(), so they don't change the result. */
++ALWAYS_INLINE v128_t hadamard_pairs( v128_t v )
++{
++    v128_t sw = wasm_i16x8_shuffle( v, v, 1, 0, 3, 2, 5, 4, 7, 6 );
++    return wasm_i16x8_shuffle( wasm_i16x8_add( v, sw ), wasm_i16x8_sub( v, sw ), 0, 9, 2, 11, 4, 13, 6, 15 );
++}
++
++ALWAYS_INLINE v128_t load_diff8( const pixel *p1, const pixel *p2 )
++{
++    return wasm_i16x8_sub( wasm_u16x8_load8x8( p1 ), wasm_u16x8_load8x8( p2 ) );
++}
++
++/* Returns per-lane partial sums whose total is twice the 8x4 SATD. */
++ALWAYS_INLINE v128_t satd_8x4_x2( const pixel *p1, intptr_t s1, const pixel *p2, intptr_t s2 )
++{
++    v128_t d0 = hadamard_pairs( load_diff8( p1,        p2 ) );
++    v128_t d1 = hadamard_pairs( load_diff8( p1 + s1,   p2 + s2 ) );
++    v128_t d2 = hadamard_pairs( load_diff8( p1 + 2*s1, p2 + 2*s2 ) );
++    v128_t d3 = hadamard_pairs( load_diff8( p1 + 3*s1, p2 + 3*s2 ) );
++    v128_t a0 = wasm_i16x8_add( d0, d1 ), a1 = wasm_i16x8_sub( d0, d1 );
++    v128_t a2 = wasm_i16x8_add( d2, d3 ), a3 = wasm_i16x8_sub( d2, d3 );
++    v128_t b0 = wasm_i16x8_abs( wasm_i16x8_add( a0, a2 ) ), b2 = wasm_i16x8_abs( wasm_i16x8_sub( a0, a2 ) );
++    v128_t b1 = wasm_i16x8_abs( wasm_i16x8_add( a1, a3 ) ), b3 = wasm_i16x8_abs( wasm_i16x8_sub( a1, a3 ) );
++    /* Remaining butterfly pairs lanes (0,2) and (1,3) of each group. */
++    v128_t m0 = wasm_i16x8_max( b0, wasm_i16x8_shuffle( b0, b0, 2, 3, 0, 1, 6, 7, 4, 5 ) );
++    v128_t m1 = wasm_i16x8_max( b1, wasm_i16x8_shuffle( b1, b1, 2, 3, 0, 1, 6, 7, 4, 5 ) );
++    v128_t m2 = wasm_i16x8_max( b2, wasm_i16x8_shuffle( b2, b2, 2, 3, 0, 1, 6, 7, 4, 5 ) );
++    v128_t m3 = wasm_i16x8_max( b3, wasm_i16x8_shuffle( b3, b3, 2, 3, 0, 1, 6, 7, 4, 5 ) );
++    /* Each max appears twice across the vector, so the lane total is 2x SATD. Lanes stay below 8160. */
++    return wasm_i16x8_add( wasm_i16x8_add( m0, m1 ), wasm_i16x8_add( m2, m3 ) );
++}
++
++ALWAYS_INLINE int satd_8wide( const pixel *p1, intptr_t s1, const pixel *p2, intptr_t s2, int w, int h )
++{
++    v128_t acc = wasm_i32x4_splat( 0 );
++    for( int y = 0; y < h; y += 4 )
++        for( int x = 0; x < w; x += 8 )
++            acc = wasm_i32x4_add( acc, wasm_i32x4_extadd_pairwise_i16x8(
++                      satd_8x4_x2( p1 + y*s1 + x, s1, p2 + y*s2 + x, s2 ) ) );
++    return hsum_i32x4( acc ) >> 1;
++}
++
++/* 4-wide blocks: two rows share a vector (lanes 0-3 and 4-7), so the vertical butterfly spans vectors
++ * and half-vectors. */
++ALWAYS_INLINE v128_t load_diff4x2( const pixel *p1, intptr_t s1, const pixel *p2, intptr_t s2 )
++{
++    v128_t pa = wasm_v128_load32_lane( p1 + s1, wasm_v128_load32_zero( p1 ), 1 );
++    v128_t pb = wasm_v128_load32_lane( p2 + s2, wasm_v128_load32_zero( p2 ), 1 );
++    return wasm_i16x8_sub( wasm_u16x8_extend_low_u8x16( pa ), wasm_u16x8_extend_low_u8x16( pb ) );
++}
++
++ALWAYS_INLINE v128_t satd_4x4_x2( const pixel *p1, intptr_t s1, const pixel *p2, intptr_t s2 )
++{
++    /* r01 holds rows 0|1, r23 rows 2|3. */
++    v128_t r01 = hadamard_pairs( load_diff4x2( p1, s1, p2, s2 ) );
++    v128_t r23 = hadamard_pairs( load_diff4x2( p1 + 2*s1, s1, p2 + 2*s2, s2 ) );
++    v128_t a = wasm_i16x8_add( r01, r23 ); /* rows 0+2 | 1+3 */
++    v128_t b = wasm_i16x8_sub( r01, r23 ); /* rows 0-2 | 1-3 */
++    v128_t sa = wasm_i16x8_shuffle( a, a, 4, 5, 6, 7, 0, 1, 2, 3 );
++    v128_t sb = wasm_i16x8_shuffle( b, b, 4, 5, 6, 7, 0, 1, 2, 3 );
++    v128_t c0 = wasm_i16x8_abs( wasm_i16x8_add( a, sa ) ); /* both halves hold the same values up to sign */
++    v128_t c1 = wasm_i16x8_abs( wasm_i16x8_sub( a, sa ) );
++    v128_t c2 = wasm_i16x8_abs( wasm_i16x8_add( b, sb ) );
++    v128_t c3 = wasm_i16x8_abs( wasm_i16x8_sub( b, sb ) );
++    v128_t m0 = wasm_i16x8_max( c0, wasm_i16x8_shuffle( c0, c0, 2, 3, 0, 1, 6, 7, 4, 5 ) );
++    v128_t m1 = wasm_i16x8_max( c1, wasm_i16x8_shuffle( c1, c1, 2, 3, 0, 1, 6, 7, 4, 5 ) );
++    v128_t m2 = wasm_i16x8_max( c2, wasm_i16x8_shuffle( c2, c2, 2, 3, 0, 1, 6, 7, 4, 5 ) );
++    v128_t m3 = wasm_i16x8_max( c3, wasm_i16x8_shuffle( c3, c3, 2, 3, 0, 1, 6, 7, 4, 5 ) );
++    /* Each half holds the same values, and each max appears twice per half. Keeping one half leaves a lane
++     * total of 2x SATD, matching satd_8x4_x2. */
++    v128_t sum = wasm_i16x8_add( wasm_i16x8_add( m0, m1 ), wasm_i16x8_add( m2, m3 ) );
++    return wasm_v128_and( sum, wasm_i32x4_const( -1, -1, 0, 0 ) );
++}
++
++ALWAYS_INLINE int satd_4wide( const pixel *p1, intptr_t s1, const pixel *p2, intptr_t s2, int h )
++{
++    v128_t acc = wasm_i32x4_splat( 0 );
++    for( int y = 0; y < h; y += 4 )
++        acc = wasm_i32x4_add( acc, wasm_i32x4_extadd_pairwise_i16x8( satd_4x4_x2( p1 + y*s1, s1, p2 + y*s2, s2 ) ) );
++    return hsum_i32x4( acc ) >> 1;
++}
++
++#define SATD_SIMD128( w, h ) \
++static int x264_pixel_satd_##w##x##h##_simd128( pixel *p1, intptr_t s1, pixel *p2, intptr_t s2 ) \
++{ \
++    return w == 4 ? satd_4wide( p1, s1, p2, s2, h ) : satd_8wide( p1, s1, p2, s2, w, h ); \
++}
++SATD_SIMD128( 16, 16 )
++SATD_SIMD128( 16, 8 )
++SATD_SIMD128( 8, 16 )
++SATD_SIMD128( 8, 8 )
++SATD_SIMD128( 8, 4 )
++SATD_SIMD128( 4, 16 )
++SATD_SIMD128( 4, 8 )
++SATD_SIMD128( 4, 4 )
++
++#define SATD_X_SIMD128( w, h ) \
++static void x264_pixel_satd_x3_##w##x##h##_simd128( pixel *fenc, pixel *p0, pixel *p1, pixel *p2, \
++                                                     intptr_t stride, int scores[3] ) \
++{ \
++    scores[0] = x264_pixel_satd_##w##x##h##_simd128( fenc, FENC_STRIDE, p0, stride ); \
++    scores[1] = x264_pixel_satd_##w##x##h##_simd128( fenc, FENC_STRIDE, p1, stride ); \
++    scores[2] = x264_pixel_satd_##w##x##h##_simd128( fenc, FENC_STRIDE, p2, stride ); \
++} \
++static void x264_pixel_satd_x4_##w##x##h##_simd128( pixel *fenc, pixel *p0, pixel *p1, pixel *p2, pixel *p3, \
++                                                     intptr_t stride, int scores[4] ) \
++{ \
++    scores[0] = x264_pixel_satd_##w##x##h##_simd128( fenc, FENC_STRIDE, p0, stride ); \
++    scores[1] = x264_pixel_satd_##w##x##h##_simd128( fenc, FENC_STRIDE, p1, stride ); \
++    scores[2] = x264_pixel_satd_##w##x##h##_simd128( fenc, FENC_STRIDE, p2, stride ); \
++    scores[3] = x264_pixel_satd_##w##x##h##_simd128( fenc, FENC_STRIDE, p3, stride ); \
++}
++SATD_X_SIMD128( 16, 16 )
++SATD_X_SIMD128( 16, 8 )
++SATD_X_SIMD128( 8, 16 )
++SATD_X_SIMD128( 8, 8 )
++SATD_X_SIMD128( 8, 4 )
++SATD_X_SIMD128( 4, 8 )
++SATD_X_SIMD128( 4, 4 )
++
++/****************************************************************************
++ * SA8D: sum of absolute 8x8 Hadamard coefficients, (sum+2)>>2.
++ ****************************************************************************/
++ALWAYS_INLINE v128_t hadamard8_rows( v128_t v )
++{
++    /* Stage 1: lanes (0,1),(2,3),... */
++    v = hadamard_pairs( v );
++    /* Stage 2: lanes (0,2),(1,3),(4,6),(5,7) */
++    v128_t sw = wasm_i16x8_shuffle( v, v, 2, 3, 0, 1, 6, 7, 4, 5 );
++    return wasm_i16x8_shuffle( wasm_i16x8_add( v, sw ), wasm_i16x8_sub( v, sw ), 0, 1, 10, 11, 4, 5, 14, 15 );
++    /* Stage 3 (lanes (0,4),(1,5),...) happens in the max trick. */
++}
++
++/* Returns the raw 8x8 coefficient sum (before rounding). */
++ALWAYS_INLINE int sa8d_8x8_raw( const pixel *p1, intptr_t s1, const pixel *p2, intptr_t s2 )
++{
++    v128_t r[8];
++    for( int i = 0; i < 8; i++ )
++        r[i] = hadamard8_rows( load_diff8( p1 + i*s1, p2 + i*s2 ) );
++    /* Vertical 8-point Hadamard, lane-wise. */
++    for( int step = 1; step < 8; step <<= 1 )
++        for( int i = 0; i < 8; i += 2*step )
++            for( int j = i; j < i + step; j++ )
++            {
++                v128_t a = r[j], b = r[j+step];
++                r[j] = wasm_i16x8_add( a, b );
++                r[j+step] = wasm_i16x8_sub( a, b );
++            }
++    v128_t acc = wasm_i32x4_splat( 0 );
++    for( int i = 0; i < 8; i++ )
++    {
++        v128_t a = wasm_i16x8_abs( r[i] );
++        v128_t m = wasm_i16x8_max( a, wasm_i16x8_shuffle( a, a, 4, 5, 6, 7, 0, 1, 2, 3 ) );
++        /* Each max is duplicated, and |a+b|+|a-b| = 2*max: the lane total is exactly the coefficient sum. */
++        acc = wasm_i32x4_add( acc, wasm_i32x4_extadd_pairwise_i16x8( m ) );
++    }
++    return hsum_i32x4( acc );
++}
++
++static int x264_pixel_sa8d_8x8_simd128( pixel *p1, intptr_t s1, pixel *p2, intptr_t s2 )
++{
++    return ( sa8d_8x8_raw( p1, s1, p2, s2 ) + 2 ) >> 2;
++}
++
++static int x264_pixel_sa8d_16x16_simd128( pixel *p1, intptr_t s1, pixel *p2, intptr_t s2 )
++{
++    int sum = sa8d_8x8_raw( p1, s1, p2, s2 )
++            + sa8d_8x8_raw( p1 + 8, s1, p2 + 8, s2 )
++            + sa8d_8x8_raw( p1 + 8*s1, s1, p2 + 8*s2, s2 )
++            + sa8d_8x8_raw( p1 + 8 + 8*s1, s1, p2 + 8 + 8*s2, s2 );
++    return ( sum + 2 ) >> 2;
++}
++
++/****************************************************************************
++ * SSD and variance
++ ****************************************************************************/
++ALWAYS_INLINE int ssd_wxh( const pixel *p1, intptr_t s1, const pixel *p2, intptr_t s2, int w, int h )
++{
++    const int rows = 16 / w;
++    v128_t acc = wasm_i32x4_splat( 0 );
++    for( int y = 0; y < h; y += rows, p1 += rows*s1, p2 += rows*s2 )
++    {
++        v128_t a = load_rows( p1, s1, w ), b = load_rows( p2, s2, w );
++        v128_t lo = wasm_i16x8_sub( wasm_u16x8_extend_low_u8x16( a ), wasm_u16x8_extend_low_u8x16( b ) );
++        v128_t hi = wasm_i16x8_sub( wasm_u16x8_extend_high_u8x16( a ), wasm_u16x8_extend_high_u8x16( b ) );
++        acc = wasm_i32x4_add( acc, wasm_i32x4_dot_i16x8( lo, lo ) );
++        acc = wasm_i32x4_add( acc, wasm_i32x4_dot_i16x8( hi, hi ) );
++    }
++    return hsum_i32x4( acc );
++}
++
++#define SSD_SIMD128( w, h ) \
++static int x264_pixel_ssd_##w##x##h##_simd128( pixel *p1, intptr_t s1, pixel *p2, intptr_t s2 ) \
++{ \
++    return ssd_wxh( p1, s1, p2, s2, w, h ); \
++}
++SSD_SIMD128( 16, 16 )
++SSD_SIMD128( 16, 8 )
++SSD_SIMD128( 8, 16 )
++SSD_SIMD128( 8, 8 )
++SSD_SIMD128( 8, 4 )
++SSD_SIMD128( 4, 16 )
++SSD_SIMD128( 4, 8 )
++SSD_SIMD128( 4, 4 )
++
++/* Returns sum | (sum of squares << 32). */
++ALWAYS_INLINE uint64_t var_wxh( const pixel *pix, intptr_t stride, int w, int h )
++{
++    const int rows = 16 / w;
++    v128_t sum = wasm_i16x8_splat( 0 ), sqr = wasm_i32x4_splat( 0 );
++    for( int y = 0; y < h; y += rows, pix += rows*stride )
++    {
++        v128_t v = load_rows( pix, stride, w );
++        v128_t lo = wasm_u16x8_extend_low_u8x16( v ), hi = wasm_u16x8_extend_high_u8x16( v );
++        sum = wasm_i16x8_add( sum, wasm_u16x8_extadd_pairwise_u8x16( v ) );
++        sqr = wasm_i32x4_add( sqr, wasm_i32x4_dot_i16x8( lo, lo ) );
++        sqr = wasm_i32x4_add( sqr, wasm_i32x4_dot_i16x8( hi, hi ) );
++    }
++    return (uint32_t)hsum_u16x8( sum ) + ( (uint64_t)(uint32_t)hsum_i32x4( sqr ) << 32 );
++}
++
++static uint64_t x264_pixel_var_16x16_simd128( pixel *pix, intptr_t stride ) { return var_wxh( pix, stride, 16, 16 ); }
++static uint64_t x264_pixel_var_8x16_simd128( pixel *pix, intptr_t stride ) { return var_wxh( pix, stride, 8, 16 ); }
++static uint64_t x264_pixel_var_8x8_simd128( pixel *pix, intptr_t stride ) { return var_wxh( pix, stride, 8, 8 ); }
++
++
++/****************************************************************************
++ * var2: chroma residual variance (U at x, V at x+8 in fenc; x+16 in fdec)
++ ****************************************************************************/
++ALWAYS_INLINE int var2_8xh( pixel *fenc, pixel *fdec, int ssd[2], int h, int shift )
++{
++    v128_t sum = wasm_i16x8_splat( 0 ), sqr_u = wasm_i32x4_splat( 0 ), sqr_v = wasm_i32x4_splat( 0 );
++    for( int y = 0; y < h; y++, fenc += FENC_STRIDE, fdec += FDEC_STRIDE )
++    {
++        v128_t e = wasm_v128_load( fenc );
++        v128_t d = wasm_v128_load64_lane( fdec + FDEC_STRIDE/2, wasm_v128_load64_zero( fdec ), 1 );
++        v128_t du = wasm_i16x8_sub( wasm_u16x8_extend_low_u8x16( e ), wasm_u16x8_extend_low_u8x16( d ) );
++        v128_t dv = wasm_i16x8_sub( wasm_u16x8_extend_high_u8x16( e ), wasm_u16x8_extend_high_u8x16( d ) );
++        /* U sums in lanes 0-3, V sums in lanes 4-7 after the pairwise add. */
++        sum = wasm_i16x8_add( sum, wasm_i16x8_shuffle( wasm_i16x8_add( du, wasm_i16x8_shuffle( du, du, 4, 5, 6, 7, 0, 1, 2, 3 ) ),
++                                                       wasm_i16x8_add( dv, wasm_i16x8_shuffle( dv, dv, 4, 5, 6, 7, 0, 1, 2, 3 ) ),
++                                                       0, 1, 2, 3, 8, 9, 10, 11 ) );
++        sqr_u = wasm_i32x4_add( sqr_u, wasm_i32x4_dot_i16x8( du, du ) );
++        sqr_v = wasm_i32x4_add( sqr_v, wasm_i32x4_dot_i16x8( dv, dv ) );
++    }
++    v128_t s32 = wasm_i32x4_extadd_pairwise_i16x8( sum ); /* lanes: u, u, v, v */
++    int sum_u = wasm_i32x4_extract_lane( s32, 0 ) + wasm_i32x4_extract_lane( s32, 1 );
++    int sum_v = wasm_i32x4_extract_lane( s32, 2 ) + wasm_i32x4_extract_lane( s32, 3 );
++    int su = hsum_i32x4( sqr_u ), sv = hsum_i32x4( sqr_v );
++    ssd[0] = su;
++    ssd[1] = sv;
++    return su - ((int64_t)sum_u * sum_u >> shift) + sv - ((int64_t)sum_v * sum_v >> shift);
++}
++
++static int x264_pixel_var2_8x8_simd128( pixel *fenc, pixel *fdec, int ssd[2] ) { return var2_8xh( fenc, fdec, ssd, 8, 6 ); }
++static int x264_pixel_var2_8x16_simd128( pixel *fenc, pixel *fdec, int ssd[2] ) { return var2_8xh( fenc, fdec, ssd, 16, 7 ); }
++
++/****************************************************************************
++ * hadamard_ac: AC energy of the 4x4 and 8x8 Hadamard transforms of the pixels
++ * (not a residual). Returns sum8 << 32 | sum4 per 8x8, DC excluded.
++ ****************************************************************************/
++ALWAYS_INLINE uint64_t hadamard_ac_8x8( const pixel *pix, intptr_t stride )
++{
++    v128_t r[8];
++    for( int i = 0; i < 8; i++ )
++        r[i] = hadamard8_rows( wasm_u16x8_load8x8( pix + i*stride ) ); /* horizontal stages 1-2 */
++    /* Vertical stages 1-2 inside each group of four rows. */
++    for( int g = 0; g < 8; g += 4 )
++    {
++        v128_t a0 = wasm_i16x8_add( r[g], r[g+1] ), a1 = wasm_i16x8_sub( r[g], r[g+1] );
++        v128_t a2 = wasm_i16x8_add( r[g+2], r[g+3] ), a3 = wasm_i16x8_sub( r[g+2], r[g+3] );
++        r[g]   = wasm_i16x8_add( a0, a2 );
++        r[g+1] = wasm_i16x8_add( a1, a3 );
++        r[g+2] = wasm_i16x8_sub( a0, a2 );
++        r[g+3] = wasm_i16x8_sub( a1, a3 );
++    }
++    /* r now holds the four 4x4 transforms; sum their magnitudes. */
++    v128_t acc4 = wasm_i32x4_splat( 0 );
++    for( int i = 0; i < 8; i++ )
++        acc4 = wasm_i32x4_add( acc4, wasm_i32x4_extadd_pairwise_i16x8( wasm_i16x8_abs( r[i] ) ) );
++    /* The 8x8 DC is the sum of the four 4x4 DCs (row 0 and row 4, lanes 0 and 4). */
++    int dc = wasm_i16x8_extract_lane( r[0], 0 ) + wasm_i16x8_extract_lane( r[0], 4 )
++           + wasm_i16x8_extract_lane( r[4], 0 ) + wasm_i16x8_extract_lane( r[4], 4 );
++    /* Vertical stage 3, then horizontal stage 3 via the max trick. */
++    v128_t acc8 = wasm_i32x4_splat( 0 );
++    for( int i = 0; i < 4; i++ )
++    {
++        v128_t a = wasm_i16x8_abs( wasm_i16x8_add( r[i], r[i+4] ) );
++        v128_t b = wasm_i16x8_abs( wasm_i16x8_sub( r[i], r[i+4] ) );
++        v128_t ma = wasm_i16x8_max( a, wasm_i16x8_shuffle( a, a, 4, 5, 6, 7, 0, 1, 2, 3 ) );
++        v128_t mb = wasm_i16x8_max( b, wasm_i16x8_shuffle( b, b, 4, 5, 6, 7, 0, 1, 2, 3 ) );
++        acc8 = wasm_i32x4_add( acc8, wasm_i32x4_extadd_pairwise_i16x8( ma ) );
++        acc8 = wasm_i32x4_add( acc8, wasm_i32x4_extadd_pairwise_i16x8( mb ) );
++    }
++    uint32_t sum4 = hsum_i32x4( acc4 ) - dc;
++    uint32_t sum8 = hsum_i32x4( acc8 ) - dc;
++    return ((uint64_t)sum8 << 32) + sum4;
++}
++
++#define HADAMARD_AC_SIMD128( w, h ) \
++static uint64_t x264_pixel_hadamard_ac_##w##x##h##_simd128( pixel *pix, intptr_t stride ) \
++{ \
++    uint64_t sum = hadamard_ac_8x8( pix, stride ); \
++    if( w == 16 ) \
++        sum += hadamard_ac_8x8( pix + 8, stride ); \
++    if( h == 16 ) \
++        sum += hadamard_ac_8x8( pix + 8*stride, stride ); \
++    if( w == 16 && h == 16 ) \
++        sum += hadamard_ac_8x8( pix + 8*stride + 8, stride ); \
++    return ((sum>>34)<<32) + ((uint32_t)sum>>1); \
++}
++HADAMARD_AC_SIMD128( 16, 16 )
++HADAMARD_AC_SIMD128( 16, 8 )
++HADAMARD_AC_SIMD128( 8, 16 )
++HADAMARD_AC_SIMD128( 8, 8 )
++
++/* Intra mode costs: C predictors, SIMD comparisons (same macros as the C versions in pixel.c). */
++INTRA_MBCMP( sad,  4x4,   v, h, dc,  , _simd128, _c )
++INTRA_MBCMP(satd,  4x4,   v, h, dc,  , _simd128, _c )
++INTRA_MBCMP( sad,  8x8,  dc, h,  v, c, _simd128, _c )
++INTRA_MBCMP(satd,  8x8,  dc, h,  v, c, _simd128, _c )
++INTRA_MBCMP( sad,  8x16, dc, h,  v, c, _simd128, _c )
++INTRA_MBCMP(satd,  8x16, dc, h,  v, c, _simd128, _c )
++INTRA_MBCMP( sad, 16x16,  v, h, dc,  , _simd128, _c )
++INTRA_MBCMP(satd, 16x16,  v, h, dc,  , _simd128, _c )
++INTRA_MBCMP_8x8( sad, _simd128, _c )
++INTRA_MBCMP_8x8(sa8d, _simd128, _c )
++
++static void x264_pixel_init_simd128( x264_pixel_function_t *pixf )
++{
++    INIT8( sad, _simd128 );
++    INIT8_NAME( sad_aligned, sad, _simd128 );
++    INIT7( sad_x3, _simd128 );
++    INIT7( sad_x4, _simd128 );
++    INIT8( ssd, _simd128 );
++    INIT8( satd, _simd128 );
++    INIT7( satd_x3, _simd128 );
++    INIT7( satd_x4, _simd128 );
++    pixf->sa8d[PIXEL_16x16] = x264_pixel_sa8d_16x16_simd128;
++    pixf->sa8d[PIXEL_8x8]   = x264_pixel_sa8d_8x8_simd128;
++    pixf->var[PIXEL_16x16]  = x264_pixel_var_16x16_simd128;
++    pixf->var[PIXEL_8x16]   = x264_pixel_var_8x16_simd128;
++    pixf->var[PIXEL_8x8]    = x264_pixel_var_8x8_simd128;
++    pixf->var2[PIXEL_8x8]   = x264_pixel_var2_8x8_simd128;
++    pixf->var2[PIXEL_8x16]  = x264_pixel_var2_8x16_simd128;
++    INIT4( hadamard_ac, _simd128 );
++
++    pixf->intra_sad_x3_4x4    = intra_sad_x3_4x4_simd128;
++    pixf->intra_satd_x3_4x4   = intra_satd_x3_4x4_simd128;
++    pixf->intra_sad_x3_8x8    = intra_sad_x3_8x8_simd128;
++    pixf->intra_sa8d_x3_8x8   = intra_sa8d_x3_8x8_simd128;
++    pixf->intra_sad_x3_8x8c   = intra_sad_x3_8x8c_simd128;
++    pixf->intra_satd_x3_8x8c  = intra_satd_x3_8x8c_simd128;
++    pixf->intra_sad_x3_8x16c  = intra_sad_x3_8x16c_simd128;
++    pixf->intra_satd_x3_8x16c = intra_satd_x3_8x16c_simd128;
++    pixf->intra_sad_x3_16x16  = intra_sad_x3_16x16_simd128;
++    pixf->intra_satd_x3_16x16 = intra_satd_x3_16x16_simd128;
++}
+diff --git a/common/wasm/quant-simd128.c b/common/wasm/quant-simd128.c
+new file mode 100644
+index 0000000..0f4f787
+--- /dev/null
++++ b/common/wasm/quant-simd128.c
+@@ -0,0 +1,80 @@
++/*****************************************************************************
++ * quant-simd128.c: WebAssembly SIMD128 quantization (8-bit only)
++ *****************************************************************************
++ * Included from common/quant.c. Matches QUANT_ONE exactly: the bias add and
++ * multiply are done in 32-bit lanes with uint32 wraparound, and coefficients
++ * <= 0 take the negated branch, just like the C.
++ *****************************************************************************/
++
++#include <wasm_simd128.h>
++
++#define ALWAYS_INLINE static inline __attribute__((always_inline))
++
++/* mf and bias arrive as 32-bit lanes: low/high halves for the 8 coefficients. */
++ALWAYS_INLINE v128_t quant_8coefs32( v128_t coef, v128_t mf_lo, v128_t mf_hi, v128_t bias_lo, v128_t bias_hi )
++{
++    v128_t positive = wasm_i16x8_gt( coef, wasm_i16x8_splat( 0 ) );
++    v128_t mag = wasm_i16x8_abs( coef ); /* -32768 stays 0x8000, i.e. 32768 unsigned */
++    v128_t lo = wasm_i32x4_mul( wasm_i32x4_add( wasm_u32x4_extend_low_u16x8( mag ), bias_lo ), mf_lo );
++    v128_t hi = wasm_i32x4_mul( wasm_i32x4_add( wasm_u32x4_extend_high_u16x8( mag ), bias_hi ), mf_hi );
++    lo = wasm_u32x4_shr( lo, 16 );
++    hi = wasm_u32x4_shr( hi, 16 );
++    /* Keep the low 16 bits of each 32-bit result, as the C does when storing into a dctcoef. */
++    v128_t v = wasm_i8x16_shuffle( lo, hi, 0, 1, 4, 5, 8, 9, 12, 13, 16, 17, 20, 21, 24, 25, 28, 29 );
++    return wasm_v128_bitselect( v, wasm_i16x8_neg( v ), positive );
++}
++
++ALWAYS_INLINE v128_t quant_8coefs( v128_t coef, v128_t mf, v128_t bias )
++{
++    return quant_8coefs32( coef, wasm_u32x4_extend_low_u16x8( mf ), wasm_u32x4_extend_high_u16x8( mf ),
++                           wasm_u32x4_extend_low_u16x8( bias ), wasm_u32x4_extend_high_u16x8( bias ) );
++}
++
++/* Quantizes n coefficients in place and returns the OR of the results. */
++ALWAYS_INLINE v128_t quant_block( dctcoef *dct, const udctcoef *mf, const udctcoef *bias, int n )
++{
++    v128_t nz = wasm_i16x8_splat( 0 );
++    for( int i = 0; i < n; i += 8 )
++    {
++        v128_t q = quant_8coefs( wasm_v128_load( dct + i ), wasm_v128_load( mf + i ), wasm_v128_load( bias + i ) );
++        wasm_v128_store( dct + i, q );
++        nz = wasm_v128_or( nz, q );
++    }
++    return nz;
++}
++
++static int quant_8x8_simd128( dctcoef dct[64], udctcoef mf[64], udctcoef bias[64] )
++{
++    return wasm_v128_any_true( quant_block( dct, mf, bias, 64 ) );
++}
++
++static int quant_4x4_simd128( dctcoef dct[16], udctcoef mf[16], udctcoef bias[16] )
++{
++    return wasm_v128_any_true( quant_block( dct, mf, bias, 16 ) );
++}
++
++static int quant_4x4x4_simd128( dctcoef dct[4][16], udctcoef mf[16], udctcoef bias[16] )
++{
++    int nza = 0;
++    for( int j = 0; j < 4; j++ )
++        nza |= wasm_v128_any_true( quant_block( dct[j], mf, bias, 16 ) ) << j;
++    return nza;
++}
++
++static int quant_4x4_dc_simd128( dctcoef dct[16], int mf, int bias )
++{
++    v128_t vmf = wasm_i32x4_splat( mf ), vbias = wasm_i32x4_splat( bias );
++    v128_t a = quant_8coefs32( wasm_v128_load( dct ), vmf, vmf, vbias, vbias );
++    v128_t b = quant_8coefs32( wasm_v128_load( dct + 8 ), vmf, vmf, vbias, vbias );
++    wasm_v128_store( dct, a );
++    wasm_v128_store( dct + 8, b );
++    return wasm_v128_any_true( wasm_v128_or( a, b ) );
++}
++
++static void x264_quant_init_simd128( x264_quant_function_t *pf )
++{
++    pf->quant_8x8    = quant_8x8_simd128;
++    pf->quant_4x4    = quant_4x4_simd128;
++    pf->quant_4x4x4  = quant_4x4x4_simd128;
++    pf->quant_4x4_dc = quant_4x4_dc_simd128;
++}
+diff --git a/tools/checkasm.c b/tools/checkasm.c
+index cdd94eb..a020aae 100644
+--- a/tools/checkasm.c
++++ b/tools/checkasm.c
+@@ -26,6 +26,9 @@
+  *****************************************************************************/
+ 
+ #include <ctype.h>
++#if defined(__EMSCRIPTEN__)
++#include <emscripten.h>
++#endif
+ #include "common/common.h"
+ #include "encoder/macroblock.h"
+ 
+@@ -103,7 +106,9 @@ static const char **intra_predict_8x16c_names = intra_predict_8x8c_names;
+ static inline uint32_t read_time(void)
+ {
+     uint32_t a = 0;
+-#if HAVE_X86_INLINE_ASM
++#if defined(__EMSCRIPTEN__)
++    a = (uint32_t)( emscripten_get_now() * 1e6 ); /* nanoseconds */
++#elif HAVE_X86_INLINE_ASM
+     asm volatile( "lfence \n"
+                   "rdtsc  \n"
+                   : "=a"(a) :: "edx", "memory" );
+@@ -3033,6 +3038,10 @@ static int check_all_flags( void )
+         ret |= add_flags( &cpu0, &cpu1, X264_CPU_LSX, "LSX" );
+     if( cpu_detect & X264_CPU_LASX )
+         ret |= add_flags( &cpu0, &cpu1, X264_CPU_LASX, "LASX" );
++#endif
++#if HAVE_SIMD128
++    if( cpu_detect & X264_CPU_SIMD128 )
++        ret |= add_flags( &cpu0, &cpu1, X264_CPU_SIMD128, "SIMD128" );
+ #endif
+     return ret;
+ }
+diff --git a/x264.h b/x264.h
+index b3223cd..8267322 100644
+--- a/x264.h
++++ b/x264.h
+@@ -192,6 +192,9 @@ typedef struct x264_nal_t
+ #define X264_CPU_LSX             0x0000001U  /* LOONGARCH LSX */
+ #define X264_CPU_LASX            0x0000002U  /* LOONGARCH LASX */
+ 
++/* WebAssembly */
++#define X264_CPU_SIMD128         (1U<<30) /* WebAssembly SIMD128 */
++
+ /* Analyse flags */
+ #define X264_ANALYSE_I4x4       0x0001U  /* Analyse i4x4 */
+ #define X264_ANALYSE_I8x8       0x0002U  /* Analyse i8x8 (requires 8x8 transform) */

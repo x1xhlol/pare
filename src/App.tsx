@@ -552,7 +552,7 @@ function Ready(props: {
           )}
           <span className="estimate-detail">
             {result?.crf
-              ? `x264 CRF ${result.crf}, from test clips`
+              ? "Measured on short test encodes"
               : result && !copy
               ? `SSIM ${result.ssim.toFixed(3)} on test clips at ${fmt.bitrate(result.bitrate)}`
               : tuning && 'round' in tuning && tuning.round > 0
