@@ -15,7 +15,14 @@ export type WorkerInit = {
   fpsNum: number
   fpsDen: number
 }
-export type WorkerChunk = { type: 'chunk'; index: number; start: number; end: number }
+export type WorkerChunk = {
+  type: 'chunk'
+  index: number
+  start: number
+  end: number
+  /** Overrides the pool's x264 options for this chunk (used when testing several rate factors). */
+  options?: string
+}
 export type EncodedChunk = {
   index: number
   /** Source timestamp of each input frame, by x264 pts. */
@@ -99,7 +106,7 @@ function cspFor(sample: VideoSample) {
   return direct && (sample.format === 'I420' || sample.format === 'I420A') ? CSP_I420 : CSP_NV12
 }
 
-async function encodeChunk({ index, start, end }: WorkerChunk): Promise<EncodedChunk> {
+async function encodeChunk({ index, start, end, options: override }: WorkerChunk): Promise<EncodedChunk> {
   const times: number[] = []
   const packets: EncodedChunk['packets'] = []
   let enc = 0
@@ -116,10 +123,11 @@ async function encodeChunk({ index, start, end }: WorkerChunk): Promise<EncodedC
       try {
         if (sample.timestamp < start - 1e-6 || sample.timestamp >= end - 1e-6) continue
         if (!enc) {
-          const options = x.stringToNewUTF8(init.options)
+          const text = override ?? init.options
+          const options = x.stringToNewUTF8(text)
           enc = x._enc_open(init.width, init.height, init.fpsNum, init.fpsDen, cspFor(sample), options)
           x._free(options)
-          if (!enc) throw new Error(`x264 rejected the options "${init.options}".`)
+          if (!enc) throw new Error(`x264 rejected the options "${text}".`)
           load = planInput(sample, enc)
         }
         await load!(sample)

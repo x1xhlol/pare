@@ -20,7 +20,7 @@ type CalibrationEntry = { promise: Promise<Calibration>; controller: AbortContro
 
 const usesX264 = (s: Settings) => s.engine === 'thorough' && s.preset !== 'copy'
 const settingsKey = (s: Settings) =>
-  `${s.preset}|${usesX264(s) ? 'x264' : s.codec}|${s.shortSide}|${s.keepAudio}`
+  `${s.preset}|${usesX264(s) ? 'x264' : s.codec}|${s.shortSide}|${s.keepAudio}|${s.sizeTarget}`
 const isAbort = (err: unknown) => err instanceof Error && (err.name === 'AbortError' || err.name === 'ConversionCanceledError')
 
 const supported = typeof window !== 'undefined' && 'VideoEncoder' in window && 'VideoDecoder' in window
@@ -39,6 +39,16 @@ const PRESETS: { value: Preset; label: string; hint: string }[] = [
     hint: 'Repackages the original streams without re-encoding, so every frame is bit-identical. It only saves space when the container itself is wasteful.',
   },
 ]
+
+const SIZE_OPTIONS: Option<'half' | 'any'>[] = [
+  { value: 'half', label: 'At least 50% smaller' },
+  { value: 'any', label: 'No limit' },
+]
+
+const SIZE_HINT = {
+  half: "Keeps the chosen quality when that already halves the file. If it wouldn't, compression is raised just enough to get there, and the quality check shows how close it stayed.",
+  any: 'Always encodes at the chosen quality, even if the file barely shrinks.',
+}
 
 const ENGINES: Option<Engine>[] = [
   { value: 'thorough', label: 'Thorough' },
@@ -69,6 +79,7 @@ export default function App() {
     codec: 'avc',
     shortSide: null,
     keepAudio: true,
+    sizeTarget: true,
   })
   const [tuning, setTuning] = useState<(Tuning & { key: string }) | null>(null)
   const calibrations = useRef(new Map<string, CalibrationEntry>())
@@ -142,9 +153,8 @@ export default function App() {
       controller,
       promise: usesX264(settings)
         ? x264().then(async (m) => {
-            const size = await m.estimate(probe, settings, controller.signal)
-            const crf = m.CRF[settings.preset as Exclude<Preset, 'copy'>]
-            return { bitrate: 0, size, ssim: 0, target: 0, reached: true, crf }
+            const { size, crf, raised } = await m.plan(probe, settings, controller.signal)
+            return { bitrate: 0, size, ssim: 0, target: 0, reached: true, crf, raised }
           })
         : media().then((m) => m.calibrate(probe, settings, controller.signal, onRound)),
     }
@@ -207,15 +217,13 @@ export default function App() {
     const onProgress = (progress: Progress) => setPhase((p) => (p.kind === 'running' ? { ...p, progress } : p))
     try {
       if (usesX264(settings)) {
-        // The size estimate competes with the encode for the same cores, so drop it if it's still running.
-        const pending = calibrations.current.get(key)
-        if (pending && !pending.result) {
-          pending.controller.abort()
-          calibrations.current.delete(key)
-        }
+        // The plan decides the rate factor (it may raise it to meet the size target), so wait for it.
         const engine = await x264()
+        const crf = await ensureCalibration(probe, settings)
+          .promise.then((c) => c.crf ?? engine.presetCrf(settings))
+          .catch(() => engine.presetCrf(settings))
         if (run.canceled) return
-        run.job = engine.encode(probe, settings, onProgress)
+        run.job = engine.encode(probe, settings, crf, onProgress)
       } else {
         const { bitrate } = await ensureCalibration(probe, settings).promise
         if (run.canceled) return
@@ -493,6 +501,14 @@ function Ready(props: {
           hint={PRESETS.find((p) => p.value === settings.preset)?.hint}
         />
         <Choice
+          legend="Size"
+          value={settings.sizeTarget ? 'half' : 'any'}
+          options={SIZE_OPTIONS}
+          disabled={copy}
+          onChange={(v) => setSettings((s) => ({ ...s, sizeTarget: v === 'half' }))}
+          hint={copy ? 'Unchanged.' : SIZE_HINT[settings.sizeTarget ? 'half' : 'any']}
+        />
+        <Choice
           legend="Encoder"
           value={settings.engine}
           options={ENGINES}
@@ -551,8 +567,10 @@ function Ready(props: {
             </span>
           )}
           <span className="estimate-detail">
-            {result?.crf
-              ? "Measured on short test encodes"
+            {result?.raised
+              ? 'Compression raised to reach 50% smaller'
+              : result?.crf
+              ? 'Measured on short test encodes'
               : result && !copy
               ? `SSIM ${result.ssim.toFixed(3)} on test clips at ${fmt.bitrate(result.bitrate)}`
               : tuning && 'round' in tuning && tuning.round > 0
@@ -568,14 +586,15 @@ function Ready(props: {
       </div>
       {result && !result.reached && !copy && (
         <p className="note">
-          {CODEC_LABEL[settings.codec]} in this browser can't reach {presetLabel} quality on this video without growing
-          past the original's bitrate, so this is as close as it gets.{' '}
+          {CODEC_LABEL[settings.codec]} in this browser can't reach {presetLabel} quality on this video{' '}
+          {settings.sizeTarget ? 'at half the original size' : "without growing past the original's bitrate"}, so this is
+          as close as it gets.{' '}
           {better.length
             ? `${better.map((c) => CODEC_LABEL[c]).join(' or ')} should do better.`
             : 'A lower quality setting will make it smaller.'}
         </p>
       )}
-      {result?.crf && result.size > probe.file.size * 0.95 && (
+      {result?.crf && !settings.sizeTarget && result.size > probe.file.size * 0.95 && (
         <p className="note">
           This video is already compressed about as tightly as x264 manages at {presetLabel} quality. Compact or a
           smaller resolution will shrink it.

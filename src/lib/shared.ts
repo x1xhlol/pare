@@ -13,6 +13,8 @@ export type Settings = {
   /** Target length of the short side in pixels, or null to keep the source resolution. */
   shortSide: number | null
   keepAudio: boolean
+  /** Keep the result at or below half the original's size, raising compression only when needed. */
+  sizeTarget: boolean
 }
 
 export type Probe = {

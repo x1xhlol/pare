@@ -171,6 +171,8 @@ export type Calibration = {
   reached: boolean
   /** Set when the size comes from x264 at a constant rate factor instead of a bitrate search. */
   crf?: number
+  /** True when the rate factor was raised to meet the size target. */
+  raised?: boolean
 }
 
 type Segment = {
@@ -201,7 +203,8 @@ export async function calibrate(
   const fps = probe.fps || 30
   const target = SSIM_TARGET[settings.preset]
   // Some containers don't report a usable bitrate; fall back to a generous per-pixel budget.
-  const ceiling = probe.videoBitrate > 0 ? probe.videoBitrate * MAX_SHARE_OF_SOURCE : width * height * fps * 0.4
+  const share = settings.sizeTarget ? 0.45 : MAX_SHARE_OF_SOURCE
+  const ceiling = probe.videoBitrate > 0 ? probe.videoBitrate * share : width * height * fps * 0.4
   const floor = Math.min(ceiling, 150_000)
   const clampRate = (b: number) => Math.min(ceiling, Math.max(floor, b))
 
