@@ -45,10 +45,44 @@ export function workerCount(probe: Probe) {
   return Math.max(1, Math.min(cores - 1, 8, byMemory))
 }
 
+async function fetchBlob(url: URL, type: string) {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      const response = await fetch(url)
+      if (!response.ok) throw new Error(`HTTP ${response.status}`)
+      return new Blob([await response.arrayBuffer()], { type })
+    } catch (err) {
+      if (attempt === 3) throw new Error(`Couldn't download the x264 encoder (${err instanceof Error ? err.message : err}).`)
+      await new Promise((resolve) => setTimeout(resolve, 500 * attempt))
+    }
+  }
+}
+
+let core: Promise<{ coreURL: string; wasmURL: string }> | null = null
+
+/**
+ * Downloads the ffmpeg core once and hands every worker an in-memory copy. Letting each worker fetch the 32 MB
+ * binary itself makes Chrome fail some of the parallel requests with ERR_CACHE_WRITE_FAILURE.
+ */
+export function loadCore() {
+  core ??= (async () => {
+    const base = new URL('/ffmpeg/', location.href)
+    const [js, wasm] = await Promise.all([
+      fetchBlob(new URL('ffmpeg-core.js', base), 'text/javascript'),
+      fetchBlob(new URL('ffmpeg-core.wasm', base), 'application/wasm'),
+    ])
+    return { coreURL: URL.createObjectURL(js), wasmURL: URL.createObjectURL(wasm) }
+  })().catch((err) => {
+    core = null
+    throw err
+  })
+  return core
+}
+
 async function spawn(file: File) {
+  const urls = await loadCore()
   const ff = new FFmpeg()
-  const base = new URL('/ffmpeg/', location.href).href
-  await ff.load({ coreURL: `${base}ffmpeg-core.js`, wasmURL: `${base}ffmpeg-core.wasm` })
+  await ff.load(urls)
   await ff.createDir(INPUT_DIR)
   await ff.mount('WORKERFS' as FFFSType, { files: [file] }, INPUT_DIR)
   return ff

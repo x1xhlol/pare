@@ -155,7 +155,8 @@ export default function App() {
       },
       (err) => {
         calibrations.current.delete(key)
-        if (currentKey.current === key && !isAbort(err)) setTuning({ key, error: message(err) })
+        if (controller.signal.aborted || isAbort(err)) return
+        if (currentKey.current === key) setTuning({ key, error: message(err) })
       },
     )
     calibrations.current.set(key, entry)
@@ -300,7 +301,12 @@ export default function App() {
             onReplace={() => picker.current?.click()}
           />
         ) : phase.kind === 'running' ? (
-          <Running probe={phase.probe} progress={phase.progress} onCancel={() => cancelRun.current?.()} />
+          <Running
+            probe={phase.probe}
+            progress={phase.progress}
+            preparing={usesX264(settings) ? 'Starting encoders…' : 'Finishing tuning…'}
+            onCancel={() => cancelRun.current?.()}
+          />
         ) : (
           <Done
             phase={phase}
@@ -556,7 +562,7 @@ function Ready(props: {
                   : '\u00a0'}
           </span>
         </div>
-        <button type="submit" className="button primary" disabled={noEncoder || (!!tuning && 'error' in tuning)}>
+        <button type="submit" className="button primary" disabled={noEncoder || (!!tuning && 'error' in tuning && !usesX264(settings))}>
           {copy ? 'Repackage video' : 'Compress video'}
         </button>
       </div>
@@ -589,7 +595,8 @@ function Ready(props: {
   )
 }
 
-function Running({ probe, progress, onCancel }: { probe: Probe; progress: Progress | null; onCancel: () => void }) {
+function Running(props: { probe: Probe; progress: Progress | null; preparing: string; onCancel: () => void }) {
+  const { probe, progress, onCancel } = props
   const fraction = progress?.fraction ?? 0
   const speed = progress && progress.elapsed > 0.5 ? progress.processed / progress.elapsed : null
   const left = speed ? (probe.duration - (progress?.processed ?? 0)) / speed : Infinity
@@ -604,7 +611,7 @@ function Running({ probe, progress, onCancel }: { probe: Probe; progress: Progre
               <span className="percent-sign">%</span>
             </span>
           ) : (
-            <span className="running-status pending">Finishing tuning…</span>
+            <span className="running-status pending">{props.preparing}</span>
           )}
           <button type="button" className="button" onClick={onCancel}>
             Cancel
