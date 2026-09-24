@@ -52,12 +52,37 @@ equal quality, using monotone (PCHIP) interpolation because VMAF saturates near 
 | faster + aq-mode 3 | −22.9% | −20.7% | −19.2% | −13.0% |
 | faster + tune film | −31.4% | −27.0% | −15.9% | −14.2% |
 | faster + tune grain | n/a | −28.9% | −6.4% | −10.5% |
+| faster + rc-lookahead 40 | −31.6% | −29.2% | −18.4% | −18.5% |
+| faster + ref 3 | −30.5% | −28.3% | −18.8% | −18.2% |
+| faster + weightp 2 | −30.1% | −28.0% | −18.5% | −18.0% |
+| **faster + lookahead 40 + ref 3 + weightp 2 (shipped)** | **−32.3%** | **−29.7%** | **−18.8%** | **−19.2%** |
+| slow | −39.1% | −35.4% | −17.4% | −21.8% |
+| faster + hqdn3d temporal denoise | −28.2% | −26.2% | −12.4% | −16.1% |
 
 `faster` gets most of `medium`'s gain at about half its cost; `fast` is no better than `faster` and slower. The film
 and grain tunes only win on the metric that rewards texture, and aq-mode 3 loses outright.
 
 CRFs were then recalibrated so `faster` lands on the file sizes `veryfast` produced (CRF 18/22/26 → 18.3/22.4/26.4).
 At those sizes VMAF NEG rises on every clip, by 1–5.5 points (e.g. ducks 93.4 → 96.6 at the visually lossless level).
+
+The three additions cost no measurable speed in the WebAssembly build (4.68 → ~4.75 fps per core at 1080p); the
+longer lookahead raises memory to ~400 MB per 1080p encoder, so it is only used up to 1080p.
+
+## Denoising before encoding
+
+hqdn3d (ported to WebAssembly, bit-exact with FFmpeg's filter) was tested as an "auto-enhance" step. At a fixed file
+size it changed nothing measurable, against either the noisy source or, on a clip with synthetic sensor noise, the
+clean original: once bits are constrained, x264's quantizer already discards the noise. Over the corpus it lowered
+efficiency slightly (above). It is not used.
+
+## At least 50% smaller
+
+A fixed "visually lossless" rate factor has no size discipline: on a noisy 25 Mbps source it re-encodes the noise and
+comes out 63% *larger*. Pare now plans each file: one round of 1-second test windows at the preset's rate factor and
+at one ~half the size (half the cores each), with keyframes and scene cuts priced separately and a measured 8%
+bias correction. Files predicted under 44% of the original keep the visually lossless setting; others get the rate
+factor interpolated to 44%, capped at CRF 30. Results on the corpus: −54% to −86%, all but the hardest grainy clip
+"visually identical" or "excellent" by the in-app SSIM check.
 
 ## End to end in the browser
 

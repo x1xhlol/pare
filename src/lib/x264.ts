@@ -112,7 +112,9 @@ export function presetCrf(settings: Settings) {
 const longLookahead = (width: number, height: number) => width * height <= 2.2e6
 
 async function encoderOptions(probe: Probe, settings: Settings, crf: number) {
-  const options = [X264_PRESET, X264_TUNE, `crf=${crf.toFixed(1)}`]
+  // 3 reference frames and smart weighted prediction cost no measurable speed; with the 40-frame lookahead they
+  // take "faster" from -27.8% to -29.7% BD-rate (VMAF NEG) against the old "veryfast".
+  const options = [X264_PRESET, X264_TUNE, `crf=${crf.toFixed(1)}`, 'ref=3', 'weightp=2']
   const { width, height } = outputSize(probe, settings.shortSide)
   if (longLookahead(width, height)) options.push('rc-lookahead=40')
   const resized = width !== probe.width || height !== probe.height
