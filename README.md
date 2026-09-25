@@ -1,28 +1,104 @@
 # Pare
 
-Video compression that runs entirely in the browser. It has two encoders:
+Pare makes a video at least half its size and keeps it looking like the original. It runs in the browser tab: the
+file never leaves your computer, and there's nothing to install.
 
-- **Thorough** (default): x264 compiled to WebAssembly with hand-written SIMD128 kernels (`x264-wasm/`), one worker
-  per CPU core, fed by the browser's own decoder. Uses the `faster` preset at a constant rate factor calibrated to
-  keep file sizes where the old `veryfast` setting put them, with better quality. See `research/RESEARCH.md`.
-- **Fast**: the browser's built-in WebCodecs encoder (often hardware). Pare:
+**Try it:** https://pare-eight.vercel.app
 
-1. Encodes a few short samples at different bitrates with the browser's own encoder (WebCodecs, via [Mediabunny](https://mediabunny.dev)) and scores each against the source with SSIM, searching for the lowest bitrate that meets the chosen quality target.
-2. Encodes the full video at that bitrate.
-3. Decodes matching frames from the original and the result, scores them, and shows them side by side.
+![A finished compression: 30.7 MB to 13.9 MB, visually identical, with a side-by-side frame comparison](docs/result.jpg)
 
-| Quality | Luma SSIM target | Roughly like x264 |
-| --- | --- | --- |
-| Visually lossless | 0.985 | CRF 18 |
-| High | 0.970 | CRF 23 |
-| Compact | 0.950 | CRF 28 |
-| Exact copy | bit-identical | remux, no re-encode |
+## Why it's different
 
-The output bitrate is capped at 90% of the source's, so a file that's already efficiently compressed gets a warning instead of a bigger copy.
+Most in-browser video compressors run ffmpeg.wasm. That's x264 with its assembly stripped out, on one thread, and it
+works, slowly. Pare started there too, and it took 105 seconds to compress a 20-second phone clip.
+
+Pare now runs its own build of x264:
+
+- **WebAssembly SIMD kernels.** x264 is fast because of hand-written x86 and ARM assembly, which a browser can't run.
+  Pare adds about 1,500 lines of WebAssembly SIMD128 in its place: SAD and SATD for motion search, sub-pixel
+  interpolation, DCT, quantization, deblocking and more. Each kernel passes x264's own `checkasm` against the C code,
+  and whole encodes come out byte-identical to the plain C build. Encoding is 2.0–2.3× faster per core, and the
+  result runs at 54% of native x264 with the same settings.
+- **The browser decodes.** WebCodecs decodes the source, in hardware when there's a GPU, and frames are copied
+  straight into x264's input planes. The encoder module is 830 KB; ffmpeg.wasm is 32 MB.
+- **Every core.** The video is split at source keyframes into chunks, each core encodes its own, and the chunks are
+  joined at the original frame timestamps.
+- **A size promise that gets checked.** Short test encodes estimate how size falls as quality drops. Each chunk gets
+  its quality setting from what the finished chunks actually cost, and the final file is weighed. If it isn't at
+  least 50% smaller, the busiest chunks are encoded again.
+- **Every frame is scored.** x264 computes SSIM for each frame against its input as it encodes. The result screen
+  reports the average and the worst frame, and opens a side-by-side view on the weakest ones.
+
+The encoder settings came out of a quality lab: every candidate was swept over rate factors on a test corpus and
+scored with VMAF, VMAF NEG, SSIM and PSNR. The winner (`faster` with a 40-frame lookahead, 3 references and weighted
+prediction) needs about 30% fewer bits than `veryfast` for the same VMAF NEG, at no speed cost. The details, and the
+ideas that didn't make it, are in [research/RESEARCH.md](research/RESEARCH.md).
+
+## Numbers
+
+Visually lossless with the 50% target, in Chrome on a 4-core, 8-thread cloud machine with no GPU. Time runs from
+clicking Compress to the finished file.
+
+| Video | Original | Pare | Time | SSIM, every frame |
+| --- | --- | --- | --- | --- |
+| Camera footage, 1080p30, 10 s | 77.9 MB | 15.3 MB (−80%) | 28 s | 0.9942 |
+| Phone clips, 1080p50, 20 s | 65.5 MB | 29.4 MB (−55%) | 61 s | 0.9505 |
+| Big Buck Bunny, 1080p30, 10 s | 30.7 MB | 13.9 MB (−55%) | 34 s | 0.9825 |
+| Screen recording, 1080p30, 8 s | 10.8 MB | 3.33 MB (−69%) | 10 s | 0.9996 |
+| Phone clips, 1080p50, 2 min | 392 MB | 193 MB (−51%) | 4 min 46 s | 0.9536 |
+
+Footage that compresses well keeps x264's CRF 15, where extra bits stop being visible, and lands well past half.
+Noisy footage gets exactly as much quality as fits in half the size.
+
+## Settings
+
+- **Quality:** visually lossless, high, compact, or an exact copy (the original streams in a new container, every
+  frame bit-identical).
+- **Size:** at least 50% smaller (default), or no limit.
+- **More options:** the encoder (x264, or the browser's own WebCodecs encoder, which is faster but less efficient and
+  can also produce HEVC or AV1), resolution, and audio.
+
+## Running it
 
 ```sh
 bun install
 bun dev
 ```
 
-Deployed with `vercel deploy --prod`.
+The x264 module is checked in at `src/lib/x264/`. To rebuild it from source you need an activated
+[Emscripten SDK](https://emscripten.org/docs/getting_started/downloads.html):
+
+```sh
+x264-wasm/build.sh
+```
+
+The script clones x264 at the commit in `x264-wasm/X264_COMMIT`, applies `x264-simd128.patch`, builds it with
+`-msimd128`, runs `checkasm` to verify every SIMD kernel against the C reference, and links the binding in
+`pare_x264.c`.
+
+## Layout
+
+| Path | What's there |
+| --- | --- |
+| `src/App.tsx` | The whole interface: landing, settings, progress, result |
+| `src/lib/x264.ts` | Size plan, chunking, per-chunk budget, refit, joining, audio |
+| `src/lib/encode-worker.ts` | One x264 encoder per worker, fed by WebCodecs through Mediabunny |
+| `src/lib/media.ts` | Probing, the WebCodecs encoder path, the frame-by-frame quality check |
+| `x264-wasm/` | The SIMD patch, the pinned x264 commit, the C binding, and the build script |
+| `research/` | Write-up, benchmark scripts, corpus builder, and every measurement in `results.jsonl` |
+
+## Limits
+
+- The x264 path writes H.264 in MP4. HDR sources come out as SDR.
+- Memory caps the encoder count: about 400 MB per 1080p encoder, and at most 40% of the device's reported memory.
+- A refit, when the first pass misses the target, runs the biggest chunks again, and a single chunk runs on a single
+  core. It's the slowest case left.
+- Needs a browser with WebCodecs and WebAssembly SIMD: current Chrome, Edge, Firefox, or Safari 17 and later.
+
+## License
+
+Pare is free software under the GNU General Public License, version 2 or later, because x264 is. See
+[LICENSE](LICENSE). The x264 changes are in `x264-wasm/x264-simd128.patch`.
+
+H.264 is covered by patents in some countries. x264's own licensing notes apply to anyone distributing encoders
+built from it.

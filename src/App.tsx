@@ -485,7 +485,7 @@ const STEPS = [
   },
   {
     title: 'x264, rebuilt for the web',
-    body: 'x264’s speed comes from hand-written x86 and ARM assembly, which a browser can’t run. Pare replaces it with about 1,700 lines of WebAssembly SIMD, bit-exact with x264’s own code and about twice as fast.',
+    body: 'x264’s speed comes from hand-written x86 and ARM assembly, which a browser can’t run. Pare replaces it with about 1,500 lines of WebAssembly SIMD, bit-exact with x264’s own code and about twice as fast.',
   },
   {
     title: 'One encoder per core',

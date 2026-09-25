@@ -17,7 +17,7 @@ WebAssembly too. Profiling the C-only x264 build (`perf`, then V8's `--cpu-prof`
 
 ## What changed
 
-**WebAssembly SIMD128 kernels for x264** (`x264-wasm/x264-simd128.patch`, ~1,600 lines):
+**WebAssembly SIMD128 kernels for x264** (`x264-wasm/x264-simd128.patch`, ~1,500 lines of kernels):
 SAD/SAD×3/×4, SATD/×3/×4, SA8D, SSD, variance, var2, hadamard_ac, intra mode costs, get_ref/mc_luma, bi-pred
 averaging, the 6-tap half-pel filter, chroma MC, lookahead downscaling, NV12 (de)interleaving, quantization,
 4×4/8×8 DCT and IDCT, and luma/chroma deblocking. Notes:
@@ -78,22 +78,101 @@ efficiency slightly (above). It is not used.
 ## At least 50% smaller
 
 A fixed "visually lossless" rate factor has no size discipline: on a noisy 25 Mbps source it re-encodes the noise and
-comes out 63% *larger*. Pare now plans each file: one round of 1-second test windows at the preset's rate factor and
-at one ~half the size (half the cores each), with keyframes and scene cuts priced separately and a measured 8%
-bias correction. Files predicted under 44% of the original keep the visually lossless setting; others get the rate
-factor interpolated to 44%, capped at CRF 30. Results on the corpus: −54% to −86%, all but the hardest grainy clip
-"visually identical" or "excellent" by the in-app SSIM check.
+comes out 63% *larger*. So with the size target on, Pare treats "at least 50% smaller" as a promise and checks it.
+
+**Plan.** While the settings screen is open, 4 windows of 24 frames are encoded at the quality ceiling (CRF 15) and at
+CRF 25, on half the cores each. Windows start on source keyframes, so no decoder works through frames it won't use.
+Keyframes and scene cuts are priced separately, and log size is interpolated in the rate factor to hit 47% of the
+original. If CRF 15 already fits, that's the answer.
+
+**Budget.** The plan is often off, in both directions. Sizes don't fall at a constant rate: on noisy footage they
+fall slowly until x264 stops spending bits on the noise and then collapse (town halves between CRF 20 and 22), so a
+straight line between CRF 15 and 25 misses the middle by up to 40%. Short windows also sample content unevenly. So
+each chunk gets its rate factor when a worker picks it up: every finished frame is converted to what it would have
+cost at CRF 15, the rest of the video is priced from those averages, and the chunk gets the rate factor that lands
+the total on the goal. Long videos are cut into ~8-second chunks (x264 starts a keyframe about that often anyway), so
+there are several rounds and later ones correct earlier ones. Each new rate factor stays within 1.5 of the
+frame-weighted average so far, which keeps quality even and absorbs a wrong slope.
+
+**Check and refit.** The finished video is weighed. If it's over half the original, the biggest chunks are encoded
+again: they save the most bytes per step, and busy footage hides the change best. The rise comes from the local slope,
+between the real total and the plan's test point on the far side. A total far under the goal means the plan was
+pessimistic, and every chunk comes down to spend the room on quality. x264's `stitchable=1` keeps the picture
+parameter set independent of the rate factor, so chunks encoded at different ones can share one; without it, joined
+chunks decode wrong.
+
+Plan errors on the test corpus, and what the budget and refit did with them:
+
+| Clip | Plan's CRF | Plan vs. real size | Result |
+| --- | --- | --- | --- |
+| town (1080p50 noisy phone clip) | 20.5 | +39% | 4 of 8 chunks refit to 22.9; −58% |
+| tree | 21.9 | +43% | 4 of 8 refit to 24.2; −55% |
+| phone clip with PCM audio | 20.9 | +8.5% | 1 chunk refit to 23.3; −53% |
+| mix (4 scenes, 20 s) | 25.0 | −4.7% | none; −55% |
+| Big Buck Bunny | 18.9 | −3.5% | none; −55% |
+| noisy (synthetic sensor noise) | 26.9 | −51% | all refit down to 25.9; −52%, SSIM 0.80 → 0.87 |
+| 2 minutes of mix | 26.1 | −19% | later rounds 24.6 → 23.0, no refit; −51% |
+| camera footage, screen recording | 15 | fits | none; −80%, −69% |
+
+Every clip ends between 51% and 80% smaller. A refit costs time when it happens (18 s for one chunk of the phone
+clip, since a single chunk runs on a single core), which is the main thing left to improve here.
+
+## What chunking costs
+
+Every chunk starts with a keyframe. On long videos that's free, since x264 inserts one every 250 frames anyway, but
+short clips pay for it. Native x264, same settings, same CRF, the whole clip vs. split into equal chunks:
+
+| Clip | 4 chunks | 8 chunks |
+| --- | --- | --- |
+| Big Buck Bunny (10 s) | −0.3% | +5.6% |
+| town (5 s) | +1.5% | +4.6% |
+| park (5 s) | +1.7% | +3.9% |
+| screen recording (8 s) | +10% | +45% |
+
+## One threaded encoder instead of chunks
+
+x264 has its own frame threading, and Emscripten can compile it with pthreads (it needs `SharedArrayBuffer`, so the
+page must be cross-origin isolated). One change was needed: `slicetype_slice_cost` runs as a thread-pool job but
+returns `void`, and WebAssembly traps on the mismatched indirect call, so it now returns `void *`. In Chrome, 8
+threads encode park at 16.8 fps: 3.95× one thread (native x264 scales 4.07×) and 94% of what 8 independent chunk
+encoders manage, without the keyframe overhead above.
+
+It isn't shipped yet. With one stream, the size target has only two tools: a plan before encoding, or x264's own
+one-pass average bitrate mode. One-pass ABR at 47% of the original was tested on the mix clip, whose four scenes
+differ a lot. It spent early (VMAF NEG by scene: 92.8, 86.7, 89.5, 77.6), overshot to 50.2% of the original, and
+scored 86.65 overall, where chunked constant quality scored 87.7 at a 10% smaller file (by scene: 87.6, 92.5, 86.7,
+84.0). A tighter `ratetol` fixes most of the overshoot but not the uneven spending. Threads are the likely next step
+for short clips, combined with the plan and budget above.
+
+## Where the time goes now
+
+Profile of the SIMD build (park, 1080p, shipped settings), top functions by self time:
+
+| Function | Share | Notes |
+| --- | --- | --- |
+| `avg2_wxh` (sub-pixel averaging) | 10.3% | already SIMD; memory-bound |
+| `me_search_ref`, `refine_subpel` | 10.7% | motion search control flow |
+| SATD 16×16 / 8×8 | 10.5% | SIMD |
+| SAD and SAD×3/×4 | ~17% | SIMD |
+| `quant_4x4_trellis` and helpers | ~6% | scalar in x264's C |
+| CABAC | ~4% | scalar by nature |
+| SSIM (`ssim_4x4x2_core`, `ssim_end4`) | 2.3–3.2% | scalar; cost of scoring every frame |
+
+The single-thread WebAssembly build runs at 54% of native x264 with the same settings (4.25 vs. 7.85 fps on park).
 
 ## End to end in the browser
 
-Same headless Chrome, same files, previous production build vs. the new one:
+Same headless Chrome, same files, production builds:
 
-| Clip | Before | After | Size | VMAF (vs. source) |
-| --- | --- | --- | --- | --- |
-| 20 s 1080p50 phone-style | 105.2 s | 54.2 s (1.9×) | 78.9 → 76.3 MB | 95.63 → 97.43 |
-| 10 s 1080p30 camera | 27.3 s | 19.3 s (1.4×) | 10.5 → 10.6 MB | SSIM 0.9887 → 0.9897 |
+| Clip | ffmpeg.wasm build | SIMD build, first size target | Now |
+| --- | --- | --- | --- |
+| 20 s 1080p50 phone-style (65.5 MB) | 105.2 s, no size target | 75 s, −61%, SSIM 0.943 | 61 s, −55%, SSIM 0.951 |
+| 10 s 1080p30 camera (77.9 MB) | 27.3 s | 31 s, −80% | 28 s, −80%, SSIM 0.994 |
+| 10 s Big Buck Bunny (30.7 MB) | | 41 s, −60%, SSIM 0.980 | 34 s, −55%, SSIM 0.983 |
 
-Short clips gain less because worker start-up and the first keyframe of each chunk are fixed costs.
+"Now" includes the size plan when Compress is clicked a second after the file loads. The ffmpeg.wasm build had no
+size target, and the middle column aimed at 44% of the original and often landed far below it; aiming at 47% and
+checking the result spends the allowance on quality.
 
 ## Reproducing
 
@@ -101,6 +180,8 @@ Short clips gain less because worker start-up and the first keyframe of each chu
   `checkasm`.
 - `research/evaluate.py` / `research/experiments.py` run the rate-quality sweeps (native x264 build, ffmpeg with
   libvmaf, corpus in `corpus/ref/*.y4m`).
+- `research/corpus.sh` downloads the Xiph clips and builds the "phone" versions and `mix.mp4`.
+- `research/results.jsonl` holds every rate-quality point measured (native x264, VMAF/VMAF NEG/SSIM/PSNR-Y).
 - `research/wasm-bench.mjs` times the WebAssembly encoder on raw frames in Node; `research/browser-ab.mjs` times a
   full compression in the browser against any deployment.
 
