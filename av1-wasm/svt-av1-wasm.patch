@@ -1,0 +1,385 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 0782cf6..c935cfa 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -49,6 +49,23 @@ check_c_source_compiles("
+ int main(void) {}
+ " HAVE_ARM_PLATFORM)
+ 
++# WebAssembly: build the x86 SIMD paths from their intrinsics, which Emscripten translates to SIMD128. The NASM
++# kernels can't be built; the dispatch tables fall back past them (Source/Lib/Codec/wasm_rtcd_fallbacks.h).
++option(SVT_WASM_NEON "WebAssembly: translate the Arm Neon kernels (via SIMDe) instead of the x86 ones" OFF)
++if(EMSCRIPTEN AND SVT_WASM_NEON)
++    set(HAVE_X86_PLATFORM 0)
++    set(HAVE_ARM_PLATFORM 1)
++    foreach(flavor ARM_CRC32 NEON_DOTPROD NEON_I8MM SVE SVE2)
++        set(ENABLE_${flavor} OFF CACHE BOOL "" FORCE)
++    endforeach()
++    add_definitions(-DCONFIG_ARM_NEON_IS_GUARANTEED=1)
++    add_compile_options(-msimd128 -mfpu=neon)
++elseif(EMSCRIPTEN)
++    set(HAVE_X86_PLATFORM 1)
++    set(ENABLE_AVX512 OFF CACHE BOOL "" FORCE)
++    add_compile_options(-msimd128)
++endif()
++
+ option(COMPILE_C_ONLY "Compile only C code with no simds (autodetect, default off for x86)" OFF)
+ option(MINIMAL_BUILD "Enable minimal build" OFF)
+ if(MINIMAL_BUILD)
+@@ -88,7 +105,9 @@ if(RTC_BUILD)
+     add_definitions(-DRTC_BUILD=1)
+ endif()
+ 
+-if(NOT COMPILE_C_ONLY AND HAVE_X86_PLATFORM)
++if(NOT COMPILE_C_ONLY AND HAVE_X86_PLATFORM AND EMSCRIPTEN)
++    add_definitions(-DARCH_X86_64=1)
++elseif(NOT COMPILE_C_ONLY AND HAVE_X86_PLATFORM)
+     include(CheckLanguage)
+     check_language(ASM_NASM)
+     if(CMAKE_ASM_NASM_COMPILER MATCHES "nasm")
+@@ -113,7 +132,9 @@ if(NOT COMPILE_C_ONLY AND HAVE_X86_PLATFORM)
+     enable_language(ASM_NASM)
+     add_definitions(-DARCH_X86_64=1)
+ elseif(NOT COMPILE_C_ONLY AND HAVE_ARM_PLATFORM)
+-    enable_language(ASM) # needed for .S files
++    if(NOT EMSCRIPTEN)
++        enable_language(ASM) # needed for .S files
++    endif()
+     set(ARM64_FLAVORS "NEON;ARM_CRC32;NEON_DOTPROD;NEON_I8MM;SVE;SVE2")
+     set(ARM_CRC32_DEFAULT_FLAG "-march=armv8-a+crc")
+     set(NEON_DOTPROD_DEFAULT_FLAG "-march=armv8.2-a+dotprod")
+@@ -506,7 +527,9 @@ endif()
+ 
+ # ASM compiler macro
+ macro(ASM_COMPILE_TO_TARGET target)
+-    if(CMAKE_GENERATOR STREQUAL "Xcode")
++    if(EMSCRIPTEN)
++        # No NASM in WebAssembly.
++    elseif(CMAKE_GENERATOR STREQUAL "Xcode")
+         if(CMAKE_BUILD_TYPE MATCHES Release)
+             set(ASM_FLAGS "${CMAKE_ASM_NASM_FLAGS_RELEASE}")
+         elseif(CMAKE_BUILD_TYPE MATCHES Debug)
+diff --git a/Source/Lib/ASM_NEON/CMakeLists.txt b/Source/Lib/ASM_NEON/CMakeLists.txt
+index 8136f44..5a1a9b1 100644
+--- a/Source/Lib/ASM_NEON/CMakeLists.txt
++++ b/Source/Lib/ASM_NEON/CMakeLists.txt
+@@ -35,8 +35,8 @@ target_sources(
+   PUBLIC convolve_neon.c
+   PUBLIC convolve_scale_neon.c
+   PUBLIC corner_match_neon.c
+-  PUBLIC dav1d_asm.S
+-  PUBLIC dav1d_util.S
++  PUBLIC $<$<NOT:$<BOOL:${EMSCRIPTEN}>>:${CMAKE_CURRENT_SOURCE_DIR}/dav1d_asm.S>
++  PUBLIC $<$<NOT:$<BOOL:${EMSCRIPTEN}>>:${CMAKE_CURRENT_SOURCE_DIR}/dav1d_util.S>
+   PUBLIC deblocking_filter_intrinsic_neon.c
+   PUBLIC encodetxb_neon.c
+   PUBLIC hadamard_path_neon.c
+@@ -60,7 +60,7 @@ target_sources(
+   PUBLIC highbd_wiener_convolve_neon.c
+   PUBLIC inter_prediction_neon.c
+   PUBLIC intra_prediction_neon.c
+-  PUBLIC itx.S
++  PUBLIC $<$<NOT:$<BOOL:${EMSCRIPTEN}>>:${CMAKE_CURRENT_SOURCE_DIR}/itx.S>
+   PUBLIC lowbd_fwd_txfm2d_neon.c
+   PUBLIC mem_neon.c
+   PUBLIC obmc_sad_neon.c
+diff --git a/Source/Lib/ASM_WASM/CMakeLists.txt b/Source/Lib/ASM_WASM/CMakeLists.txt
+new file mode 100644
+index 0000000..a25e7b7
+--- /dev/null
++++ b/Source/Lib/ASM_WASM/CMakeLists.txt
+@@ -0,0 +1,4 @@
++# Kernels written for WebAssembly SIMD128, used in place of translated x86 ones that emulate badly
++# (see Source/Lib/Codec/wasm_rtcd_fallbacks.h).
++include_directories(${PROJECT_SOURCE_DIR}/Source/API/ ${PROJECT_SOURCE_DIR}/Source/Lib/Codec/)
++add_library(ASM_WASM OBJECT sad_loop_wasm.c all_sad_wasm.c)
+diff --git a/Source/Lib/ASM_WASM/all_sad_wasm.c b/Source/Lib/ASM_WASM/all_sad_wasm.c
+new file mode 100644
+index 0000000..c854f4a
+--- /dev/null
++++ b/Source/Lib/ASM_WASM/all_sad_wasm.c
+@@ -0,0 +1,81 @@
++/*
++ * SADs of every 8x8 and 16x16 block of a 64x64 superblock at eight horizontal positions, for SVT-AV1's full-pel
++ * motion search, written for WebAssembly SIMD128.
++ *
++ * One 16-byte source row covers two 8x8 quadrants. For each of the eight positions it's compared with a shifted
++ * 16-byte reference load, and a pairwise-widening add leaves the left quadrant's partial sums in lanes 0-3 and the
++ * right one's in lanes 4-7. The x86 kernel gets there through MPSADBW, which WebAssembly has to emulate. Results
++ * and the order of best-candidate updates match svt_ext_all_sad_calculation_8x8_16x16_c exactly.
++ */
++#include <stdbool.h>
++#include <stdint.h>
++#include <wasm_simd128.h>
++
++#define MVXT(mv) ((int16_t)((mv)&0xFFFF))
++#define MVYT(mv) ((int16_t)((mv) >> 16))
++
++static inline v128_t absdiff(v128_t a, v128_t b) {
++    return wasm_v128_or(wasm_u8x16_sub_sat(a, b), wasm_u8x16_sub_sat(b, a));
++}
++
++/* Rows [first, first + 8) of a 16-wide block, every `step`th row, against eight positions: per position, the left
++ * and right 8x8 (or 8x4) sums in lanes 0 and 1 of the returned vectors. */
++static inline void quadrant_rows(const uint8_t* src, uint32_t src_stride, const uint8_t* ref, uint32_t ref_stride,
++                                 int step, uint32_t left[8], uint32_t right[8]) {
++    v128_t acc[8];
++    for (int p = 0; p < 8; p++) acc[p] = wasm_i16x8_splat(0);
++    for (int r = 0; r < 8; r += step) {
++        const v128_t s = wasm_v128_load(src + r * src_stride);
++        const uint8_t* q = ref + r * ref_stride;
++        for (int p = 0; p < 8; p++)
++            acc[p] = wasm_i16x8_add(acc[p], wasm_u16x8_extadd_pairwise_u8x16(absdiff(s, wasm_v128_load(q + p))));
++    }
++    for (int p = 0; p < 8; p++) {
++        /* lanes: [0+1, 2+3 | 4+5, 6+7] then [left, right] */
++        const v128_t w = wasm_u32x4_extadd_pairwise_u16x8(acc[p]);
++        left[p]  = (uint32_t)(wasm_i32x4_extract_lane(w, 0) + wasm_i32x4_extract_lane(w, 1));
++        right[p] = (uint32_t)(wasm_i32x4_extract_lane(w, 2) + wasm_i32x4_extract_lane(w, 3));
++    }
++}
++
++static inline void update(uint32_t sad, uint32_t* best_sad, uint32_t* best_mv, uint32_t mv, int search_index) {
++    if (sad < *best_sad) {
++        *best_sad                = sad;
++        const int16_t x_mv       = MVXT(mv) + (int16_t)search_index;
++        const int16_t y_mv       = MVYT(mv);
++        *best_mv                 = ((uint32_t)y_mv << 16) | ((uint16_t)x_mv);
++    }
++}
++
++void svt_ext_all_sad_calculation_8x8_16x16_wasm(uint8_t* src, uint32_t src_stride, uint8_t* ref, uint32_t ref_stride,
++                                                uint32_t mv, uint32_t* p_best_sad_8x8, uint32_t* p_best_sad_16x16,
++                                                uint32_t* p_best_mv8x8, uint32_t* p_best_mv16x16,
++                                                uint32_t p_eight_sad16x16[16][8], uint32_t p_eight_sad8x8[64][8],
++                                                bool sub_sad) {
++    (void)p_eight_sad8x8;
++    static const char offsets[16] = {0, 1, 4, 5, 2, 3, 6, 7, 8, 9, 12, 13, 10, 11, 14, 15};
++    const int         step        = sub_sad ? 2 : 1;
++    for (int y = 0; y < 4; y++) {
++        for (int x = 0; x < 4; x++) {
++            const uint8_t* s   = src + 16 * y * src_stride + 16 * x;
++            const uint8_t* r   = ref + 16 * y * ref_stride + 16 * x;
++            const uint32_t pos = offsets[4 * y + x];
++            uint32_t       q0[8], q1[8], q2[8], q3[8];
++            quadrant_rows(s, src_stride, r, ref_stride, step, q0, q1);
++            quadrant_rows(s + 8 * src_stride, src_stride, r + 8 * ref_stride, ref_stride, step, q2, q3);
++            uint32_t* best8  = p_best_sad_8x8 + 4 * pos;
++            uint32_t* mv8    = p_best_mv8x8 + 4 * pos;
++            for (int i = 0; i < 8; i++) {
++                /* Subsampled sums cover every other row; the C version doubles them. */
++                const uint32_t a = q0[i] << (step - 1), b = q1[i] << (step - 1);
++                const uint32_t c = q2[i] << (step - 1), d = q3[i] << (step - 1);
++                update(a, &best8[0], &mv8[0], mv, i);
++                update(b, &best8[1], &mv8[1], mv, i);
++                update(c, &best8[2], &mv8[2], mv, i);
++                update(d, &best8[3], &mv8[3], mv, i);
++                const uint32_t sad16 = p_eight_sad16x16[pos][i] = a + b + c + d;
++                update(sad16, &p_best_sad_16x16[pos], &p_best_mv16x16[pos], mv, i);
++            }
++        }
++    }
++}
+diff --git a/Source/Lib/ASM_WASM/sad_loop_wasm.c b/Source/Lib/ASM_WASM/sad_loop_wasm.c
+new file mode 100644
+index 0000000..e7d09a8
+--- /dev/null
++++ b/Source/Lib/ASM_WASM/sad_loop_wasm.c
+@@ -0,0 +1,94 @@
++/*
++ * Full-search SAD for SVT-AV1's hierarchical motion estimation, written for WebAssembly SIMD128.
++ *
++ * The x86 kernels are built around MPSADBW, which WebAssembly lacks and which costs about 19 instructions to
++ * emulate. Here each block row is compared with eight neighbouring reference positions at once: a 16-byte chunk of
++ * source against eight shifted 16-byte loads of reference, absolute differences with two saturating subtractions,
++ * and pairwise-widening adds into one accumulator per position. Results match svt_sad_loop_kernel_c exactly: the
++ * first strict minimum in raster order, the same row skipping, the same untouched centre when nothing beats
++ * 0xffffff.
++ */
++#include <stdint.h>
++#include <wasm_simd128.h>
++
++void svt_sad_loop_kernel_avx2_intrin(uint8_t* src, uint32_t src_stride, uint8_t* ref, uint32_t ref_stride,
++                                     uint32_t block_height, uint32_t block_width, uint64_t* best_sad,
++                                     int16_t* x_search_center, int16_t* y_search_center, uint32_t src_stride_raw,
++                                     uint8_t skip_search_line, int16_t search_area_width, int16_t search_area_height);
++
++static inline v128_t absdiff(v128_t a, v128_t b) {
++    return wasm_v128_or(wasm_u8x16_sub_sat(a, b), wasm_u8x16_sub_sat(b, a));
++}
++
++static inline uint32_t hsum_u32(v128_t v) {
++    v = wasm_i32x4_add(v, wasm_i32x4_shuffle(v, v, 2, 3, 0, 1));
++    v = wasm_i32x4_add(v, wasm_i32x4_shuffle(v, v, 1, 0, 3, 2));
++    return (uint32_t)wasm_i32x4_extract_lane(v, 0);
++}
++
++/* SADs of one block against positions x0..x0+7 of one search row, for block widths that are multiples of 8. */
++static inline void sad8_positions(const uint8_t* src, uint32_t src_stride, const uint8_t* ref, uint32_t ref_stride,
++                                  uint32_t block_height, uint32_t block_width, uint32_t out[8]) {
++    v128_t total[8];
++    for (int p = 0; p < 8; p++) total[p] = wasm_i32x4_splat(0);
++    const uint32_t wide    = block_width & ~15u; /* columns covered by 16-byte chunks */
++    const int      tail8   = block_width & 8; /* one more 8-byte chunk */
++    const uint32_t chunks  = wide / 16 + (tail8 ? 1 : 0);
++    /* Each widening add puts at most 510 in a 16-bit lane, so 128 of them fit before flushing to 32 bits. */
++    const uint32_t rows_per_flush = 128 / chunks;
++
++    for (uint32_t r0 = 0; r0 < block_height; r0 += rows_per_flush) {
++        const uint32_t r1 = r0 + rows_per_flush < block_height ? r0 + rows_per_flush : block_height;
++        v128_t         acc[8];
++        for (int p = 0; p < 8; p++) acc[p] = wasm_i16x8_splat(0);
++        for (uint32_t r = r0; r < r1; r++) {
++            const uint8_t* s = src + r * src_stride;
++            const uint8_t* q = ref + r * ref_stride;
++            for (uint32_t c = 0; c < wide; c += 16) {
++                const v128_t sv = wasm_v128_load(s + c);
++                for (int p = 0; p < 8; p++)
++                    acc[p] = wasm_i16x8_add(
++                        acc[p], wasm_u16x8_extadd_pairwise_u8x16(absdiff(sv, wasm_v128_load(q + c + p))));
++            }
++            if (tail8) {
++                const v128_t sv = wasm_v128_load64_zero(s + wide);
++                for (int p = 0; p < 8; p++)
++                    acc[p] = wasm_i16x8_add(
++                        acc[p], wasm_u16x8_extadd_pairwise_u8x16(absdiff(sv, wasm_v128_load64_zero(q + wide + p))));
++            }
++        }
++        for (int p = 0; p < 8; p++) total[p] = wasm_i32x4_add(total[p], wasm_u32x4_extadd_pairwise_u16x8(acc[p]));
++    }
++    for (int p = 0; p < 8; p++) out[p] = hsum_u32(total[p]);
++}
++
++void svt_sad_loop_kernel_wasm(uint8_t* src, uint32_t src_stride, uint8_t* ref, uint32_t ref_stride,
++                              uint32_t block_height, uint32_t block_width, uint64_t* best_sad,
++                              int16_t* x_search_center, int16_t* y_search_center, uint32_t src_stride_raw,
++                              uint8_t skip_search_line, int16_t search_area_width, int16_t search_area_height) {
++    if ((block_width & 7) || block_width > 64 || block_width == 0) {
++        svt_sad_loop_kernel_avx2_intrin(src, src_stride, ref, ref_stride, block_height, block_width, best_sad,
++                                        x_search_center, y_search_center, src_stride_raw, skip_search_line,
++                                        search_area_width, search_area_height);
++        return;
++    }
++    const int skip_even_rows = block_width == 16 && block_height <= 16 && skip_search_line;
++    uint64_t  best           = 0xffffff;
++    for (int16_t y = 0; y < search_area_height; y++, ref += src_stride_raw) {
++        if (skip_even_rows && (y & 1) == 0)
++            continue;
++        for (int16_t x0 = 0; x0 < search_area_width; x0 += 8) {
++            uint32_t sad[8];
++            sad8_positions(src, src_stride, ref + x0, ref_stride, block_height, block_width, sad);
++            const int n = search_area_width - x0 < 8 ? search_area_width - x0 : 8;
++            for (int p = 0; p < n; p++) {
++                if (sad[p] < best) {
++                    best             = sad[p];
++                    *x_search_center = (int16_t)(x0 + p);
++                    *y_search_center = y;
++                }
++            }
++        }
++    }
++    *best_sad = best;
++}
+diff --git a/Source/Lib/CMakeLists.txt b/Source/Lib/CMakeLists.txt
+index eb888b8..e513aa3 100644
+--- a/Source/Lib/CMakeLists.txt
++++ b/Source/Lib/CMakeLists.txt
+@@ -48,7 +48,11 @@ if(NOT COMPILE_C_ONLY AND HAVE_X86_PLATFORM)
+     add_subdirectory(ASM_SSE2)
+     add_subdirectory(ASM_SSSE3)
+     add_subdirectory(ASM_SSE4_1)
+-    add_subdirectory(ASM_SSE4_2)
++    if(NOT EMSCRIPTEN) # its only kernel is a CRC32 hash, which has no WebAssembly instruction
++        add_subdirectory(ASM_SSE4_2)
++    else()
++        add_subdirectory(ASM_WASM)
++    endif()
+     add_subdirectory(ASM_AVX2)
+     if(ENABLE_AVX512)
+         add_subdirectory(ASM_AVX512)
+@@ -90,7 +94,8 @@ if(NOT COMPILE_C_ONLY AND HAVE_X86_PLATFORM)
+         $<TARGET_OBJECTS:ASM_SSE2>
+         $<TARGET_OBJECTS:ASM_SSSE3>
+         $<TARGET_OBJECTS:ASM_SSE4_1>
+-        $<TARGET_OBJECTS:ASM_SSE4_2>
++        $<$<NOT:$<BOOL:${EMSCRIPTEN}>>:$<TARGET_OBJECTS:ASM_SSE4_2>>
++        $<$<BOOL:${EMSCRIPTEN}>:$<TARGET_OBJECTS:ASM_WASM>>
+         $<TARGET_OBJECTS:ASM_AVX2>)
+     if(ENABLE_AVX512)
+         target_sources(SvtAv1Enc PRIVATE
+diff --git a/Source/Lib/Codec/aom_dsp_rtcd.c b/Source/Lib/Codec/aom_dsp_rtcd.c
+index 2b5074a..a2417e8 100644
+--- a/Source/Lib/Codec/aom_dsp_rtcd.c
++++ b/Source/Lib/Codec/aom_dsp_rtcd.c
+@@ -220,6 +220,9 @@
+ // Thread-safe RTCD initialization using lazily-initialized mutex
+ DEFINE_ONCE_MUTEX(rtcd_init_mutex);
+ 
++#if defined(__EMSCRIPTEN__)
++#include "wasm_rtcd_fallbacks.h"
++#endif
+ void svt_aom_setup_rtcd_internal(EbCpuFlags flags) {
+     RUN_ONCE_MUTEX(rtcd_init_mutex);
+     svt_block_on_mutex(rtcd_init_mutex);
+diff --git a/Source/Lib/Codec/common_dsp_rtcd.c b/Source/Lib/Codec/common_dsp_rtcd.c
+index ef77016..43cb3df 100644
+--- a/Source/Lib/Codec/common_dsp_rtcd.c
++++ b/Source/Lib/Codec/common_dsp_rtcd.c
+@@ -27,8 +27,12 @@
+ 
+ #if defined ARCH_X86_64
+ #define AOM_ARCH_X86_64 ARCH_X86_64
++#if defined(__EMSCRIPTEN__)
++/* WebAssembly: no cpuid. Emscripten translates SSE2..AVX2 intrinsics to WebAssembly SIMD128, so report those. */
++#else
+ #include "third_party/aom/aom_ports/x86.h"
+ #endif
++#endif
+ 
+ #if defined ARCH_AARCH64
+ 
+@@ -71,6 +75,12 @@ int64_t svt_av1_block_error_c(const TranLow *coeff, const TranLow *dqcoeff, intp
+  * Instruction Set Support
+  **************************************/
+ #ifdef ARCH_X86_64
++#if defined(__EMSCRIPTEN__)
++EbCpuFlags svt_aom_get_cpu_flags() {
++    return EB_CPU_FLAGS_MMX | EB_CPU_FLAGS_SSE | EB_CPU_FLAGS_SSE2 | EB_CPU_FLAGS_SSE3 | EB_CPU_FLAGS_SSSE3 |
++        EB_CPU_FLAGS_SSE4_1 | EB_CPU_FLAGS_AVX | EB_CPU_FLAGS_AVX2;
++}
++#else
+ EbCpuFlags svt_aom_get_cpu_flags() {
+     EbCpuFlags flags     = 0;
+     const int  aom_flags = x86_simd_caps();
+@@ -94,6 +104,7 @@ EbCpuFlags svt_aom_get_cpu_flags() {
+ 
+     return flags;
+ }
++#endif
+ 
+ EbCpuFlags svt_aom_get_cpu_flags_to_use() {
+     EbCpuFlags flags = svt_aom_get_cpu_flags();
+@@ -472,6 +483,9 @@ int svt_aom_library_built_for_unit_tests(void) {
+ #endif
+ }
+ 
++#if defined(__EMSCRIPTEN__)
++#include "wasm_rtcd_fallbacks.h"
++#endif
+ void svt_aom_setup_common_rtcd_internal(EbCpuFlags flags) {
+     RUN_ONCE_MUTEX(common_rtcd_init_mutex);
+     svt_block_on_mutex(common_rtcd_init_mutex);
+diff --git a/test/CMakeLists.txt b/test/CMakeLists.txt
+index 67574ef..5b85ca1 100644
+--- a/test/CMakeLists.txt
++++ b/test/CMakeLists.txt
+@@ -168,7 +168,8 @@ if(HAVE_X86_PLATFORM)
+       $<TARGET_OBJECTS:ASM_SSE2>
+       $<TARGET_OBJECTS:ASM_SSSE3>
+       $<TARGET_OBJECTS:ASM_SSE4_1>
+-      $<TARGET_OBJECTS:ASM_SSE4_2>
++      $<$<NOT:$<BOOL:${EMSCRIPTEN}>>:$<TARGET_OBJECTS:ASM_SSE4_2>>
++      $<$<BOOL:${EMSCRIPTEN}>:$<TARGET_OBJECTS:ASM_WASM>>
+       $<TARGET_OBJECTS:ASM_AVX2>)
+   if(ENABLE_AVX512)
+     list(APPEND x86_arch_lib_list

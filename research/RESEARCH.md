@@ -129,6 +129,51 @@ short clips pay for it. Native x264, same settings, same CRF, the whole clip vs.
 | park (5 s) | +1.7% | +3.9% |
 | screen recording (8 s) | +10% | +45% |
 
+## AV1: SVT-AV1 in WebAssembly, with SIMD
+
+The biggest quality lever left is the codec. At preset 8, SVT-AV1 needs 29.9% fewer bits than Pare's x264 setting
+for the same VMAF NEG on the corpus (native builds, same scoring): −54.9% on town, −52.4% on tree, −44.3% on Big Buck
+Bunny, −68.5% on the screen recording, +6.6% on park and +34.4% on ducks, where AV1 smooths the rippling water that
+x264's psychovisual tuning keeps. None of SVT-AV1's tuning switches fixed ducks (tune 0, temporal filtering off,
+variance boost: +31% to +40%). SVT-AV1 had only been compiled to WebAssembly as plain C before (its own merge
+request !2571 notes the "lack of simd"). `av1-wasm/` builds it with SIMD:
+
+- **Translate, don't port.** SVT-AV1 writes its speed-critical code as C intrinsics: 108 files of SSE2 to AVX2 and
+  63 of Arm Neon. Emscripten translates x86 intrinsics to WebAssembly SIMD (AVX2 as pairs of 128-bit operations), and
+  its `arm_neon.h` is SIMDe, which does the same for Neon. Every one of those 171 files compiles; the only exception
+  is a CRC32 hash with no WebAssembly instruction, which keeps its C version.
+- **Route around the assembly.** 20 NASM files (and 3 `.S` files on Arm) can't be built. `gen_fallbacks.py`
+  preprocesses every intrinsic file, since several build the names of the functions they call with `##`, finds the
+  95 functions that reach assembly directly or through helpers, and points each of the 109 affected dispatch entries
+  at the next implementation in the same line.
+- **Let the unit tests find what translation breaks.** SVT-AV1's own tests, which compare every SIMD kernel with its
+  C version, build for WebAssembly too. 127 AVX2 test groups pass. One failed: `svt_copy_mi_map_grid_avx2` (and its
+  Neon twin) broadcasts a pointer as a 64-bit value, which corrupts memory where pointers are 32 bits. It's excluded.
+- **Fix the emulations that are really scalar loops.** Emscripten implements `_mm_mpsadbw_epu8` as 32 byte
+  extractions and `_mm_minpos_epu16` as a loop, and SVT-AV1's motion search uses them 543 and 112 times.
+  `av1-wasm/include/` replaces both, and shortens `_mm_sad_epu8`, with SIMD versions checked against the originals
+  on a million random inputs. They're drop-in headers, so they'd help any x86 code built with Emscripten.
+- **Write WebAssembly kernels where emulation still loses.** Full-search SAD (hierarchical motion estimation) and the
+  8x8/16x16 all-position SAD were 3.4% and 2.0% of native encode time but 20% and 8% in WebAssembly. Both are
+  rewritten around WebAssembly's own strengths (eight shifted loads per source chunk, saturating subtractions,
+  pairwise-widening adds) and checked against the C semantics on 18,000 and 3,000 random cases.
+
+Every build below produces output byte-identical to native SVT-AV1 (150 frames of park, 1080p, preset 8, CRF 35):
+
+| Build | Speed, one thread |
+| --- | --- |
+| x86 intrinsics translated | 2.18 fps |
+| Arm Neon intrinsics via SIMDe | 2.38 fps |
+| x86, with SIMD MPSADBW and PHMINPOSUW | 2.85 fps |
+| x86, plus the WebAssembly SAD loop | 3.37 fps |
+| x86, plus the WebAssembly all-position SAD | **3.42 fps** (50% of native's 6.9) |
+
+For scale, plain C is hopeless: 30 frames at preset 10 take 20.2 s in WebAssembly and 17.5 s natively, against 2.0 s
+for native SIMD.
+
+With SVT-AV1's own threading (`--lp 8`) the WebAssembly build encodes 1080p at 11.8 fps on the 4-core, 8-thread
+test machine, against about 24 fps for Pare's chunked x264. Output is identical at every thread count.
+
 ## Threads
 
 x264 has its own frame threading, and Emscripten can compile it with pthreads (it needs `SharedArrayBuffer`, so the
