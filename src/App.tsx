@@ -4,7 +4,7 @@ import { Compare } from './components/Compare'
 import { BENCHMARKS, BENCHMARK_SETUP } from './benchmarks'
 import * as fmt from './lib/format'
 import type { Calibration, Job, QualityReport } from './lib/media'
-import type { Progress } from './lib/x264'
+import type { Progress, SizePlan } from './lib/x264'
 import { CODEC_LABEL, outputSize, type Engine, type OutputCodec, type Preset, type Probe, type Settings } from './lib/shared'
 
 const media = () => import('./lib/media')
@@ -32,6 +32,12 @@ type CalibrationEntry = {
   result?: Calibration
   /** A compression is waiting on this result, so leaving the settings screen mustn't cancel it. */
   needed?: boolean
+  /**
+   * Auto: H.264's plan, ready before AV1's test is, whether H.264 can reach the size target, and a way to stop the
+   * test when the compression starts without it.
+   */
+  first?: Promise<Calibration & { reaches: boolean }>
+  skipTest?: () => void
 }
 
 /** Thorough runs Pare's own WebAssembly encoders: x264 for H.264, SVT-AV1 for AV1. */
@@ -192,20 +198,29 @@ export default function App() {
     const onRound = (round: number) => {
       if (currentKey.current === key) setTuning({ key, round })
     }
+    const fromPlan = ({ size, crf, raised, fitted, slope, points }: SizePlan): Calibration =>
+      ({ bitrate: 0, size, ssim: 0, target: 0, reached: true, crf, raised, fitted, slope, points })
+    // Auto tests AV1 while the settings are on screen. Starting before the test ends goes ahead with H.264 when it
+    // meets the size target, so a quick start doesn't wait for a test that rarely changes the answer.
+    const test = new AbortController()
+    controller.signal.addEventListener('abort', () => test.abort())
+    const first = usesX264(settings) && settings.autoCodec
+      ? x264().then(async (m) => ({ m, avc: await m.planAvc(probe, settings, controller.signal) }))
+      : null
     const entry: CalibrationEntry = {
       controller,
-      promise: usesX264(settings)
-        ? x264().then(async (m) => {
-            if (settings.autoCodec) {
-              const { codec, plan, reason, vmaf } = await m.choose(probe, settings, controller.signal)
-              const { size, crf, raised, fitted, slope, points } = plan
-              return { bitrate: 0, size, ssim: 0, target: 0, reached: true, crf, raised, fitted, slope, points, codec,
-                choice: { reason, vmaf } }
-            }
-            const { size, crf, raised, fitted, slope, points } = await m.plan(probe, settings, controller.signal)
-            return { bitrate: 0, size, ssim: 0, target: 0, reached: true, crf, raised, fitted, slope, points }
+      first: first?.then(({ m, avc }) => ({ ...fromPlan(avc), codec: 'avc' as const, reaches: m.avcReaches(probe, settings, avc) })),
+      skipTest: () => test.abort(),
+      promise: first
+        ? first.then(async ({ m, avc }) => {
+            if (m.testsAv1(probe, settings, avc) && currentKey.current === key && !entry.result)
+              setTuning({ key, result: { ...fromPlan(avc), codec: 'avc', choice: { reason: 'testing' } } })
+            const { codec, plan, reason, vmaf } = await m.settle(probe, settings, avc, test.signal)
+            return { ...fromPlan(plan), codec, choice: { reason, vmaf } }
           })
-        : media().then((m) => m.calibrate(probe, settings, controller.signal, onRound)),
+        : usesX264(settings)
+          ? x264().then(async (m) => fromPlan(await m.plan(probe, settings, controller.signal)))
+          : media().then((m) => m.calibrate(probe, settings, controller.signal, onRound)),
     }
     entry.promise.then(
       (result) => {
@@ -276,7 +291,7 @@ export default function App() {
       status: !usesX264(settings)
         ? 'Finishing tuning…'
         : waitFor && !waitFor.result
-          ? settings.autoCodec ? 'Finishing format tests…' : 'Finishing size tests…'
+          ? 'Finishing size tests…'
           : 'Starting encoders…',
     })
     const onProgress = (progress: Progress) => setPhase((p) => (p.kind === 'running' ? { ...p, progress } : p))
@@ -284,7 +299,17 @@ export default function App() {
     try {
       if (usesX264(settings)) {
         const engine = await x264()
-        const plan = waitFor ? await waitFor.promise.catch(() => undefined) : undefined
+        let plan: Calibration | undefined
+        if (waitFor?.first && !waitFor.result) {
+          const first = await waitFor.first.catch(() => undefined)
+          if (first?.reaches && !waitFor.result) {
+            waitFor.skipTest?.()
+            plan = first
+          } else if (!waitFor.result) {
+            setPhase((p) => (p.kind === 'running' ? { ...p, status: "Testing AV1: H.264 can't reach half the size…" } : p))
+          }
+        }
+        plan ??= waitFor ? await waitFor.promise.catch(() => undefined) : undefined
         if (run.canceled) return
         setPhase((p) => (p.kind === 'running' ? { ...p, status: 'Starting encoders…' } : p))
         codec = settings.autoCodec ? plan?.codec ?? 'avc' : thoroughCodec(settings)
@@ -630,6 +655,7 @@ function FileSummary({ probe, onReplace }: { probe: Probe; onReplace?: () => voi
 /** What Auto picked and why, as "format: reason" in one line on wide screens (two on phones). */
 function choiceDetail({ reason, vmaf }: NonNullable<Calibration['choice']>) {
   const gain = vmaf?.av1 !== undefined ? vmaf.av1 - vmaf.avc : 0
+  if (reason === 'testing') return 'H.264 so far, testing AV1'
   if (reason === 'high' && vmaf) return `H.264: already ${Math.round(vmaf.avc)} VMAF here`
   if (vmaf?.av1 === undefined && reason === 'even') return 'Measured on short test encodes'
   if (reason === 'device') return "H.264: this device can't play AV1"

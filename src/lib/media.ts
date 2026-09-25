@@ -180,7 +180,11 @@ export type Calibration = {
   points?: { crf: number; bytes: number }[]
   /** Auto: the encoder the in-browser test picked, why, and each one's predicted VMAF NEG at the target size. */
   codec?: 'avc' | 'av1'
-  choice?: { reason: 'unlimited' | 'fits' | 'high' | 'device' | 'size' | 'better' | 'even'; vmaf?: { avc: number; av1?: number } }
+  choice?: {
+    /** testing: H.264's plan so far, while AV1's test runs. */
+    reason: 'unlimited' | 'fits' | 'high' | 'device' | 'size' | 'better' | 'even' | 'testing'
+    vmaf?: { avc: number; av1?: number }
+  }
 }
 
 type Segment = {

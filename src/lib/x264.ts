@@ -945,6 +945,8 @@ const SIZE_AIM = 0.47
 const WINDOW_FRAMES = 24
 /** Test-window estimates came in 3-11% under the finished files (median ~7%); scale them to match. */
 const ESTIMATE_BIAS = 1.08
+/** The plan windows AV1's test uses when choosing the codec: every other one of four. */
+const AV1_TEST_WINDOWS = [1, 3]
 /** Frames of each test window scored with VMAF when choosing the codec (research/codec_choice.py). */
 const SCORED_FRAMES = 2
 /**
@@ -973,8 +975,11 @@ export type SizePlan = {
   fitted?: boolean
   /** Measured change in log size per rate factor step. */
   slope?: number
-  /** Predicted video bytes at the tested rate factors, and VMAF NEG of the test windows when measured. */
-  points?: { crf: number; bytes: number; vmaf?: number }[]
+  /**
+   * Predicted video bytes at the tested rate factors, and VMAF NEG of the test windows when measured. `subset` is
+   * the same from only the windows AV1's test uses.
+   */
+  points?: { crf: number; bytes: number; vmaf?: number; subset?: { bytes: number; vmaf?: number } }[]
   /** The size target binds: the lower test didn't fit, so the rate factor was raised to make it fit. */
   bound?: boolean
 }
@@ -984,7 +989,36 @@ export type SizePlan = {
  * rate factor would leave the file bigger than half the original, searches for the lowest rate factor that gets
  * there (x264 roughly halves the bits every +6).
  */
-export async function plan(probe: Probe, settings: Settings, signal: AbortSignal, measure = false): Promise<SizePlan> {
+type PlanPoint = NonNullable<SizePlan['points']>[number]
+
+/**
+ * The rate factor that meets the size target, from the predicted sizes at the plan's two test rate factors (the
+ * preset's or the quality ceiling, and a higher one).
+ */
+function fit(probe: Probe, settings: Settings, points: PlanPoint[]): SizePlan {
+  const profile = profileFor(settings)
+  const baseCrf = presetCrf(settings)
+  const audio = audioBytes(probe, settings)
+  const [{ crf: lo, bytes: atLo }, { crf: hi, bytes: atHi }] = points
+  // Decide against the aim, not the target itself: estimates run up to ~10% low, and a file predicted at 48% could
+  // land above half.
+  const goal = videoGoal(probe, settings)
+  // log(size) is close to linear in the rate factor; interpolate (or extrapolate) between the two tests.
+  const measured = (Math.log(atHi) - Math.log(atLo)) / (hi - lo)
+  const slope = measured < -0.03 ? measured : profile.slope
+  if (atLo <= goal) return { crf: lo, size: atLo + audio, raised: false, fitted: false, slope, points, bound: false }
+  let crf = Math.min(profile.max, Math.max(lo, lo + (Math.log(goal) - Math.log(atLo)) / slope))
+  // Past the higher test the straight line tends to overstate sizes (the noise stops costing bits), so land halfway
+  // back: the encode checks its real size and corrects either way.
+  if (crf > hi) crf = hi + (crf - hi) / 2
+  const video = Math.exp(Math.log(atLo) + slope * (crf - lo))
+  console.info(`[pare] plan: crf ${crf.toFixed(1)} → ${(video / 1e6).toFixed(2)} MB video, slope ${slope.toFixed(3)}`)
+  return { crf: Math.round(crf * 10) / 10, size: Math.min(video, goal) + audio, raised: crf > baseCrf,
+    fitted: settings.preset === 'visually-lossless', slope, points, bound: true }
+}
+
+export async function plan(probe: Probe, settings: Settings, signal: AbortSignal, measure = false,
+                           only?: number[]): Promise<SizePlan> {
   const began = performance.now()
   const { input, track } = await openTrack(probe.file)
   const rotation = await track.getRotation()
@@ -1001,14 +1035,18 @@ export async function plan(probe: Probe, settings: Settings, signal: AbortSignal
   // window starts on a source keyframe when one is close, so its decoder doesn't work through frames it won't use.
   const { encoders, threads } = workerCount(probe, settings)
   const windowCount = Math.max(1, Math.min(Math.floor(encoders / 2) || 1, Math.floor(times.length / 40)))
-  const count = Math.min(encoders, windowCount * 2)
   const per = Math.min(Math.floor(times.length / windowCount), WINDOW_FRAMES)
-  const windows = Array.from({ length: windowCount }, (_, i) => {
+  const all = Array.from({ length: windowCount }, (_, i) => {
     const ideal = Math.min(times.length - per, Math.max(0, Math.round(((i + 0.5) / windowCount) * times.length - per / 2)))
     const near = line.keys.filter((k) => Math.abs(k - ideal) <= times.length / windowCount / 3 && k + per <= times.length)
     const first = near.length ? near.reduce((a, b) => (Math.abs(b - ideal) < Math.abs(a - ideal) ? b : a)) : ideal
     return { start: times[first], end: first + per < times.length ? times[first + per] : Infinity }
   })
+  // A test on some of the windows (AV1 when choosing the codec) keeps their positions, so another encoder's test on
+  // all of them can tell how the rest compare.
+  const picked = only?.filter((i) => i < all.length)
+  const windows = picked?.length ? picked.map((i) => all[i]) : all
+  const count = Math.min(encoders, windows.length * 2)
   // The real encode starts a keyframe per chunk and roughly every 250 frames, plus one per scene cut.
   const fixedKeyframes = planChunks(line, encoders, profile.decodeShare).length + Math.floor(times.length / 250)
   if (signal.aborted) throw new Canceled()
@@ -1045,11 +1083,11 @@ export async function plan(probe: Probe, settings: Settings, signal: AbortSignal
     const encoded = await pool.run(chunks, () => {})
     if (signal.aborted) throw new Canceled()
     lastScores = encoded.map((c) => c.timing.score ?? 0)
-    return crfs.map((_, c) => {
-      // Keyframes are priced separately: every window starts with one, which would over-count them. Keyframes
-      // later in a window are scene cuts, and their rate carries over to the whole video.
+    // Keyframes are priced separately: every window starts with one, which would over-count them. Keyframes later in
+    // a window are scene cuts, and their rate carries over to the whole video.
+    const estimate = (tests: EncodedChunk[]) => {
       let keyBytes = 0, keyCount = 0, restBytes = 0, restCount = 0, sceneCuts = 0, frames = 0
-      for (const chunk of encoded.slice(c * windows.length, (c + 1) * windows.length)) {
+      for (const chunk of tests) {
         frames += chunk.times.length
         for (const p of chunk.packets) {
           if (p.key) (keyBytes += p.data.byteLength), keyCount++
@@ -1061,9 +1099,21 @@ export async function plan(probe: Probe, settings: Settings, signal: AbortSignal
       const perKey = keyCount ? keyBytes / keyCount : 0
       const perFrame = restCount ? restBytes / restCount : perKey
       // Short windows see less of the lookahead's bit redistribution and ran 3-11% low against full encodes.
-      const bytes = ESTIMATE_BIAS * (perKey * keyframes + perFrame * Math.max(0, times.length - keyframes))
-      const scores = encoded.slice(c * windows.length, (c + 1) * windows.length).flatMap((w) => (w.vmaf! >= 0 ? [w.vmaf!] : []))
-      return { crf: crfs[c], bytes, vmaf: scores.length ? scores.reduce((a, b) => a + b, 0) / scores.length : undefined }
+      return ESTIMATE_BIAS * (perKey * keyframes + perFrame * Math.max(0, times.length - keyframes))
+    }
+    const vmaf = (tests: EncodedChunk[]) => {
+      const scores = tests.flatMap((w) => (w.vmaf! >= 0 ? [w.vmaf!] : []))
+      return scores.length ? scores.reduce((a, b) => a + b, 0) / scores.length : undefined
+    }
+    return crfs.map((crf, c): PlanPoint => {
+      const tests = encoded.slice(c * windows.length, (c + 1) * windows.length)
+      const some = tests.filter((_, i) => AV1_TEST_WINDOWS.includes(i))
+      return {
+        crf,
+        bytes: estimate(tests),
+        vmaf: vmaf(tests),
+        subset: measure && !picked ? { bytes: estimate(some), vmaf: vmaf(some) } : undefined,
+      }
     })
   }
 
@@ -1074,29 +1124,13 @@ export async function plan(probe: Probe, settings: Settings, signal: AbortSignal
     }
     // Visually lossless spends the whole budget on quality: test the quality ceiling and a point well below it. Other
     // presets keep their own rate factor unless it would miss the target.
-    const lossless = settings.preset === 'visually-lossless'
-    const lo = lossless ? profile.ceiling : baseCrf
-    const hi = Math.min(profile.max, lo + (lossless ? profile.span.lossless : profile.span.other))
+    const lo = settings.preset === 'visually-lossless' ? profile.ceiling : baseCrf
+    const hi = Math.min(profile.max, lo + (settings.preset === 'visually-lossless' ? profile.span.lossless : profile.span.other))
     const points = await videoAt([lo, hi])
-    const [atLo, atHi] = points.map((p) => p.bytes)
-    // Decide against the aim, not the target itself: estimates run up to ~10% low, and a file predicted at 48% could
-    // land above half.
-    const goal = videoGoal(probe, settings)
-    // log(size) is close to linear in the rate factor; interpolate (or extrapolate) between the two tests.
-    const measured = (Math.log(atHi) - Math.log(atLo)) / (hi - lo)
-    const slope = measured < -0.03 ? measured : profile.slope
     const scoring = measure ? `, scoring ${(Math.max(...lastScores) / 1000).toFixed(1)} s per window` : ''
     console.info(`[pare] plan: ${(performance.now() - began) / 1000 | 0} s${scoring}, ${windows.length}×${per} frames, ` +
-      `crf ${lo} → ${(atLo / 1e6).toFixed(1)} MB, crf ${hi} → ${(atHi / 1e6).toFixed(1)} MB, slope ${slope.toFixed(3)}`)
-    if (atLo <= goal) return { crf: lo, size: atLo + audio, raised: false, fitted: false, slope, points, bound: false }
-    let crf = Math.min(profile.max, Math.max(lo, lo + (Math.log(goal) - Math.log(atLo)) / slope))
-    // Past the higher test the straight line tends to overstate sizes (the noise stops costing bits), so land
-    // halfway back: the encode checks its real size and corrects either way.
-    if (crf > hi) crf = hi + (crf - hi) / 2
-    const video = Math.exp(Math.log(atLo) + slope * (crf - lo))
-    console.info(`[pare] plan: crf ${crf.toFixed(1)} → ${(video / 1e6).toFixed(2)} MB video`)
-    return { crf: Math.round(crf * 10) / 10, size: Math.min(video, goal) + audio, raised: crf > baseCrf, fitted: lossless, slope,
-      points, bound: true }
+      points.map((p) => `crf ${p.crf} → ${(p.bytes / 1e6).toFixed(1)} MB`).join(', '))
+    return fit(probe, settings, points)
   } finally {
     signal.removeEventListener('abort', stop)
     pool.terminate()
@@ -1143,25 +1177,47 @@ async function playsAv1(width: number, height: number, fps: number) {
   }
 }
 
+/** Auto, first step: H.264's size plan, with VMAF measured on its test windows. */
+export const planAvc = (probe: Probe, settings: Settings, signal: AbortSignal) =>
+  plan(probe, { ...settings, codec: 'avc' }, signal, settings.sizeTarget)
+
+/** Whether H.264 can meet the size target at all, going by its plan. Otherwise Auto has to wait for AV1's test. */
+export const avcReaches = (probe: Probe, settings: Settings, avc: SizePlan) =>
+  !settings.sizeTarget || !avc.bound || bytesAt(avc.points, X264.max) <= videoGoal(probe, settings)
+
+/** Whether `settle` will test AV1 (unless this device can't play it), given H.264's plan. */
+export function testsAv1(probe: Probe, settings: Settings, avc: SizePlan) {
+  if (!settings.sizeTarget || !avc.bound) return false
+  const score = vmafAt(avc.points, videoGoal(probe, settings))
+  return score !== undefined && !(avcReaches(probe, settings, avc) && score >= AUTO_HIGH)
+}
+
 /**
- * Auto: tests both encoders on the size plan's windows and keeps the one that looks better at the target size, by
- * VMAF NEG measured in the browser on a few frames of each window. H.264 wins ties and needs no AV1 test when it
- * already fits at its best quality. In the corpus test (research/codec_choice.py) this picked the better encoder in 28
- * of 30 cases, and the two it missed were within 0.31 points.
+ * Auto, second step: keeps the encoder that looks better at the target size, by VMAF NEG measured in the browser on
+ * a few frames of each test window. H.264 wins ties and needs no AV1 test when it already fits at its best quality or
+ * scores AUTO_HIGH. In the corpus test (research/codec_choice.py) this matched "AV1 only when it's a point better" in
+ * 27 of 30 cases, and the three it missed were within a point of the margin.
  */
-export async function choose(probe: Probe, settings: Settings, signal: AbortSignal): Promise<Choice> {
-  const avc = await plan(probe, { ...settings, codec: 'avc' }, signal, settings.sizeTarget)
+export async function settle(probe: Probe, settings: Settings, avc: SizePlan, signal: AbortSignal): Promise<Choice> {
   if (!settings.sizeTarget) return { codec: 'avc', plan: avc, reason: 'unlimited' }
   if (!avc.bound) return { codec: 'avc', plan: avc, reason: 'fits' }
   const goal = videoGoal(probe, settings)
-  const reaches = bytesAt(avc.points, X264.max) <= goal
+  const reaches = avcReaches(probe, settings, avc)
   const avcScore = vmafAt(avc.points, goal)
   if (avcScore === undefined) return { codec: 'avc', plan: avc, reason: 'even' }
   if (reaches && avcScore >= AUTO_HIGH) return { codec: 'avc', plan: avc, vmaf: { avc: avcScore }, reason: 'high' }
   const { width, height } = outputSize(probe, settings.shortSide)
   if (!(await playsAv1(width, height, probe.fps))) return { codec: 'avc', plan: avc, vmaf: { avc: avcScore }, reason: 'device' }
-  const av1 = await plan(probe, { ...settings, codec: 'av1' }, signal, true)
-  const vmaf = { avc: avcScore, av1: vmafAt(av1.points, goal) }
+  // Two windows choose as well as four (research/codec_choice.py), and four test encodes on four cores take about half
+  // as long as eight sharing them. Their size estimate is off by however those two windows differ from the video, which
+  // H.264's test on all four measured: scale by that.
+  const tested = await plan(probe, { ...settings, codec: 'av1' }, signal, true, AV1_TEST_WINDOWS)
+  const ratios = avc.points!.flatMap((p) => (p.subset ? [Math.log(p.bytes / p.subset.bytes)] : []))
+  const scale = ratios.length ? Math.exp(ratios.reduce((a, b) => a + b, 0) / ratios.length) : 1
+  const av1 = fit(probe, { ...settings, codec: 'av1' }, tested.points!.map((p) => ({ ...p, bytes: p.bytes * scale })))
+  // Compare like with like: both encoders on the same two windows, at the size those windows' share of the target is.
+  const same = avc.points!.map((p) => ({ crf: p.crf, bytes: p.subset?.bytes ?? p.bytes, vmaf: p.subset?.vmaf ?? p.vmaf }))
+  const vmaf = { avc: vmafAt(same, goal / scale) ?? avcScore, av1: vmafAt(tested.points, goal / scale) }
   console.info(`[pare] auto: VMAF NEG at ${(goal / 1e6).toFixed(1)} MB, H.264 ${vmaf.avc.toFixed(2)}, AV1 ${vmaf.av1?.toFixed(2)}; ` +
     `rate factors ${avc.crf} / ${av1.crf}`)
   // x264 at its highest rate factor still over the target: only AV1 can keep the size promise.

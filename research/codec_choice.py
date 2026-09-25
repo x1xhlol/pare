@@ -45,8 +45,15 @@ def frame_count(path):
     return (os.path.getsize(path) - len(header) - 1) // (w * h * 3 // 2 + 6)
 
 
-def window_starts(n):
-    return [max(0, min(n - FRAMES, round((i + 0.5) / WINDOWS * n - FRAMES / 2))) for i in range(WINDOWS)]
+# AV1 test windows: fewer than the plan's 4 halves the test's time in the browser. With 2, AV1 runs on the 2nd and
+# 4th of x264's windows (as Pare does) and is compared with x264 on those same two, at the target size scaled by how
+# those windows' estimate differs from all four's.
+AV1_WINDOWS = int(os.environ.get('AV1_WINDOWS', WINDOWS))
+SUBSET = (1, 3)
+
+
+def window_starts(n, count=WINDOWS):
+    return [max(0, min(n - FRAMES, round((i + 0.5) / count * n - FRAMES / 2))) for i in range(count)]
 
 
 def vmaf_neg(out, clip, start):
@@ -93,9 +100,11 @@ def encode_av1(clip, start, crf):
 def windows(pool, clip, n):
     """Both codecs at both test rate factors over the plan's windows: futures keyed by (codec, crf)."""
     jobs = {}
+    starts = window_starts(n)
     for codec, crfs, fn in (('x264', X264_CRFS, encode_x264), ('av1', AV1_CRFS, encode_av1)):
         for crf in crfs:
-            jobs[(codec, crf)] = [pool.submit(fn, clip, s, crf) for s in window_starts(n)]
+            some = [starts[i] for i in SUBSET] if codec == 'av1' and AV1_WINDOWS == 2 else starts
+            jobs[(codec, crf)] = [pool.submit(fn, clip, s, crf) for s in some]
     return jobs
 
 
@@ -149,15 +158,20 @@ def main():
         for clip, (n, jobs) in pending.items():
             points = {codec: [predict([f.result() for f in jobs[(codec, crf)]], n) for crf in crfs]
                       for codec, crfs in (('x264', X264_CRFS), ('av1', AV1_CRFS))}
+            scale = 1
+            if AV1_WINDOWS == 2:
+                sub = [predict([jobs[('x264', crf)][i].result() for i in SUBSET], n) for crf in X264_CRFS]
+                scale = math.exp(sum(math.log(a[0] / b[0]) for a, b in zip(points['x264'], sub)) / len(sub))
+                points['x264'] = sub
             for size, _, crf in sorted(xt[clip], key=lambda p: p[2]):
                 vx, va = vmaf_at(xt[clip], size), vmaf_at(at[clip], size)
                 if vx is None or va is None:
                     continue
                 cases.append({'clip': clip, 'x264_crf': crf, 'bytes': size, 'vmaf_neg': {'x264': vx, 'av1': va},
-                              'psnr_predicted': {c: metric_at(points[c], size, 1) for c in points},
-                              'vmaf_neg_predicted': {c: metric_at(points[c], size, 2) for c in points},
+                              'psnr_predicted': {c: metric_at(points[c], size / scale, 1) for c in points},
+                              'vmaf_neg_predicted': {c: metric_at(points[c], size / scale, 2) for c in points},
                               'windows': {c: [list(p) for p in points[c]] for c in points}})
-    with open(f'{HERE}/codec_choice{f"-run{RUN}" if RUN else ""}{"" if AV1_PRESET == "10" else f"-p{AV1_PRESET}"}.jsonl', 'w') as f:
+    with open(f'{HERE}/codec_choice{f"-run{RUN}" if RUN else ""}{"" if AV1_PRESET == "10" else f"-p{AV1_PRESET}"}{f"-w{AV1_WINDOWS}" if AV1_WINDOWS != WINDOWS else ""}.jsonl', 'w') as f:
         for c in cases:
             f.write(json.dumps(c) + '\n')
 
