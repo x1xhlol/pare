@@ -31,6 +31,8 @@ export type X264Module = {
 }
 
 type Options = {
+  /** Threaded build only: how many thread workers to start with the module. */
+  threads?: number
   instantiateWasm?: (
     imports: WebAssembly.Imports,
     done: (instance: WebAssembly.Instance, module: WebAssembly.Module) => void,

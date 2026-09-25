@@ -150,15 +150,26 @@ Profile of the SIMD build (park, 1080p, shipped settings), top functions by self
 
 | Function | Share | Notes |
 | --- | --- | --- |
-| `avg2_wxh` (sub-pixel averaging) | 10.3% | already SIMD; memory-bound |
-| `me_search_ref`, `refine_subpel` | 10.7% | motion search control flow |
-| SATD 16×16 / 8×8 | 10.5% | SIMD |
+| `avg2_wxh` (sub-pixel averaging) | 10.5% | SIMD, 8.6× the C per call; it's the first read of each candidate's reference pixels, so it takes the cache misses |
+| `me_search_ref`, `refine_subpel` | 12% | motion search control flow, scalar in native x264 too |
+| SATD 16×16 / 8×8 | 10.7% | SIMD |
 | SAD and SAD×3/×4 | ~17% | SIMD |
-| `quant_4x4_trellis` and helpers | ~6% | scalar in x264's C |
-| CABAC | ~4% | scalar by nature |
-| SSIM (`ssim_4x4x2_core`, `ssim_end4`) | 2.3–3.2% | scalar; cost of scoring every frame |
+| `quant_4x4_trellis` and helpers | ~6% | scalar in x264's C; the x86-64 assembly for it is a specialised rewrite |
+| CABAC | ~3.3% | scalar by nature |
 
-The single-thread WebAssembly build runs at 54% of native x264 with the same settings (4.25 vs. 7.85 fps on park).
+Two more kernels since the first round: per-frame SSIM (`ssim_4x4x2_core`, `ssim_end4`) and explicit weighted
+prediction (`mc_weight`, whose chroma scales reach 255, so products use unsigned 16-bit lanes and saturate before the
+offset). SSIM went from 2.3–3.2% of the time to 0.4%, and encodes got ~4% faster, byte-identical as before. Link-time
+optimisation (`-flto`) changed nothing (4.05 vs. 4.07 fps). The single-thread WebAssembly build runs at 54% of native
+x264 with the same settings (4.25 vs. 7.85 fps on park).
+
+## A faster plan that wasn't
+
+The plan costs 10–14 s before the encode starts, all of it encoding test windows (24 frames per window at ~2.7 fps per
+worker when 8 share 4 cores). A two-round version was tried: 8 windows of 12 frames at CRF 15, then, only if that
+didn't fit, the same windows at a rate factor estimated from the first round. Easy footage finished planning in 6.5 s
+instead of 10, but 12-frame windows underestimate the finished size by 20–100% (most of a 12-frame window is the
+cheap stretch right after its keyframe), so hard clips needed refits and got slower overall. Reverted.
 
 ## End to end in the browser
 

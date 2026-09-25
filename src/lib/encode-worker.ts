@@ -2,11 +2,16 @@
 // Encodes chunks of one video with x264 (WebAssembly SIMD). Frames come from the browser's decoder via
 // Mediabunny and are copied straight into x264's input planes whenever the pixel format allows it.
 import { BlobSource, Input, MATROSKA, MP4, QTFF, VideoSampleSink, WEBM, type VideoSample } from 'mediabunny'
-import createX264, { type X264Module } from './x264/x264.mjs'
+import type createX264 from './x264/x264.mjs'
+import type { X264Module } from './x264/x264.mjs'
 
 export type WorkerInit = {
   type: 'init'
   module: WebAssembly.Module
+  /** URL of the Emscripten glue for `module`. A threaded build starts its own workers from this same file. */
+  script: string
+  /** x264 frame threads; above 1 the module must be the threaded build. */
+  threads: number
   file: File
   /** x264 options: "preset;tune;key=value;..." */
   options: string
@@ -116,7 +121,7 @@ async function encodeChunk({ index, start, end, options: override }: WorkerChunk
   const times: number[] = []
   const packets: EncodedChunk['packets'] = []
   const stats: FrameStat[] = []
-  const text = override ?? init.options
+  const text = (override ?? init.options) + (init.threads > 1 ? `;threads=${init.threads}` : '')
   const crf = Number(/crf=([\d.]+)/.exec(text)?.[1] ?? 0)
   let load: Loader | null = null
   const collect = (size: number) => {
@@ -182,7 +187,11 @@ self.onmessage = async (event: MessageEvent<WorkerInit | WorkerChunk>) => {
   try {
     if (message.type === 'init') {
       init = message
-      x = await createX264({
+      const { default: create }: { default: typeof createX264 } = await import(/* @vite-ignore */ message.script)
+      x = await create({
+        // The threaded build starts its thread workers up front: x264's threads plus its lookahead thread, and one
+        // spare. A thread started later would deadlock, since this worker blocks while x264 waits on them.
+        threads: message.threads > 1 ? message.threads + 2 : 0,
         instantiateWasm: (imports, done) => {
           void WebAssembly.instantiate(message.module, imports).then((instance) => done(instance, message.module))
           return {}

@@ -17,7 +17,10 @@ import {
   canEncodeAudio,
   type AudioCodec,
 } from 'mediabunny'
-import wasmUrl from './x264/x264.wasm?url'
+import singleScript from './x264/x264.mjs?url'
+import singleWasm from './x264/x264.wasm?url'
+import threadedScript from './x264/x264-mt.mjs?url'
+import threadedWasm from './x264/x264-mt.wasm?url'
 import type { EncodedChunk, FrameStat, WorkerChunk, WorkerInit, WorkerMessage } from './encode-worker'
 import { outputSize, type Preset, type Probe, type Settings } from './shared'
 
@@ -56,26 +59,48 @@ class Canceled extends Error {
   name = 'AbortError'
 }
 
-let compiled: Promise<WebAssembly.Module> | null = null
 
 /** Share of a frame's time spent before x264 outputs it: decoding, copying in, and lookahead analysis. On short
  * chunks, where the lookahead holds nearly every frame, that phase took about 40% of the wall time. */
 const LOOKAHEAD_SHARE = 0.4
 
-/** Compiles the encoder once; every worker instantiates the same module. */
-export function loadEncoder() {
-  compiled ??= WebAssembly.compileStreaming(fetch(wasmUrl)).catch((err) => {
-    compiled = null
+/**
+ * x264's own frame threads need SharedArrayBuffer, which browsers only allow on cross-origin isolated pages. The
+ * threaded build is the same encoder compiled with pthreads; it's only loaded when a layout actually uses threads.
+ */
+const canThread = typeof crossOriginIsolated !== 'undefined' && crossOriginIsolated
+const BUILDS = {
+  single: { script: singleScript, wasm: singleWasm },
+  threaded: { script: threadedScript, wasm: threadedWasm },
+}
+type Build = keyof typeof BUILDS
+const compiled: Partial<Record<Build, Promise<WebAssembly.Module>>> = {}
+
+/** Compiles an encoder build once; every worker instantiates the same module. */
+export function loadEncoder(build: Build = 'single') {
+  compiled[build] ??= WebAssembly.compileStreaming(fetch(BUILDS[build].wasm)).catch((err) => {
+    delete compiled[build]
     throw new Error(`Couldn't load the x264 encoder (${err instanceof Error ? err.message : err}).`)
   })
-  return compiled
+  return compiled[build]
 }
 
 // Measured peak WebAssembly memory for one 1080p encoder with the preset's own lookahead; 40 frames needs ~400 MB.
 const MEMORY_1080P_MB: Record<string, number> = { veryfast: 190, faster: 275, fast: 330, medium: 400, slow: 480 }
 
-/** One encoder per core (the main thread is mostly idle while they run), fewer when frames are big or memory is tight. */
-export function workerCount(probe: Probe, settings: Settings) {
+export type Layout = {
+  /** Encoders running side by side, one chunk each. */
+  encoders: number
+  /** x264 frame threads inside each encoder. */
+  threads: number
+}
+
+/**
+ * One encoder per core (the main thread is mostly idle while they run), fewer when frames are big or memory is
+ * tight. Cores beyond what memory allows go to x264's own frame threads, which add a frame in flight rather than a
+ * whole encoder's worth of memory.
+ */
+export function workerCount(probe: Probe, settings: Settings): Layout {
   const { width, height } = outputSize(probe, settings.shortSide)
   const cores = navigator.hardwareConcurrency || 4
   const memoryGB = (navigator as Navigator & { deviceMemory?: number }).deviceMemory ?? 8
@@ -83,7 +108,9 @@ export function workerCount(probe: Probe, settings: Settings) {
     ? 400 * Math.max(0.35, (width * height) / (1920 * 1080))
     : (MEMORY_1080P_MB[X264_PRESET] ?? 400) * Math.max(0.35, (width * height) / (1920 * 1080))
   const budget = Math.min(3200, memoryGB * 1024 * 0.4)
-  return Math.max(1, Math.min(cores, 8, Math.floor(budget / perWorker)))
+  const encoders = Math.max(1, Math.min(cores, 8, Math.floor(budget / perWorker)))
+  const threads = canThread ? Math.max(1, Math.min(4, Math.floor(cores / encoders))) : 1
+  return { encoders, threads }
 }
 
 async function openTrack(file: Blob) {
@@ -179,8 +206,10 @@ type Pool = {
   terminate(): void
 }
 
-async function createPool(size: number, init: Omit<WorkerInit, 'type' | 'module'>): Promise<Pool> {
-  const module = await loadEncoder()
+async function createPool(size: number, threads: number,
+                          init: Omit<WorkerInit, 'type' | 'module' | 'script' | 'threads'>): Promise<Pool> {
+  const build: Build = threads > 1 ? 'threaded' : 'single'
+  const module = await loadEncoder(build)
   const workers = Array.from({ length: size }, () =>
     new Worker(new URL('./encode-worker.ts', import.meta.url), { type: 'module' }),
   )
@@ -200,7 +229,7 @@ async function createPool(size: number, init: Omit<WorkerInit, 'type' | 'module'
               else if (e.data.type === 'error') reject(failed(e.data.message))
             }
             worker.onerror = (e) => reject(failed(e.message))
-            worker.postMessage({ type: 'init', module, ...init } satisfies WorkerInit)
+            worker.postMessage({ type: 'init', module, script: BUILDS[build].script, threads, ...init } satisfies WorkerInit)
           }),
       ),
     )
@@ -541,15 +570,15 @@ export function encode(probe: Probe, settings: Settings, start: EncodeStart, onP
       const slope = start.slope && start.slope < -0.03 ? start.slope : DEFAULT_SLOPE
       const [line, options] = await Promise.all([timeline(probe.file), encoderOptions(probe, settings, crf)])
       const { times } = line
-      const workers = workerCount(probe, settings)
-      const chunks = planChunks(line, workers)
+      const { encoders, threads } = workerCount(probe, settings)
+      const chunks = planChunks(line, encoders)
       const frameCounts = chunks.map((c) => times.filter((t) => t >= c.start && t < c.end).length)
-      const active = Math.min(workers, chunks.length)
+      const active = Math.min(encoders, chunks.length)
+      const cores = Math.min(navigator.hardwareConcurrency || active, active * threads)
       const fps = probe.fps || 30
-      pool = await createPool(active, {
-        file: probe.file, options, width: size.width, height: size.height,
-        fpsNum: Math.round(fps * 1000), fpsDen: 1000,
-      })
+      const init = { file: probe.file, options, width: size.width, height: size.height, fpsNum: Math.round(fps * 1000), fpsDen: 1000 }
+      pool = await createPool(active, threads, init)
+      let poolThreads = threads
       if (canceled) throw new Canceled()
       const audio = audioBytes(probe, settings)
       const goal = Math.max(probe.file.size * SIZE_AIM - audio, probe.file.size * 0.05)
@@ -572,7 +601,7 @@ export function encode(probe: Probe, settings: Settings, start: EncodeStart, onP
       const report = (frames: number, stage: Progress['stage']) => {
         const fraction = Math.min(0.99, (finished + frames) / work)
         onProgress({ fraction, processed: fraction * probe.duration, elapsed: (performance.now() - started) / 1000,
-          workers: active, stage })
+          workers: cores, stage })
       }
       const encoded = await pool.run(
         spread(chunks, active),
@@ -596,22 +625,30 @@ export function encode(probe: Probe, settings: Settings, start: EncodeStart, onP
         const again = redo.map(({ index, crf: value }) => withCrf(chunks[index], value))
         finished += work - finished
         work = finished + again.reduce((t, c) => t + frameCounts[c.index], 0)
+        // Fewer chunks than encoders: give each the cores the others would have used, as x264 threads.
+        const spare = canThread ? Math.min(4, Math.floor((navigator.hardwareConcurrency || active) / again.length)) : 1
+        if (spare > poolThreads) {
+          pool.terminate()
+          pool = await createPool(again.length, spare, init)
+          poolThreads = spare
+          if (canceled) throw new Canceled()
+        }
         const redone = await pool.run(again, (frames) => report(frames, 'refitting'))
         for (const c of redone) if (c) encoded[c.index] = c
         const before = total
         total = encoded.reduce((t, c) => t + chunkBytes(c), 0)
-        passes.push(`${(before / 1e6).toFixed(2)} MB, slope ${local.toFixed(3)}: ` +
+        passes.push(`${(before / 1e6).toFixed(2)} MB, slope ${local.toFixed(3)}, ${poolThreads} threads: ` +
           redo.map((r) => `${r.index}→${r.crf.toFixed(1)}`).join(' '))
       }
       pool.terminate()
       if (canceled) throw new Canceled()
       const wall = performance.now() - started
       const sum = (k: 'decode' | 'load' | 'encode') => encoded.reduce((t, c) => t + c.timing[k], 0)
-      console.info(`[pare] ${active} workers, ${chunks.length} chunks, wall ${(wall / 1000).toFixed(1)} s; per-worker average: ` +
+      console.info(`[pare] ${active} workers × ${threads} threads, ${chunks.length} chunks, wall ${(wall / 1000).toFixed(1)} s; per-worker average: ` +
         `decode ${(sum('decode') / active / 1000).toFixed(1)} s, copy ${(sum('load') / active / 1000).toFixed(1)} s, ` +
         `encode ${(sum('encode') / active / 1000).toFixed(1)} s; video ${(total / 1e6).toFixed(2)} MB; rate factors ${passes.join(' | ')}`)
       onProgress({ fraction: 0.99, processed: probe.duration, elapsed: (performance.now() - started) / 1000,
-        workers: active, stage: 'finishing' })
+        workers: cores, stage: 'finishing' })
       const blob = await mux(probe, settings, encoded, size, rotation)
       onProgress({ fraction: 1, processed: probe.duration, elapsed: (performance.now() - started) / 1000 })
       const scores: FrameScores = { times: [], ssim: [] }
@@ -676,9 +713,9 @@ export async function plan(probe: Probe, settings: Settings, signal: AbortSignal
   // One round of tests: half the cores encode short windows at the preset's rate factor, the other half the same
   // windows at a rate factor about half the size, so the curve between them is known without a second round. Each
   // window starts on a source keyframe when one is close, so its decoder doesn't work through frames it won't use.
-  const workers = workerCount(probe, settings)
-  const windowCount = Math.max(1, Math.min(Math.floor(workers / 2) || 1, Math.floor(times.length / 40)))
-  const count = Math.min(workers, windowCount * 2)
+  const { encoders, threads } = workerCount(probe, settings)
+  const windowCount = Math.max(1, Math.min(Math.floor(encoders / 2) || 1, Math.floor(times.length / 40)))
+  const count = Math.min(encoders, windowCount * 2)
   const per = Math.min(Math.floor(times.length / windowCount), WINDOW_FRAMES)
   const windows = Array.from({ length: windowCount }, (_, i) => {
     const ideal = Math.min(times.length - per, Math.max(0, Math.round(((i + 0.5) / windowCount) * times.length - per / 2)))
@@ -687,10 +724,10 @@ export async function plan(probe: Probe, settings: Settings, signal: AbortSignal
     return { start: times[first], end: first + per < times.length ? times[first + per] : Infinity }
   })
   // The real encode starts a keyframe per chunk and roughly every 250 frames, plus one per scene cut.
-  const fixedKeyframes = planChunks(line, workers).length + Math.floor(times.length / 250)
+  const fixedKeyframes = planChunks(line, encoders).length + Math.floor(times.length / 250)
   if (signal.aborted) throw new Canceled()
   const fps = probe.fps || 30
-  const pool = await createPool(count, {
+  const pool = await createPool(count, threads, {
     file: probe.file, options, width: size.width, height: size.height, fpsNum: Math.round(fps * 1000), fpsDen: 1000,
   })
   const stop = () => pool.terminate()

@@ -21,7 +21,12 @@ function preloadFonts(): Plugin {
   }
 }
 
+// Cross-origin isolation lets the encoder use SharedArrayBuffer, and with it x264's own threads.
+const isolation = { 'Cross-Origin-Opener-Policy': 'same-origin', 'Cross-Origin-Embedder-Policy': 'require-corp' }
+
 export default defineConfig({
   plugins: [react(), preloadFonts()],
   worker: { format: 'es' },
+  server: { headers: isolation },
+  preview: { headers: isolation },
 })
