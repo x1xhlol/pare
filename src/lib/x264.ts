@@ -204,10 +204,30 @@ type Pool = {
     prepare?: (chunk: WorkerChunk) => WorkerChunk,
   ): Promise<EncodedChunk[]>
   terminate(): void
+  /** x264 threads per encoder: what was asked for, or 1 if the threaded build couldn't start. */
+  threads: number
 }
 
-async function createPool(size: number, threads: number,
-                          init: Omit<WorkerInit, 'type' | 'module' | 'script' | 'threads'>): Promise<Pool> {
+type PoolInit = Omit<WorkerInit, 'type' | 'module' | 'script' | 'threads'>
+
+/** Starts `size` encoders with `threads` x264 threads each, falling back to single-threaded encoders if the
+ * threaded build doesn't start (it's the less travelled path, and some browsers limit nested workers). */
+let threadsFailed = false
+
+async function createPool(size: number, threads: number, init: PoolInit): Promise<Pool> {
+  if (threads > 1 && !threadsFailed) {
+    try {
+      return await startPool(size, threads, init, 20_000)
+    } catch (err) {
+      if (err instanceof Canceled) throw err
+      threadsFailed = true
+      console.warn(`[pare] threaded encoder unavailable, using one thread per encoder: ${err instanceof Error ? err.message : err}`)
+    }
+  }
+  return startPool(size, 1, init)
+}
+
+async function startPool(size: number, threads: number, init: PoolInit, timeout?: number): Promise<Pool> {
   const build: Build = threads > 1 ? 'threaded' : 'single'
   const module = await loadEncoder(build)
   const workers = Array.from({ length: size }, () =>
@@ -220,7 +240,7 @@ async function createPool(size: number, threads: number,
     abort?.(new Canceled())
   }
   try {
-    await Promise.all(
+    const ready = Promise.all(
       workers.map(
         (worker) =>
           new Promise<void>((resolve, reject) => {
@@ -233,6 +253,9 @@ async function createPool(size: number, threads: number,
           }),
       ),
     )
+    await (timeout
+      ? Promise.race([ready, new Promise((_, reject) => setTimeout(() => reject(failed('timed out starting')), timeout))])
+      : ready)
   } catch (err) {
     terminate()
     throw err
@@ -240,6 +263,7 @@ async function createPool(size: number, threads: number,
 
   return {
     terminate,
+    threads,
     run: (chunks, onProgress, prepare) =>
       new Promise((resolve, reject) => {
         abort = reject
@@ -578,7 +602,7 @@ export function encode(probe: Probe, settings: Settings, start: EncodeStart, onP
       const fps = probe.fps || 30
       const init = { file: probe.file, options, width: size.width, height: size.height, fpsNum: Math.round(fps * 1000), fpsDen: 1000 }
       pool = await createPool(active, threads, init)
-      let poolThreads = threads
+      let poolThreads = pool.threads
       if (canceled) throw new Canceled()
       const audio = audioBytes(probe, settings)
       const goal = Math.max(probe.file.size * SIZE_AIM - audio, probe.file.size * 0.05)
@@ -630,7 +654,7 @@ export function encode(probe: Probe, settings: Settings, start: EncodeStart, onP
         if (spare > poolThreads) {
           pool.terminate()
           pool = await createPool(again.length, spare, init)
-          poolThreads = spare
+          poolThreads = pool.threads
           if (canceled) throw new Canceled()
         }
         const redone = await pool.run(again, (frames) => report(frames, 'refitting'))
@@ -644,7 +668,7 @@ export function encode(probe: Probe, settings: Settings, start: EncodeStart, onP
       if (canceled) throw new Canceled()
       const wall = performance.now() - started
       const sum = (k: 'decode' | 'load' | 'encode') => encoded.reduce((t, c) => t + c.timing[k], 0)
-      console.info(`[pare] ${active} workers × ${threads} threads, ${chunks.length} chunks, wall ${(wall / 1000).toFixed(1)} s; per-worker average: ` +
+      console.info(`[pare] ${active} workers × ${threads} threads asked, ${chunks.length} chunks, wall ${(wall / 1000).toFixed(1)} s; per-worker average: ` +
         `decode ${(sum('decode') / active / 1000).toFixed(1)} s, copy ${(sum('load') / active / 1000).toFixed(1)} s, ` +
         `encode ${(sum('encode') / active / 1000).toFixed(1)} s; video ${(total / 1e6).toFixed(2)} MB; rate factors ${passes.join(' | ')}`)
       onProgress({ fraction: 0.99, processed: probe.duration, elapsed: (performance.now() - started) / 1000,

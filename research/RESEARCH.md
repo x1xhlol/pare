@@ -114,8 +114,8 @@ Plan errors on the test corpus, and what the budget and refit did with them:
 | 2 minutes of mix | 26.1 | −19% | later rounds 24.6 → 23.0, no refit; −51% |
 | camera footage, screen recording | 15 | fits | none; −80%, −69% |
 
-Every clip ends between 51% and 80% smaller. A refit costs time when it happens (18 s for one chunk of the phone
-clip, since a single chunk runs on a single core), which is the main thing left to improve here.
+Every clip ends between 51% and 80% smaller. A refit costs time when it happens: the phone clip's one chunk took 18 s
+on a single core, and 7 s once refits got the idle cores as x264 threads (see Threads).
 
 ## What chunking costs
 
@@ -129,20 +129,51 @@ short clips pay for it. Native x264, same settings, same CRF, the whole clip vs.
 | park (5 s) | +1.7% | +3.9% |
 | screen recording (8 s) | +10% | +45% |
 
-## One threaded encoder instead of chunks
+## Threads
 
 x264 has its own frame threading, and Emscripten can compile it with pthreads (it needs `SharedArrayBuffer`, so the
 page must be cross-origin isolated). One change was needed: `slicetype_slice_cost` runs as a thread-pool job but
-returns `void`, and WebAssembly traps on the mismatched indirect call, so it now returns `void *`. In Chrome, 8
-threads encode park at 16.8 fps: 3.95× one thread (native x264 scales 4.07×) and 94% of what 8 independent chunk
-encoders manage, without the keyframe overhead above.
+returns `void`, and WebAssembly traps on the mismatched indirect call, so it now returns `void *`. The thread workers
+must exist before x264 starts its threads (the encoder's worker blocks while x264 waits on them, so a thread started
+later never runs), and they load the glue from its own URL so Vite's hashed file names resolve. In Chrome, one
+encoder with 8 threads runs at 16.8 fps on park: 3.95× one thread (native x264 scales 4.07×).
 
-It isn't shipped yet. With one stream, the size target has only two tools: a plan before encoding, or x264's own
-one-pass average bitrate mode. One-pass ABR at 47% of the original was tested on the mix clip, whose four scenes
-differ a lot. It spent early (VMAF NEG by scene: 92.8, 86.7, 89.5, 77.6), overshot to 50.2% of the original, and
-scored 86.65 overall, where chunked constant quality scored 87.7 at a 10% smaller file (by scene: 87.6, 92.5, 86.7,
-84.0). A tighter `ratetol` fixes most of the overshoot but not the uneven spending. Threads are the likely next step
-for short clips, combined with the plan and budget above.
+On the 4-core, 8-thread test machine, the same 240 frames split different ways:
+
+| Layout | Speed | Size |
+| --- | --- | --- |
+| 8 encoders × 1 thread | 19.7 fps | 24.70 MB |
+| 4 encoders × 2 threads | 18.4 fps | 24.43 MB |
+| 2 encoders × 4 threads | 17.7 fps | 24.07 MB |
+
+Fewer chunks compress a little better (fewer keyframes) but run slower, so independent encoders stay the default.
+Threads are used where they're free: cores beyond the 8 encoders memory allows, and refits, which usually redo fewer
+chunks than there are cores (the phone clip's one-chunk refit went from 18 s on one core to 7 s on four).
+
+One stream with no chunks at all would need size control without chunks. x264's one-pass average bitrate mode was
+tested on the mix clip, whose four scenes differ a lot: it spent early (VMAF NEG by scene: 92.8, 86.7, 89.5, 77.6),
+overshot to 50.2% of the original, and scored 86.65 overall, where chunked constant quality scored 87.7 at a 10%
+smaller file (by scene: 87.6, 92.5, 86.7, 84.0). A tighter `ratetol` fixes most of the overshoot but not the uneven
+spending.
+
+## Slower tools that might be worth it
+
+Each of `medium`'s tools added alone to the shipped setting, BD-rate over the corpus, and encode speed in the
+WebAssembly build (park, one encoder):
+
+| Added | VMAF NEG | SSIM | Speed |
+| --- | --- | --- | --- |
+| `subme 5` | −1.6% | −1.8% | −10% |
+| `subme 6` | +0.3% | +1.2% | |
+| `subme 7` | −7.6% | +3.2% | −32% |
+| `mixed-refs` (with subme 5) | −0.6% | −0.5% | −20% |
+| `partitions all` | +0.7% | +0.5% | |
+| `me umh` | +0.1% | −0.5% | |
+| `b-adapt 2` | −1.1% | −0.4% | |
+
+`subme 7` is the interesting one: at the same size it scores up to 0.8 VMAF NEG higher on noisy footage (town at CRF
+20: 92.73 → 93.51) while SSIM dips, which is psychovisual RD keeping grain that SSIM counts as error. It costs a third
+of the speed, so it isn't the default; it's the obvious candidate for a "best quality" setting.
 
 ## Where the time goes now
 
@@ -177,8 +208,8 @@ Same headless Chrome, same files, production builds:
 
 | Clip | ffmpeg.wasm build | SIMD build, first size target | Now |
 | --- | --- | --- | --- |
-| 20 s 1080p50 phone-style (65.5 MB) | 105.2 s, no size target | 75 s, −61%, SSIM 0.943 | 61 s, −55%, SSIM 0.951 |
-| 10 s 1080p30 camera (77.9 MB) | 27.3 s | 31 s, −80% | 28 s, −80%, SSIM 0.994 |
+| 20 s 1080p50 phone-style (65.5 MB) | 105.2 s, no size target | 75 s, −61%, SSIM 0.943 | 60 s, −55%, SSIM 0.951 |
+| 10 s 1080p30 camera (77.9 MB) | 27.3 s | 31 s, −80% | 27 s, −80%, SSIM 0.994 |
 | 10 s Big Buck Bunny (30.7 MB) | | 41 s, −60%, SSIM 0.980 | 34 s, −55%, SSIM 0.983 |
 
 "Now" includes the size plan when Compress is clicked a second after the file loads. The ffmpeg.wasm build had no
