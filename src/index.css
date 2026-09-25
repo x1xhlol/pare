@@ -21,6 +21,7 @@
   --primary-bg: oklch(0.2 0.008 80);
   --primary-text: oklch(0.985 0.003 85);
   --stage-bg: oklch(0.16 0.004 80);
+  --image-outline: oklch(0 0 0 / 0.1);
 
   --elevation:
     0 0 0 1px oklch(0.2 0.008 80 / 0.06),
@@ -61,6 +62,7 @@
     --primary-bg: oklch(0.955 0.004 85);
     --primary-text: oklch(0.17 0.004 80);
     --stage-bg: oklch(0.12 0.003 80);
+    --image-outline: oklch(1 0 0 / 0.1);
     --elevation: 0 0 0 1px oklch(1 0 0 / 0.08);
     --elevation-control: 0 0 0 1px oklch(1 0 0 / 0.1);
   }
@@ -208,7 +210,7 @@ label {
   font-size: 14px;
   color: var(--text-muted);
   text-wrap: pretty;
-  max-width: 68ch;
+  max-width: 65ch;
 }
 
 .error {
@@ -594,15 +596,9 @@ label {
   width: 100%;
   height: 100%;
   object-fit: contain;
-  outline: 1px solid rgb(0 0 0 / 0.1);
+  outline: 1px solid var(--image-outline);
   outline-offset: -1px;
   border-radius: inherit;
-}
-
-@media (prefers-color-scheme: dark) {
-  .poster img {
-    outline-color: rgb(255 255 255 / 0.1);
-  }
 }
 
 .summary-body {
@@ -1049,7 +1045,7 @@ label {
   font-size: 14px;
   color: var(--text-muted);
   cursor: pointer;
-  min-height: 40px;
+  min-height: 44px;
   user-select: none;
 }
 
@@ -1276,7 +1272,14 @@ label {
     color: var(--text-muted);
   }
   .bench .delta {
-    display: none;
+    display: block;
+    margin: 0;
+  }
+  /* The finished quality line is the verdict plus two wrapped lines of figures (24 + 4 + 2 × 19.5px); reserve that
+     while the check runs so Download doesn't jump. */
+  .result-quality {
+    min-height: 67px;
+    align-content: flex-start;
   }
   .segmented {
     display: grid;
@@ -1290,7 +1293,7 @@ label {
     display: grid;
     place-items: center;
     height: 100%;
-    min-height: 38px;
+    min-height: 44px;
     padding: 6px 8px;
     text-align: center;
     white-space: normal;

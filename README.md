@@ -1,7 +1,7 @@
 # Pare
 
-Pare makes a video at least half its size and keeps it looking like the original. It runs in the browser tab: the
-file never leaves your computer, and there's nothing to install.
+Pare makes a video at least half its size and keeps it looking like the original. It runs in the browser tab, so the
+file never leaves your computer and there's nothing to install.
 
 **Try it:** https://pare-eight.vercel.app
 
@@ -22,19 +22,19 @@ Pare now runs its own build of x264:
 - **The browser decodes.** WebCodecs decodes the source, in hardware when there's a GPU, and frames are copied
   straight into x264's input planes. The encoder module is 830 KB; ffmpeg.wasm is 32 MB.
 - **Every core.** The video is split at source keyframes into chunks, each core encodes its own, and the chunks are
-  joined at the original frame timestamps. Each encoder also runs x264's own frame threads, from a second build
-  compiled with pthreads: two per encoder keep a core busy while its worker waits for decoded frames (13% faster),
-  and cores beyond the 8 encoders memory allows, or left idle when only a few chunks need encoding again, become
-  more threads.
+  joined at the original frame timestamps. Each encoder also runs two of x264's own frame threads, from a second
+  build compiled with pthreads. The second thread keeps x264 working while the encoder waits for decoded frames,
+  which makes encoding 13% faster on the same cores. Machines with more than 8 cores, and refits that redo only a
+  few chunks, get more threads per encoder.
 - **A size promise that gets checked.** Short test encodes estimate how size falls as quality drops. Each chunk gets
   its quality setting from what the finished chunks actually cost, and the final file is weighed. If it isn't at
   least 50% smaller, the busiest chunks are encoded again.
 - **Every frame is scored.** x264 computes SSIM for each frame against its input as it encodes. The result screen
   reports the average and the worst frame, and opens a side-by-side view on the weakest ones.
 
-The encoder settings came out of a quality lab: every candidate was swept over rate factors on a test corpus and
+The encoder settings came out of a quality lab. Every candidate was swept over rate factors on a test corpus and
 scored with VMAF, VMAF NEG, SSIM and PSNR. The winner (`faster` with a 40-frame lookahead, 3 references and weighted
-prediction) needs about 30% fewer bits than `veryfast` for the same VMAF NEG, at no speed cost. The details, and the
+prediction) needs about 30% fewer bits than `veryfast` for the same VMAF NEG, and costs no speed. The details, and the
 ideas that didn't make it, are in [research/RESEARCH.md](research/RESEARCH.md).
 
 ## Numbers
@@ -51,7 +51,9 @@ clicking Compress to the finished file.
 | Phone clips, 1080p50, 2 min | 392 MB | 193 MB (−51%) | 4 min 20 s | 0.9535 |
 
 Footage that compresses well keeps x264's CRF 15, where extra bits stop being visible, and lands well past half.
-Noisy footage gets exactly as much quality as fits in half the size.
+Noisy footage gets exactly as much quality as fits in half the size. The phone clips are the hard case. They're
+already noisy 25 Mbps re-encodes, and at half the size they score "Excellent" rather than "Visually identical". I
+haven't found a setting that closes that gap without a bigger file or about 50% more encoding time.
 
 ## Settings
 
@@ -93,9 +95,10 @@ The script clones x264 at the commit in `x264-wasm/X264_COMMIT`, applies `x264-s
 ## Limits
 
 - The x264 path writes H.264 in MP4. HDR sources come out as SDR.
-- Memory caps the encoder count: about 400 MB per 1080p encoder, and at most 40% of the device's reported memory.
-- A refit, when the first pass misses the target, encodes the biggest chunks again. It uses every core, but it still
-  adds time: about 7 s on a 20-second clip.
+- Each 1080p encoder needs about 400 MB, and Pare uses at most 40% of the memory the device reports, so memory caps
+  the encoder count.
+- A refit, when the first pass misses the target, encodes the biggest chunks again on every core. It still adds time,
+  about 7 s on a 20-second clip.
 - Threads need a cross-origin isolated page (the site sends COOP and COEP headers). Without them, or if the threaded
   build fails to start, each encoder runs on one thread.
 - Needs a browser with WebCodecs and WebAssembly SIMD: current Chrome, Edge, Firefox, or Safari 17 and later.

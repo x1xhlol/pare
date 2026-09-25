@@ -31,7 +31,9 @@ const settingsKey = (s: Settings) =>
   `${s.preset}|${usesX264(s) ? 'x264' : s.codec}|${s.shortSide}|${s.keepAudio}|${s.sizeTarget}`
 const isAbort = (err: unknown) => err instanceof Error && (err.name === 'AbortError' || err.name === 'ConversionCanceledError')
 
-const supported = typeof window !== 'undefined' && 'VideoEncoder' in window && 'VideoDecoder' in window
+// The landing page is rendered to HTML at build time, where there is no window: render it as supported, and let the
+// rare browser without WebCodecs swap in its message on hydration.
+const supported = typeof window === 'undefined' || ('VideoEncoder' in window && 'VideoDecoder' in window)
 
 export const REPO = 'https://github.com/x1xhlol/pare'
 
@@ -495,11 +497,11 @@ const STEPS = [
   },
   {
     title: 'One encoder per core',
-    body: 'The video is split at keyframes into chunks, each core encodes its own, and the pieces are joined at the original frame timestamps.',
+    body: 'The video is split at keyframes into chunks, each core encodes its own, and the chunks are joined at the original frame timestamps.',
   },
   {
     title: 'Held to half the size',
-    body: 'Short test encodes measure how size falls as quality drops, and each chunk gets its setting from what the finished ones really cost. The file is weighed at the end: if it isn’t at least 50% smaller, the busiest parts are encoded again.',
+    body: 'Short test encodes measure how size falls as quality drops, and each chunk gets its setting from what the finished ones really cost. The file is weighed at the end, and if it isn’t at least 50% smaller, the busiest chunks are encoded again.',
   },
   {
     title: 'Checked frame by frame',
