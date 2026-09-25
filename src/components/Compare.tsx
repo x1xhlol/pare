@@ -103,7 +103,8 @@ export function Compare({ frames }: { frames: FramePair[] }) {
         ))}
       </div>
       <p className="note">
-        {frames.length} frames sampled across the video, scored by SSIM (1.000 is identical). Opens on the weakest one.
+        The weakest frames the encoder measured, plus an even spread across the video. SSIM of 1.000 means identical;
+        the view opens on the weakest.
       </p>
     </section>
   )

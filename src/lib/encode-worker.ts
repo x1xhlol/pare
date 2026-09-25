@@ -25,9 +25,12 @@ export type WorkerChunk = {
 }
 export type EncodedChunk = {
   index: number
+  /** Milliseconds spent waiting for decoded frames, copying them in, and encoding. */
+  timing: { decode: number; load: number; encode: number }
   /** Source timestamp of each input frame, by x264 pts. */
   times: number[]
-  packets: { data: Uint8Array<ArrayBuffer>; pts: number; key: boolean }[]
+  /** SSIM of each output frame against its input, as measured by x264 (luma). */
+  packets: { data: Uint8Array<ArrayBuffer>; pts: number; key: boolean; ssim: number }[]
   headers: Uint8Array<ArrayBuffer>
 }
 export type WorkerMessage =
@@ -114,12 +117,20 @@ async function encodeChunk({ index, start, end, options: override }: WorkerChunk
   const collect = (size: number) => {
     if (size <= 0) return
     const ptr = x._enc_payload(enc)
-    packets.push({ data: x.HEAPU8.slice(ptr, ptr + size), pts: x._enc_out_pts(enc), key: !!x._enc_out_keyframe(enc) })
+    packets.push({
+      data: x.HEAPU8.slice(ptr, ptr + size),
+      pts: x._enc_out_pts(enc),
+      key: !!x._enc_out_keyframe(enc),
+      ssim: x._enc_out_ssim(enc),
+    })
   }
 
+  const timing = { decode: 0, load: 0, encode: 0 }
+  let mark = performance.now()
   try {
     // A small tolerance keeps float rounding from pulling in a neighbouring frame.
     for await (const sample of sink.samples(start, end)) {
+      timing.decode += performance.now() - mark
       try {
         if (sample.timestamp < start - 1e-6 || sample.timestamp >= end - 1e-6) continue
         if (!enc) {
@@ -130,20 +141,28 @@ async function encodeChunk({ index, start, end, options: override }: WorkerChunk
           if (!enc) throw new Error(`x264 rejected the options "${text}".`)
           load = planInput(sample, enc)
         }
+        let t = performance.now()
         await load!(sample)
+        timing.load += performance.now() - t
         times.push(sample.timestamp)
+        t = performance.now()
         collect(x._enc_encode(enc, times.length - 1))
-        if (times.length % 8 === 0) post({ type: 'progress', index, frames: times.length })
+        timing.encode += performance.now() - t
+        // Report frames x264 has finished, not frames fed in: the lookahead buffers ~40 before any output.
+        if (times.length % 8 === 0) post({ type: 'progress', index, frames: packets.length })
       } finally {
         sample.close()
+        mark = performance.now()
       }
     }
     if (!enc) throw new Error(`No frames decoded between ${start.toFixed(3)} s and ${end.toFixed(3)} s.`)
+    const t = performance.now()
     for (let size; (size = x._enc_flush(enc)) >= 0; ) collect(size)
+    timing.encode += performance.now() - t
     const headerSize = x._enc_headers(enc)
     const headersPtr = x._enc_headers_ptr(enc)
     post({ type: 'progress', index, frames: times.length })
-    return { index, times, packets, headers: x.HEAPU8.slice(headersPtr, headersPtr + headerSize) }
+    return { index, times, packets, timing, headers: x.HEAPU8.slice(headersPtr, headersPtr + headerSize) }
   } finally {
     if (enc) x._enc_close(enc)
   }

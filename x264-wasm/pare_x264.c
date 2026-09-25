@@ -3,6 +3,8 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdarg.h>
+#include <stdio.h>
 #include <emscripten/emscripten.h>
 #include "x264.h"
 
@@ -25,6 +27,12 @@ typedef struct {
   Denoiser *denoiser;
 } Encoder;
 
+// x264 only computes per-frame SSIM when logging at INFO or above; keep the level there but print errors only.
+static void quiet_log(void *priv, int level, const char *fmt, va_list args) {
+  (void)priv;
+  if (level <= X264_LOG_ERROR) vfprintf(stderr, fmt, args);
+}
+
 // `options` is "preset;tune;key=value;key=value..." using x264's own option names (the same as the CLI flags).
 EMSCRIPTEN_KEEPALIVE
 Encoder *enc_open(int width, int height, int fps_num, int fps_den, int csp, const char *options) {
@@ -45,7 +53,8 @@ Encoder *enc_open(int width, int height, int fps_num, int fps_den, int csp, cons
   p.i_threads = 1;
   p.b_annexb = 0;
   p.b_repeat_headers = 0;
-  p.i_log_level = X264_LOG_ERROR;
+  p.i_log_level = X264_LOG_INFO;
+  p.pf_log = quiet_log;
 
   for (char *pair = strsep(&rest, ";"); pair; pair = strsep(&rest, ";")) {
     if (!*pair) continue;
@@ -117,6 +126,8 @@ EMSCRIPTEN_KEEPALIVE uint8_t *enc_payload(Encoder *e) { return e->payload; }
 EMSCRIPTEN_KEEPALIVE double enc_out_pts(Encoder *e) { return (double)e->out.i_pts; }
 EMSCRIPTEN_KEEPALIVE double enc_out_dts(Encoder *e) { return (double)e->out.i_dts; }
 EMSCRIPTEN_KEEPALIVE int enc_out_keyframe(Encoder *e) { return e->out.b_keyframe; }
+// SSIM of the frame just output against its input (only computed when the "ssim" option is on).
+EMSCRIPTEN_KEEPALIVE double enc_out_ssim(Encoder *e) { return e->out.prop.f_ssim; }
 
 // Enables the hqdn3d pre-filter (strengths as in FFmpeg; 0 disables that part). Temporal state starts empty.
 EMSCRIPTEN_KEEPALIVE void enc_denoise_setup(Encoder *e, double luma_spatial, double chroma_spatial, double luma_tmp,

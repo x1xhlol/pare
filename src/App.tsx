@@ -153,8 +153,8 @@ export default function App() {
       controller,
       promise: usesX264(settings)
         ? x264().then(async (m) => {
-            const { size, crf, raised } = await m.plan(probe, settings, controller.signal)
-            return { bitrate: 0, size, ssim: 0, target: 0, reached: true, crf, raised }
+            const { size, crf, raised, fitted } = await m.plan(probe, settings, controller.signal)
+            return { bitrate: 0, size, ssim: 0, target: 0, reached: true, crf, raised, fitted }
           })
         : media().then((m) => m.calibrate(probe, settings, controller.signal, onRound)),
     }
@@ -230,11 +230,11 @@ export default function App() {
         run.job = (await media()).compress(probe, settings, bitrate, onProgress)
       }
       const { measureQuality } = await media()
-      const blob = await run.job.promise
+      const { blob, scores } = await run.job.promise
       const url = URL.createObjectURL(blob)
       setPhase({ kind: 'done', probe, blob, url, quality: settings.preset === 'copy' ? 'failed' : 'pending' })
       if (settings.preset === 'copy') return
-      const quality = await measureQuality(probe, blob).catch(() => 'failed' as const)
+      const quality = await measureQuality(probe, blob, scores).catch(() => 'failed' as const)
       setPhase((p) => (p.kind === 'done' && p.blob === blob ? { ...p, quality } : p))
     } catch (err) {
       if (run.canceled) {
@@ -567,7 +567,11 @@ function Ready(props: {
             </span>
           )}
           <span className="estimate-detail">
-            {result?.raised
+            {result?.fitted === false
+              ? 'Highest quality already fits in half the size'
+              : result?.fitted
+              ? 'Best quality that fits in half the size'
+              : result?.raised
               ? 'Compression raised to reach 50% smaller'
               : result?.crf
               ? 'Measured on short test encodes'
@@ -708,7 +712,10 @@ function Done(props: {
             <>
               <strong>{verdict(quality.ssim)}</strong>
               <span className="muted">
-                SSIM {quality.ssim.toFixed(4)} · PSNR {quality.psnr.toFixed(1)}&nbsp;dB
+                SSIM {quality.ssim.toFixed(4)}
+                {quality.scored > quality.frames.length
+                  ? ` across all ${quality.scored.toLocaleString()} frames, lowest ${quality.min.toFixed(4)}`
+                  : ` · PSNR ${quality.psnr.toFixed(1)}\u00a0dB`}
               </span>
             </>
           )}

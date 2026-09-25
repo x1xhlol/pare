@@ -13,6 +13,7 @@ export type X264Module = {
   _enc_payload(enc: number): number
   _enc_out_pts(enc: number): number
   _enc_out_keyframe(enc: number): number
+  _enc_out_ssim(enc: number): number
   _enc_close(enc: number): void
   _enc_import_rgba(enc: number, rgba: number, stride: number, width: number, height: number, bgr: number): void
   _enc_import_p16(

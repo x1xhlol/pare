@@ -173,6 +173,8 @@ export type Calibration = {
   crf?: number
   /** True when the rate factor was raised to meet the size target. */
   raised?: boolean
+  /** Visually lossless with the size target: tuned to fill the budget (true) or at the quality ceiling (false). */
+  fitted?: boolean
 }
 
 type Segment = {
@@ -346,10 +348,16 @@ async function trial(
   }
 }
 
-export type Progress = { fraction: number; processed: number; elapsed: number }
+export type Progress = {
+  fraction: number
+  processed: number
+  elapsed: number
+  workers?: number
+  stage?: 'encoding' | 'finishing'
+}
 
 export type Job = {
-  promise: Promise<Blob>
+  promise: Promise<{ blob: Blob; scores?: { times: number[]; ssim: number[] } }>
   cancel: () => void
 }
 
@@ -387,7 +395,7 @@ export function compress(probe: Probe, settings: Settings, bitrate: number, onPr
       conversion.onProgress = (fraction, processed) =>
         onProgress({ fraction, processed, elapsed: (performance.now() - started) / 1000 })
       await conversion.execute()
-      return new Blob(parts, { type: format.mimeType })
+      return { blob: new Blob(parts, { type: format.mimeType }) }
     } finally {
       input.dispose()
     }
@@ -410,10 +418,44 @@ export type FramePair = {
   psnr: number
 }
 
-export type QualityReport = { ssim: number; psnr: number; frames: FramePair[] }
+export type QualityReport = {
+  /** Mean SSIM: over every frame when the encoder scored them, else over the sampled frames. */
+  ssim: number
+  /** Lowest single-frame SSIM seen. */
+  min: number
+  /** How many frames the SSIM figures cover. */
+  scored: number
+  psnr: number
+  frames: FramePair[]
+}
 
-/** Decodes the same frames from both files and scores them against each other. */
-export async function measureQuality(probe: Probe, result: Blob, count = 8): Promise<QualityReport> {
+/** Frames to show side by side: the worst-scoring ones (kept apart from each other) plus an even spread. */
+function pickFrames(probe: Probe, scores: { times: number[]; ssim: number[] } | undefined, count: number) {
+  const even = Array.from({ length: count }, (_, i) => probe.firstTimestamp + ((i + 0.5) / count) * probe.duration)
+  if (!scores?.times.length) return even
+  const gap = probe.duration / (count * 1.5)
+  const order = scores.ssim.map((_, i) => i).sort((a, b) => scores.ssim[a] - scores.ssim[b])
+  const worst: number[] = []
+  for (const i of order) {
+    const t = scores.times[i]
+    if (worst.every((w) => Math.abs(w - t) >= gap)) worst.push(t)
+    if (worst.length === Math.ceil(count / 2)) break
+  }
+  const picks = [...worst]
+  for (const t of even) if (picks.length < count && picks.every((p) => Math.abs(p - t) >= gap / 2)) picks.push(t)
+  return picks.sort((a, b) => a - b)
+}
+
+/**
+ * Decodes matching frames from both files for the side-by-side view and scores them. When the encoder scored every
+ * frame, those scores are the headline numbers and the view opens on the weakest frames.
+ */
+export async function measureQuality(
+  probe: Probe,
+  result: Blob,
+  scores?: { times: number[]; ssim: number[] },
+  count = 8,
+): Promise<QualityReport> {
   const source = openInput(probe.file)
   const encoded = openInput(result)
   try {
@@ -426,8 +468,7 @@ export async function measureQuality(probe: Probe, result: Blob, count = 8): Pro
     const offset = probe.firstTimestamp - Math.max(0, await b.getFirstTimestamp())
 
     const frames: FramePair[] = []
-    for (let i = 0; i < count; i++) {
-      const t = probe.firstTimestamp + ((i + 0.5) / count) * probe.duration
+    for (const t of pickFrames(probe, scores, count)) {
       const original = await sinkA.getCanvas(t)
       if (!original) continue
       // Sample the encoded file mid-frame so a rounding difference can't pick the neighbouring frame.
@@ -445,8 +486,11 @@ export async function measureQuality(probe: Probe, result: Blob, count = 8): Pro
     }
     if (!frames.length) throw new Error('Could not decode frames to compare.')
     const mean = (xs: number[]) => xs.reduce((s, x) => s + x, 0) / xs.length
+    const all = scores?.ssim.length ? scores.ssim : frames.map((f) => f.ssim)
     return {
-      ssim: mean(frames.map((f) => f.ssim)),
+      ssim: mean(all),
+      min: Math.min(...all),
+      scored: all.length,
       psnr: mean(frames.map((f) => Math.min(f.psnr, 99))),
       frames,
     }

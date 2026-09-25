@@ -24,11 +24,12 @@ import { outputSize, type Preset, type Probe, type Settings } from './shared'
 type EncodingPreset = Exclude<Preset, 'copy'>
 
 /**
- * x264 constant-rate factors, calibrated so "faster" lands on the file sizes "veryfast" produced at CRF 18/22/26.
- * At those sizes it scores 1-5 VMAF points higher on the test corpus.
+ * x264 constant-rate factors. High and compact are calibrated so "faster" lands on the sizes "veryfast" produced at
+ * CRF 22/26, scoring 1-5 VMAF points higher. Visually lossless is the no-size-limit target; with the size target on it
+ * instead gets the best quality that fits (see plan()).
  */
 export const CRF: Record<EncodingPreset, number> = {
-  'visually-lossless': 18.3,
+  'visually-lossless': 16,
   high: 22.4,
   compact: 26.4,
 }
@@ -38,8 +39,18 @@ export const CRF: Record<EncodingPreset, number> = {
 export const X264_PRESET = 'faster'
 const X264_TUNE = ''
 
-export type Progress = { fraction: number; processed: number; elapsed: number }
-export type Job = { promise: Promise<Blob>; cancel: () => void }
+export type Progress = {
+  fraction: number
+  processed: number
+  elapsed: number
+  /** Parallel encoders at work, and whether the file is being assembled. */
+  workers?: number
+  stage?: 'encoding' | 'finishing'
+}
+/** Per-frame SSIM from the encoder, by source timestamp. */
+export type FrameScores = { times: number[]; ssim: number[] }
+export type Encoded = { blob: Blob; scores?: FrameScores }
+export type Job = { promise: Promise<Encoded>; cancel: () => void }
 
 class Canceled extends Error {
   name = 'AbortError'
@@ -78,15 +89,22 @@ async function openTrack(file: Blob) {
   return { input, track }
 }
 
-/** Presentation timestamps of every video frame, in order. */
-async function frameTimes(file: Blob) {
+type Timeline = {
+  /** Presentation timestamps of every video frame, in order. */
+  times: number[]
+  /** Indexes into `times` of the source's keyframes. */
+  keys: number[]
+}
+
+async function timeline(file: Blob): Promise<Timeline> {
   const { input, track } = await openTrack(file)
   try {
-    const times: number[] = []
+    const frames: { t: number; key: boolean }[] = []
     for await (const packet of new EncodedPacketSink(track).packets(undefined, undefined, { metadataOnly: true })) {
-      times.push(packet.timestamp)
+      frames.push({ t: packet.timestamp, key: packet.type === 'key' })
     }
-    return times.sort((a, b) => a - b)
+    frames.sort((a, b) => a.t - b.t)
+    return { times: frames.map((f) => f.t), keys: frames.flatMap((f, i) => (f.key ? [i] : [])) }
   } finally {
     input.dispose()
   }
@@ -114,7 +132,8 @@ const longLookahead = (width: number, height: number) => width * height <= 2.2e6
 async function encoderOptions(probe: Probe, settings: Settings, crf: number) {
   // 3 reference frames and smart weighted prediction cost no measurable speed; with the 40-frame lookahead they
   // take "faster" from -27.8% to -29.7% BD-rate (VMAF NEG) against the old "veryfast".
-  const options = [X264_PRESET, X264_TUNE, `crf=${crf.toFixed(1)}`, 'ref=3', 'weightp=2']
+  // ssim=1 makes x264 score every frame against its input as it encodes, at no measurable cost.
+  const options = [X264_PRESET, X264_TUNE, `crf=${crf.toFixed(1)}`, 'ref=3', 'weightp=2', 'ssim=1']
   const { width, height } = outputSize(probe, settings.shortSide)
   if (longLookahead(width, height)) options.push('rc-lookahead=40')
   const resized = width !== probe.width || height !== probe.height
@@ -212,20 +231,31 @@ async function createPool(size: number, init: Omit<WorkerInit, 'type' | 'module'
   }
 }
 
-/** Two chunks per worker keeps cores busy near the end; each chunk costs one extra keyframe, so not too many. */
-function chunkLength(probe: Probe, workers: number) {
-  return Math.min(20, Math.max(3, probe.duration / (workers * 2)))
-}
-
-/** Splits frames into roughly equal chunks; each chunk runs from one frame's timestamp to the next chunk's. */
-function planChunks(times: number[], count: number): WorkerChunk[] {
-  const n = Math.max(1, Math.min(count, Math.floor(times.length / 30)))
-  const firsts = Array.from({ length: n }, (_, k) => Math.round((k * times.length) / n))
+/**
+ * Splits the video for the worker pool. At least one chunk per worker so no core idles, and up to two per worker on
+ * longer videos so fast workers can take the last ones. Each boundary moves to the nearest source keyframe within a
+ * third of a chunk: those are usually scene cuts, where a fresh keyframe costs nothing extra, and decoding a chunk
+ * then starts exactly at its first frame.
+ */
+function planChunks({ times, keys }: Timeline, duration: number, workers: number): WorkerChunk[] {
+  const n = Math.max(1, Math.min(Math.max(workers, Math.min(2 * workers, Math.ceil(duration / 3))), Math.floor(times.length / 30)))
+  const span = times.length / n
+  const firsts = [0]
+  for (let k = 1; k < n; k++) {
+    const ideal = Math.round(k * span)
+    let best = ideal
+    let distance = span / 3
+    for (const key of keys) {
+      const d = Math.abs(key - ideal)
+      if (d < distance) (best = key), (distance = d)
+    }
+    if (best > firsts[firsts.length - 1] + 15 && best < times.length - 15) firsts.push(best)
+  }
   return firsts.map((first, index) => ({
     type: 'chunk',
     index,
     start: times[first],
-    end: index === n - 1 ? Infinity : times[firsts[index + 1]],
+    end: index === firsts.length - 1 ? Infinity : times[firsts[index + 1]],
   }))
 }
 
@@ -343,10 +373,10 @@ export function encode(probe: Probe, settings: Settings, crf: number, onProgress
       const rotation = await track.getRotation()
       input.dispose()
       const size = frameSize(probe, settings, rotation)
-      const [times, options] = await Promise.all([frameTimes(probe.file), encoderOptions(probe, settings, crf)])
+      const [line, options] = await Promise.all([timeline(probe.file), encoderOptions(probe, settings, crf)])
+      const { times } = line
       const workers = workerCount(probe, settings)
-      const chunkSeconds = chunkLength(probe, workers)
-      const chunks = planChunks(times, Math.ceil(probe.duration / chunkSeconds))
+      const chunks = planChunks(line, probe.duration, workers)
       const fps = probe.fps || 30
       pool = await createPool(Math.min(workers, chunks.length), {
         file: probe.file, options, width: size.width, height: size.height,
@@ -354,15 +384,30 @@ export function encode(probe: Probe, settings: Settings, crf: number, onProgress
       })
       if (canceled) throw new Canceled()
       const started = performance.now()
+      const active = Math.min(workers, chunks.length)
       const encoded = await pool.run(chunks, (frames) => {
         const processed = (frames / times.length) * probe.duration
-        onProgress({ fraction: Math.min(0.99, frames / times.length), processed, elapsed: (performance.now() - started) / 1000 })
+        onProgress({ fraction: Math.min(0.99, frames / times.length), processed, elapsed: (performance.now() - started) / 1000,
+          workers: active, stage: 'encoding' })
       })
       pool.terminate()
       if (canceled) throw new Canceled()
+      const wall = performance.now() - started
+      const sum = (k: 'decode' | 'load' | 'encode') => encoded.reduce((t, c) => t + c.timing[k], 0)
+      console.info(`[pare] ${active} workers, ${chunks.length} chunks, wall ${(wall / 1000).toFixed(1)} s; per-worker average: ` +
+        `decode ${(sum('decode') / active / 1000).toFixed(1)} s, copy ${(sum('load') / active / 1000).toFixed(1)} s, ` +
+        `encode ${(sum('encode') / active / 1000).toFixed(1)} s; chunk ends ${encoded.map((c) => c.index).join(',')}`)
+      onProgress({ fraction: 0.99, processed: probe.duration, elapsed: (performance.now() - started) / 1000,
+        workers: active, stage: 'finishing' })
       const blob = await mux(probe, settings, encoded, size, rotation)
       onProgress({ fraction: 1, processed: probe.duration, elapsed: (performance.now() - started) / 1000 })
-      return blob
+      const scores: FrameScores = { times: [], ssim: [] }
+      for (const chunk of encoded)
+        for (const p of chunk.packets) {
+          scores.times.push(chunk.times[p.pts])
+          scores.ssim.push(p.ssim)
+        }
+      return { blob, scores }
     } catch (err) {
       if (canceled) throw new Canceled()
       throw err
@@ -378,6 +423,8 @@ export function encode(probe: Probe, settings: Settings, crf: number, onProgress
 export const SIZE_TARGET = 0.5
 const SIZE_AIM = 0.44
 const MAX_CRF = 30
+/** Past this, extra bits buy nothing visible even on paused frames (VMAF NEG 95-100 on the test corpus at CRF 16). */
+const QUALITY_CEILING_CRF = 15
 /** Test-window estimates came in 3-11% under the finished files (median ~7%); scale them to match. */
 const ESTIMATE_BIAS = 1.08
 
@@ -387,6 +434,8 @@ export type SizePlan = {
   size: number
   /** True when the rate factor was raised above the preset's to meet the size target. */
   raised: boolean
+  /** Visually lossless with the size target: the best quality that fits (true), or the quality ceiling (false). */
+  fitted?: boolean
 }
 
 /**
@@ -400,7 +449,8 @@ export async function plan(probe: Probe, settings: Settings, signal: AbortSignal
   input.dispose()
   const size = frameSize(probe, settings, rotation)
   const baseCrf = presetCrf(settings)
-  const [times, options] = await Promise.all([frameTimes(probe.file), encoderOptions(probe, settings, baseCrf)])
+  const [line, options] = await Promise.all([timeline(probe.file), encoderOptions(probe, settings, baseCrf)])
+  const { times } = line
   // One round of tests: half the cores encode 1-second windows at the preset's rate factor, the other half the same
   // windows at a rate factor about half the size, so the curve between them is known without a second round.
   const workers = workerCount(probe, settings)
@@ -412,7 +462,7 @@ export async function plan(probe: Probe, settings: Settings, signal: AbortSignal
     return { start: times[first], end: first + per < times.length ? times[first + per] : Infinity }
   })
   // The real encode starts a keyframe per chunk and roughly every 250 frames, plus one per scene cut.
-  const fixedKeyframes = Math.ceil(probe.duration / chunkLength(probe, workers)) + Math.floor(times.length / 250)
+  const fixedKeyframes = planChunks(line, probe.duration, workers).length + Math.floor(times.length / 250)
   if (signal.aborted) throw new Canceled()
   const fps = probe.fps || 30
   const pool = await createPool(count, {
@@ -460,19 +510,25 @@ export async function plan(probe: Probe, settings: Settings, signal: AbortSignal
   }
 
   try {
-    const probeCrf = Math.min(MAX_CRF, baseCrf + 6)
-    const [base, smaller] = await videoAt(settings.sizeTarget ? [baseCrf, probeCrf] : [baseCrf])
-    // Decide against the aim, not the target itself: estimates run up to ~10% low, and a file predicted at 48% could
-    // land above half. Files comfortably under keep the preset's quality untouched.
-    if (!settings.sizeTarget || base + audioBytes <= probe.file.size * SIZE_AIM) {
+    if (!settings.sizeTarget) {
+      const [base] = await videoAt([baseCrf])
       return { crf: baseCrf, size: base + audioBytes, raised: false }
     }
+    // Visually lossless spends the whole budget on quality: test the quality ceiling and a point well below it. Other
+    // presets keep their own rate factor unless it would miss the target.
+    const lossless = settings.preset === 'visually-lossless'
+    const lo = lossless ? QUALITY_CEILING_CRF : baseCrf
+    const hi = Math.min(MAX_CRF, lo + (lossless ? 10 : 6))
+    const [atLo, atHi] = await videoAt([lo, hi])
+    // Decide against the aim, not the target itself: estimates run up to ~10% low, and a file predicted at 48% could
+    // land above half.
     const goal = Math.max(probe.file.size * SIZE_AIM - audioBytes, probe.file.size * 0.05)
+    if (atLo <= goal) return { crf: lo, size: atLo + audioBytes, raised: false, fitted: false }
     // log(size) is close to linear in the rate factor; interpolate (or extrapolate) between the two tests.
-    const slope = (Math.log(smaller) - Math.log(base)) / (probeCrf - baseCrf)
-    const crf = Math.min(MAX_CRF, Math.max(baseCrf, baseCrf + (Math.log(goal) - Math.log(base)) / (slope < -0.02 ? slope : -0.1155)))
-    const video = Math.exp(Math.log(base) + slope * (crf - baseCrf))
-    return { crf: Math.round(crf * 10) / 10, size: video + audioBytes, raised: true }
+    const slope = (Math.log(atHi) - Math.log(atLo)) / (hi - lo)
+    const crf = Math.min(MAX_CRF, Math.max(lo, lo + (Math.log(goal) - Math.log(atLo)) / (slope < -0.02 ? slope : -0.1155)))
+    const video = Math.exp(Math.log(atLo) + slope * (crf - lo))
+    return { crf: Math.round(crf * 10) / 10, size: video + audioBytes, raised: crf > baseCrf, fitted: lossless }
   } finally {
     signal.removeEventListener('abort', stop)
     pool.terminate()
