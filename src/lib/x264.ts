@@ -953,8 +953,11 @@ export function encode(probe: Probe, settings: Settings, start: EncodeStart, onP
         const piecesFor = (count: number, index: number) =>
           Math.max(1, Math.min(Math.floor(active / share / count), Math.floor(frameCounts[index] / 30)))
         const cuts = (list: { index: number }[]) => list.reduce((t, r) => t + piecesFor(list.length, r.index) - 1, 0)
-        let redo = refit(encoded, crfs, total - goal, local, floor, profile.max)
-        if (cuts(redo)) redo = refit(encoded, crfs, total - goal + cuts(redo) * keyframeCost(encoded), local, floor, profile.max)
+        // Chunks already at the limit of the range would come out the same.
+        const changing = (list: { index: number; crf: number }[]) => list.filter((r) => Math.abs(r.crf - crfs[r.index]) >= 0.05)
+        let redo = changing(refit(encoded, crfs, total - goal, local, floor, profile.max))
+        if (cuts(redo)) redo = changing(refit(encoded, crfs, total - goal + cuts(redo) * keyframeCost(encoded), local, floor, profile.max))
+        if (!redo.length) break
         const again = redo.flatMap(({ index, crf: value }) =>
           cutInto(index, piecesFor(redo.length, index)).map((c) => withCrf(c, value)))
         finished += work - finished
