@@ -21,9 +21,12 @@ Pare now runs its own build of x264:
   result runs at 54% of native x264 with the same settings.
 - **The browser decodes.** WebCodecs decodes the source, in hardware when there's a GPU, and frames are copied
   straight into x264's input planes. The encoder module is 830 KB; ffmpeg.wasm is 32 MB.
-- **Every core.** The video is split at source keyframes into chunks, each core encodes its own, and the chunks are
-  joined at the original frame timestamps. Each encoder also runs two of x264's own frame threads, from a second
-  build compiled with pthreads. The second thread keeps x264 working while the encoder waits for decoded frames,
+- **Every core, busy to the end.** The video is split into chunks of equal cost, counting the frames each decoder
+  has to work through from the source keyframe before its chunk starts. Each core encodes its own, and the chunks
+  are joined at the original frame timestamps. Busy footage still encodes up to 1.5× slower than calm footage, so
+  once every chunk has shown its speed, the ones that will finish last hand their final frames to the encoders that
+  will finish first, at the cost of a keyframe each. Each encoder also runs two of x264's own frame threads, from a
+  second build compiled with pthreads. The second thread keeps x264 working while the encoder waits for decoded frames,
   which makes encoding 13% faster on the same cores. Machines with more than 8 cores, and refits that redo only a
   few chunks, get more threads per encoder.
 - **A size promise that gets checked.** Short test encodes estimate how size falls as quality drops. Each chunk gets
@@ -34,8 +37,9 @@ Pare now runs its own build of x264:
 - **AV1, with SIMD.** More options → Format → AV1 runs SVT-AV1, compiled to WebAssembly with its x86 SIMD kernels
   translated automatically, the worst emulations replaced, and motion-search kernels rewritten for WebAssembly
   (`av1-wasm/`). Its output is byte-identical to native SVT-AV1. At the same size target it scores 0.7–1.4 VMAF NEG
-  points higher than x264, with better worst frames, and footage that already fits comes out about 26% smaller. It
-  encodes 1.3–1.75× slower, and AV1 files don't play on older Apple devices, so H.264 stays the default.
+  points higher than x264, with better worst frames, and footage that already fits comes out about 26% smaller. On
+  the benchmark clips it takes 0.85× to 1.6× as long as x264. AV1 files don't play on older Apple devices, so H.264
+  stays the default.
 
 The encoder settings came out of a quality lab. Every candidate was swept over rate factors on a test corpus and
 scored with VMAF, VMAF NEG, SSIM and PSNR. The winner (`faster` with a 40-frame lookahead, 3 references and weighted

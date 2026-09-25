@@ -129,6 +129,61 @@ short clips pay for it. Native x264, same settings, same CRF, the whole clip vs.
 | park (5 s) | +1.7% | +3.9% |
 | screen recording (8 s) | +10% | +45% |
 
+## Keeping every encoder busy
+
+Every encoder waits for the slowest chunk, and the chunks weren't even. On the 20-second phone clip the encode's
+wall time was 36% longer than the average chunk's working time with AV1, and 18% longer with x264. Three changes
+brought that to 6% and 5%.
+
+**Chunks of equal cost, not chunks that start on keyframes.** Boundaries used to move to the nearest source keyframe
+within a third of a chunk, so each decoder started exactly on its chunk's first frame. Phones write a keyframe every
+50 frames, and the phone clip came out as 100- and 150-frame chunks for 8 encoders. Now every chunk costs the same,
+counting its frames plus the frames its decoder has to work through from the previous source keyframe, at a tenth of
+a frame each (30 ms to decode against about 310 ms to encode with every core busy; `decodeShare` in the codec
+profiles). A binary search finds the smallest cost that covers the video, and each chunk reaches as far as that cost
+allows. That greedy fill is optimal here, because moving a frame into a chunk costs a whole frame, while starting the
+next chunk later costs at most a tenth of one in decoding. Big Buck Bunny, with a keyframe every 250 frames, gains
+the other way. Its later chunks spent up to 8 s decoding frames they never encoded, and now they get fewer frames to
+make up for it.
+
+**Cutting chunks that will finish late.** Equal cost on paper isn't equal time. At one rate factor, busy footage took
+up to 1.5× longer per frame than calm footage: 38 s against 58 s for two 124-frame AV1 chunks of the phone clip.
+The source doesn't predict it, since phones record at a nearly constant bitrate. The obvious fix, splitting a busy
+chunk when an encoder runs out of work, never fired. By then the slow chunks had fed their last frames into the
+encoder (x264 holds 40 in its lookahead, SVT-AV1 41), and there was nothing left to hand over. So the decision
+happens early. Once every chunk has put out 16 frames, Pare predicts each one's finish from its speed so far, pairs
+the chunks that will finish last with the encoders that will finish first, and asks each slow chunk's worker to stop
+where both sides should finish together. The worker checks between frames and agrees if that frame hasn't gone into
+the encoder yet. The rest becomes a new chunk for the first free encoder, with a rate factor from the size budget like
+any other. Each cut costs a keyframe, about 150 KB in AV1 and 110 KB in x264 on the phone clip, or 0.4% of the file.
+Pare cuts only when it saves at least a second.
+
+**Refits in pieces.** When the first pass misses the size limit, the biggest chunks are encoded again. x264 gives
+them the idle cores as threads, but SVT-AV1 runs one thread per encoder, so a two-chunk refit used 2 of 7 encoders
+and took as long as the first pass. Refit chunks are now cut into pieces of at least 30 frames, so every encoder
+works, and the refit budgets for the extra keyframes. Shorter pieces were slower. At a high-quality rate factor an
+AV1 keyframe costs about 250 KB, and budgeting for four more of them pulled a third chunk into the refit. On a
+10-second phone clip with PCM audio, AV1 went from 50 s to 41 s.
+
+Before and after in the browser, clicking Compress a second after the file loads, alternating the two builds. The
+machine was shared with other work during these runs (load average 8 to 13 on 8 threads), so differences under about
+5% are noise:
+
+| Clip | x264, before → after | AV1, before → after |
+| --- | --- | --- |
+| Camera footage, 10 s | 27.1 → 27.7 s | 35.2 → 23.5 s |
+| Phone clips, 20 s | 54.6 → 56.5 s | 95.3 → 72.5 s |
+| Big Buck Bunny, 10 s | 32.2 → 31.6 s | 41.6 → 37.0 s |
+| Screen recording, 8 s | 9.7 → 9.6 s | 22.1 → 15.7 s |
+
+AV1 gained 11–33%. Its frames take longer, so the same imbalance cost it more seconds, and it was the codec hit by the
+canceled-plan bug below. For x264 the change is inside the noise of these runs. With the plan already finished before
+the click, the phone clip went from 45.9 s to 43.4 s. AV1 now takes 0.85× to 1.6× as long as x264, against 1.3× to
+2.3× before.
+
+Refits also stop when no chunk's rate factor would change. A source that x264 can't halve even at its highest rate
+factor (a 5 MB clip that was already tightly compressed) used to get two more identical passes, 64 s instead of 30.
+
 ## AV1: SVT-AV1 in WebAssembly, with SIMD
 
 The biggest quality lever left is the codec. At preset 8, SVT-AV1 needs 29.9% fewer bits than Pare's x264 setting
@@ -172,6 +227,14 @@ Every build below produces output byte-identical to native SVT-AV1 (150 frames o
 
 For scale, plain C is hopeless: 30 frames at preset 10 take 20.2 s in WebAssembly and 17.5 s natively, against 2.0 s
 for native SIMD.
+
+Where the single-thread build's time goes now (park, preset 8, CRF 35): the two WebAssembly SAD kernels take 16%,
+`svt_aom_quantize_inv_quantize` 9%, and the 6-tap convolutions about 7%. The quantizer isn't a SIMD gap. It inlines
+SVT-AV1's rate-distortion quantizer (`svt_av1_optimize_b`), which is scalar natively too and takes 16% there. The
+all-position SAD is the clearest gap left. Native AVX2 spends 2.0% of its time in it, WebAssembly 7.3% of a run
+twice as long, because MPSADBW does 32 absolute differences in one instruction and WebAssembly needs about six
+instructions per 16. Turning off the stack protector or turning on link-time optimisation changed nothing (16.5 s
+for 60 frames either way, identical output).
 
 With SVT-AV1's own threading (`--lp 8`) the WebAssembly build encodes 1080p at 11.8 fps on the 4-core, 8-thread
 test machine, against about 24 fps for Pare's chunked x264. Output is identical at every thread count. At `--lp 1`,
@@ -270,6 +333,21 @@ worker when 8 share 4 cores). A two-round version was tried: 8 windows of 12 fra
 didn't fit, the same windows at a rate factor estimated from the first round. Easy footage finished planning in 6.5 s
 instead of 10, but 12-frame windows underestimate the finished size by 20–100% (most of a 12-frame window is the
 cheap stretch right after its keyframe), so hard clips needed refits and got slower overall. Reverted.
+
+## Planning AV1
+
+Two things made AV1's plan slow, and one was a bug. The plan starts as soon as a file loads, with the default
+settings, and restarts when they change. A plan canceled while its encoders were still starting added its cancel
+handler after the cancel had happened, so it never stopped. Choosing AV1 right after loading a file left x264's plan
+running to the end in the background, and AV1's plan took 20 to 38 s. Now a canceled plan stops, and AV1's takes 8 to
+13 s.
+
+The other was the preset. SVT-AV1's preset 10 encodes 24-frame windows 1.7× faster in WebAssembly than preset 8 (2×
+natively). The plan only needs sizes, so the question was whether preset 10's sizes predict preset 8's files as well.
+On three 24-frame windows of each corpus clip at CRF 16, 28 and 40, preset 10 came out 1–6% bigger (median by rate
+factor), with a 4–8% spread across clips, and the slope of size against rate factor was the same to within 0.004. Next
+to the windows' own error, that doesn't show. Predicting each whole clip's size from its windows is off by 21% (the
+spread of the log ratio) at either preset, with the same median bias (1.13 and 1.12).
 
 ## End to end in the browser
 
