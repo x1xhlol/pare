@@ -107,7 +107,7 @@ const THOROUGH_CODECS: Option<ThoroughFormat>[] = [
 ]
 
 const THOROUGH_CODEC_HINT = {
-  auto: 'Test-encodes this video and measures the results with VMAF, in this browser. AV1 when it looks clearly better at this size and this device plays it, otherwise H.264: faster, and plays everywhere.',
+  auto: 'Test-encodes this video and measures the results with VMAF, in this browser. AV1 when it looks better at this size and this device plays it, otherwise H.264: faster, and plays everywhere.',
   avc: 'x264. Plays everywhere.',
   av1: 'SVT-AV1. About 30% smaller than H.264 at the same quality on most footage, and about half as fast. Plays in current Chrome, Edge and Firefox, on Android, and on Apple devices with AV1 hardware (iPhone 15 Pro, M3 Macs and later).',
 }
@@ -318,7 +318,7 @@ export default function App() {
             waitFor.skipTest?.()
             plan = first
           } else if (!waitFor.result) {
-            const why = first?.reaches ? 'it looks clearly better on some footage' : "H.264 can't reach half the size"
+            const why = first?.reaches ? "H.264 isn't near 1:1 at this size" : "H.264 can't reach half the size"
             setPhase((p) => (p.kind === 'running' ? { ...p, status: `Testing AV1: ${why}…` } : p))
           }
         }
@@ -588,7 +588,7 @@ const STEPS = [
   },
   {
     title: 'H.264 or AV1, by measuring',
-    body: 'Netflix’s VMAF, compiled to WebAssembly too, scores test encodes in both formats. AV1 is used when it looks clearly better at the target size and your device plays it; otherwise H.264, which is faster and plays everywhere.',
+    body: 'Netflix’s VMAF, compiled to WebAssembly too, scores test encodes in both formats. AV1 is used when it looks better at the target size and your device plays it; otherwise H.264, which is faster and plays everywhere.',
   },
   {
     title: 'Checked frame by frame',

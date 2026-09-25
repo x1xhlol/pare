@@ -396,11 +396,13 @@ In the app, Auto (the default format) works like this:
   take about half as long as eight sharing them, and two windows chose as well as four. AV1's size estimate is scaled
   by how those two windows compare with all four in H.264's test, and its VMAF is compared with H.264's on the same
   two windows.
-- AV1 wins when it's at least a point ahead and this device can play AV1, or when H.264 can't reach half the size at
-  its highest rate factor and AV1 can. With that margin the simulation matched "AV1 only when it's truly a point
-  better" in 27 of 30 cases, and the three misses were within a point of the margin.
-- The AV1 test runs while the settings are on screen. Starting before it ends goes ahead with H.264, unless AV1 is the
-  only way to half the size.
+- AV1 wins when it's at least half a point ahead and this device can play AV1, or when H.264 can't reach half the size
+  at its highest rate factor and AV1 can. In the simulation half a point gave up 0.12 VMAF NEG on average against
+  always picking the better encoder (1.08 at worst); a whole point, the first margin, gave up 0.20 (2.01) and missed
+  AV1's +1.4 on the phone clips.
+- The AV1 test runs while the settings are on screen, starting as soon as H.264's sizes show the target binds. A
+  compression started before it ends goes ahead with H.264 only when H.264 is predicted at 93 or more, or waits (see
+  the next section).
 
 | Clip | Auto | Predicted, AV1 − H.264 | Whole file, AV1 − H.264 |
 | --- | --- | --- | --- |

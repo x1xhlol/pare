@@ -1038,10 +1038,11 @@ const AUTO_HIGH = 95
  */
 const AUTO_QUICK = 93
 /**
- * How much better AV1 has to look before Auto picks it: it encodes slower and some older devices can't play it.
- * One VMAF NEG point; in the corpus test, AV1 gained 0.3 to 2.9 at sizes where it won.
+ * How much better AV1 has to look before Auto picks it: it encodes slower and some older devices can't play it. In the
+ * corpus test (two AV1 windows, compared like for like) half a point gave up 0.12 VMAF NEG on average against always
+ * picking the better encoder, 1.08 at worst; a whole point gave up 0.20 and 2.01, missing AV1's +1.4 on the phone clips.
  */
-const AUTO_MARGIN = 1
+const AUTO_MARGIN = 0.5
 
 /** Video bytes the size target leaves once the audio is paid for. */
 function videoGoal(probe: Probe, settings: Settings) {
@@ -1349,35 +1350,49 @@ export function testsAv1(probe: Probe, settings: Settings, avc: SizePlan) {
  */
 export async function settle(probe: Probe, settings: Settings, avc: SizePlan, signal: AbortSignal): Promise<Choice> {
   if (!settings.sizeTarget) return { codec: 'avc', plan: avc, reason: 'unlimited' }
-  await avc.scored
   if (!avc.bound) return { codec: 'avc', plan: avc, reason: 'fits' }
-  const goal = videoGoal(probe, settings)
-  const reaches = avcReaches(probe, settings, avc)
-  const avcScore = vmafAt(avc.points, goal)
-  if (avcScore === undefined) return { codec: 'avc', plan: avc, reason: 'even' }
-  if (reaches && avcScore >= AUTO_HIGH) return { codec: 'avc', plan: avc, vmaf: { avc: avcScore }, reason: 'high' }
   const { width, height } = outputSize(probe, settings.shortSide)
-  if (!(await playsAv1(width, height, probe.fps))) return { codec: 'avc', plan: avc, vmaf: { avc: avcScore }, reason: 'device' }
+  const plays = playsAv1(width, height, probe.fps)
+  // AV1's test starts while H.264's windows are still being scored, and is dropped if the scores make it unneeded.
   // Two windows choose as well as four (research/codec_choice.py), and four test encodes on four cores take about half
-  // as long as eight sharing them. Their size estimate is off by however those two windows differ from the video, which
-  // H.264's test on all four measured: scale by that.
-  // Test AV1 either side of where H.264's answer usually maps to (research/RESEARCH.md: 1.88 x H.264's - 10.7, give
-  // or take 5.6), which is quicker than from its quality ceiling, the slowest rate factor to encode.
+  // as long as eight sharing them. It brackets where H.264's answer usually maps to (1.88 x H.264's - 10.7, give or
+  // take 5.6), which is quicker to encode than AV1's quality ceiling.
+  const early = new AbortController()
+  const cancel = () => early.abort()
+  signal.addEventListener('abort', cancel)
   const guess = 1.88 * avc.crf - 10.7
   const low = Math.round(Math.min(AV1.max - AV1_BRACKET * 2, Math.max(AV1.ceiling, guess - AV1_BRACKET)))
-  const tested = await plan(probe, { ...settings, codec: 'av1' }, signal, true, AV1_TEST_WINDOWS,
-    [low, low + AV1_BRACKET * 2])
-  await tested.scored
-  const ratios = avc.points!.flatMap((p) => (p.subset ? [Math.log(p.bytes / p.subset.bytes)] : []))
-  const scale = ratios.length ? Math.exp(ratios.reduce((a, b) => a + b, 0) / ratios.length) : 1
-  const av1 = fit(probe, { ...settings, codec: 'av1' }, tested.points!.map((p) => ({ ...p, bytes: p.bytes * scale })))
-  // Compare like with like: both encoders on the same two windows, at the size those windows' share of the target is.
-  const same = avc.points!.map((p) => ({ crf: p.crf, bytes: p.subset?.bytes ?? p.bytes, vmaf: p.subset?.vmaf ?? p.vmaf }))
-  const vmaf = { avc: vmafAt(same, goal / scale) ?? avcScore, av1: vmafAt(tested.points, goal / scale) }
-  console.info(`[pare] auto: VMAF NEG at ${(goal / 1e6).toFixed(1)} MB, H.264 ${vmaf.avc.toFixed(2)}, AV1 ${vmaf.av1?.toFixed(2)}; ` +
-    `rate factors ${avc.crf} / ${av1.crf}`)
-  // x264 at its highest rate factor still over the target: only AV1 can keep the size promise.
-  if (!reaches && bytesAt(av1.points, AV1.max) <= goal) return { codec: 'av1', plan: av1, vmaf, reason: 'size' }
-  if (vmaf.av1 !== undefined && vmaf.av1 - vmaf.avc >= AUTO_MARGIN) return { codec: 'av1', plan: av1, vmaf, reason: 'better' }
-  return { codec: 'avc', plan: avc, vmaf, reason: 'even' }
+  const testing = plays.then((ok) => ok
+    ? plan(probe, { ...settings, codec: 'av1' }, early.signal, true, AV1_TEST_WINDOWS, [low, low + AV1_BRACKET * 2])
+    : null)
+  testing.catch(() => {})
+  try {
+    await avc.scored
+    const goal = videoGoal(probe, settings)
+    const reaches = avcReaches(probe, settings, avc)
+    const avcScore = vmafAt(avc.points, goal)
+    if (avcScore === undefined) return { codec: 'avc', plan: avc, reason: 'even' }
+    if (reaches && avcScore >= AUTO_HIGH) return { codec: 'avc', plan: avc, vmaf: { avc: avcScore }, reason: 'high' }
+    const tested = await testing
+    if (!tested) return { codec: 'avc', plan: avc, vmaf: { avc: avcScore }, reason: 'device' }
+    await tested.scored
+    // Its size estimate is off by however those two windows differ from the video, which H.264's test on all four
+    // measured: scale by that.
+    const ratios = avc.points!.flatMap((p) => (p.subset ? [Math.log(p.bytes / p.subset.bytes)] : []))
+    const scale = ratios.length ? Math.exp(ratios.reduce((a, b) => a + b, 0) / ratios.length) : 1
+    const av1 = fit(probe, { ...settings, codec: 'av1' }, tested.points!.map((p) => ({ ...p, bytes: p.bytes * scale })))
+    // Compare like with like: both encoders on the same two windows, at the size those windows' share of the target is.
+    const same = avc.points!.map((p) => ({ crf: p.crf, bytes: p.subset?.bytes ?? p.bytes, vmaf: p.subset?.vmaf ?? p.vmaf }))
+    const vmaf = { avc: vmafAt(same, goal / scale) ?? avcScore, av1: vmafAt(tested.points, goal / scale) }
+    console.info(`[pare] auto: VMAF NEG at ${(goal / 1e6).toFixed(1)} MB, H.264 ${vmaf.avc.toFixed(2)}, AV1 ${vmaf.av1?.toFixed(2)}; ` +
+      `rate factors ${avc.crf} / ${av1.crf}`)
+    // x264 at its highest rate factor still over the target: only AV1 can keep the size promise.
+    if (!reaches && bytesAt(av1.points, AV1.max) <= goal) return { codec: 'av1', plan: av1, vmaf, reason: 'size' }
+    if (vmaf.av1 !== undefined && vmaf.av1 - vmaf.avc >= AUTO_MARGIN) return { codec: 'av1', plan: av1, vmaf, reason: 'better' }
+    return { codec: 'avc', plan: avc, vmaf, reason: 'even' }
+  } finally {
+    // A decision without AV1's test stops it.
+    cancel()
+    signal.removeEventListener('abort', cancel)
+  }
 }

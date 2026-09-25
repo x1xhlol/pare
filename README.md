@@ -39,10 +39,10 @@ Pare now runs its own build of x264:
   byte-identical to native SVT-AV1. At the same size target it usually scores 0.7–1.4 VMAF NEG points higher than
   x264, and on the benchmark clips it takes 0.85× to 1.6× as long.
 - **Auto picks the format by measuring.** Pare compiles Netflix's libvmaf to WebAssembly too (`vmaf-wasm/`). The size
-  plan's test encodes are decoded and scored with VMAF NEG in the browser, and AV1 is used only when it looks at least
+  plan's test encodes are decoded and scored with VMAF NEG in the browser, and AV1 is used when it looks at least half
   a point better at the target size and the device can play it, or when it's the only way to half the size. On the
   test corpus that picked the better encoder in 28 of 30 cases, where SSIM would have agreed with VMAF in 21. The AV1
-  test runs while you look at the settings; start sooner and Pare goes ahead with H.264.
+  test runs while you look at the settings; start sooner and Pare goes ahead with H.264 if it's already near 1:1.
 
 The encoder settings came out of a quality lab. Every candidate was swept over rate factors on a test corpus and
 scored with VMAF, VMAF NEG, SSIM and PSNR. The winner (`faster` with a 40-frame lookahead, 3 references and weighted
