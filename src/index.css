@@ -1240,9 +1240,43 @@ label {
     grid-template-columns: 1fr;
     gap: 20px;
   }
+  /* Each row becomes a small card: the name, then the four figures with their labels. */
+  .bench thead {
+    display: none;
+  }
+  .bench tbody tr {
+    display: grid;
+    grid-template-columns: repeat(4, auto);
+    justify-content: space-between;
+    gap: 10px 12px;
+    padding: 16px;
+  }
+  .bench tbody tr + tr {
+    border-top: 1px solid var(--line);
+  }
+  .bench tbody tr + tr > * {
+    border-top: 0;
+  }
+  .bench tbody th {
+    grid-column: 1 / -1;
+  }
   .bench th,
   .bench td {
-    padding: 12px 14px;
+    padding: 0;
+  }
+  .bench td.num {
+    text-align: left;
+    font-size: 13px;
+  }
+  .bench td::before {
+    content: attr(data-label);
+    display: block;
+    font-family: var(--font-sans);
+    font-size: 12px;
+    color: var(--text-muted);
+  }
+  .bench .delta {
+    display: none;
   }
   .segmented {
     display: grid;

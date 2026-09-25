@@ -463,12 +463,18 @@ function Benchmarks() {
                   <span className="bench-name">{b.name}</span>
                   <span className="bench-detail">{b.detail}</span>
                 </th>
-                <td className="num">{fmt.bytes(b.before)}</td>
-                <td className="num">
+                <td className="num" data-label="Original">
+                  {fmt.bytes(b.before)}
+                </td>
+                <td className="num" data-label="Pare">
                   {fmt.bytes(b.after)} <span className="delta">{fmt.change(b.before, b.after)}</span>
                 </td>
-                <td className="num">{b.seconds} s</td>
-                <td className="num">{b.ssim.toFixed(4)}</td>
+                <td className="num" data-label="Time">
+                  {b.seconds} s
+                </td>
+                <td className="num" data-label="SSIM">
+                  {b.ssim.toFixed(4)}
+                </td>
               </tr>
             ))}
           </tbody>
