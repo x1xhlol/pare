@@ -95,7 +95,7 @@ The script clones x264 at the commit in `x264-wasm/X264_COMMIT`, applies `x264-s
 | `src/lib/encode-worker.ts` | One x264 encoder per worker, fed by WebCodecs through Mediabunny |
 | `src/lib/media.ts` | Probing, the WebCodecs encoder path, the frame-by-frame quality check |
 | `x264-wasm/` | The SIMD patch, the pinned x264 commit, the C binding, and the build script |
-| `av1-wasm/` | The SVT-AV1 patch, dispatch-fallback generator, replacement intrinsic headers, C binding, build script |
+| `av1-wasm/` | The SVT-AV1 patch, dispatch-fallback generator, replacement intrinsic header, C binding, build script |
 | `research/` | Write-up, benchmark scripts, corpus builder, and every measurement in `results.jsonl` |
 
 ## Limits

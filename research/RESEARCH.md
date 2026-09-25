@@ -151,8 +151,10 @@ request !2571 notes the "lack of simd"). `av1-wasm/` builds it with SIMD:
   Neon twin) broadcasts a pointer as a 64-bit value, which corrupts memory where pointers are 32 bits. It's excluded.
 - **Fix the emulations that are really scalar loops.** Emscripten implements `_mm_mpsadbw_epu8` as 32 byte
   extractions and `_mm_minpos_epu16` as a loop, and SVT-AV1's motion search uses them 543 and 112 times.
-  `av1-wasm/include/` replaces both, and shortens `_mm_sad_epu8`, with SIMD versions checked against the originals
-  on a million random inputs. They're drop-in headers, so they'd help any x86 code built with Emscripten.
+  `av1-wasm/include/` replaces both with SIMD versions, checked against the originals on a million random inputs
+  and 1.6× and 1.7× faster on their own. A version of `_mm_sad_epu8` with fewer WebAssembly instructions (pairwise
+  widening adds) turned out 18% slower, since V8 lowers those adds to several x86 instructions, so it was dropped.
+  The two that help are being offered to Emscripten.
 - **Write WebAssembly kernels where emulation still loses.** Full-search SAD (hierarchical motion estimation) and the
   8x8/16x16 all-position SAD were 3.4% and 2.0% of native encode time but 20% and 8% in WebAssembly. Both are
   rewritten around WebAssembly's own strengths (eight shifted loads per source chunk, saturating subtractions,
