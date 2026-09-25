@@ -31,6 +31,11 @@ Pare now runs its own build of x264:
   least 50% smaller, the busiest chunks are encoded again.
 - **Every frame is scored.** x264 computes SSIM for each frame against its input as it encodes. The result screen
   reports the average and the worst frame, and opens a side-by-side view on the weakest ones.
+- **AV1, with SIMD.** More options → Format → AV1 runs SVT-AV1, compiled to WebAssembly with its x86 SIMD kernels
+  translated automatically, the worst emulations replaced, and motion-search kernels rewritten for WebAssembly
+  (`av1-wasm/`). Its output is byte-identical to native SVT-AV1. At the same size target it scores 0.7–1.4 VMAF NEG
+  points higher than x264, with better worst frames, and footage that already fits comes out about 26% smaller. It
+  encodes 1.3–1.75× slower, and AV1 files don't play on older Apple devices, so H.264 stays the default.
 
 The encoder settings came out of a quality lab. Every candidate was swept over rate factors on a test corpus and
 scored with VMAF, VMAF NEG, SSIM and PSNR. The winner (`faster` with a 40-frame lookahead, 3 references and weighted
@@ -90,6 +95,7 @@ The script clones x264 at the commit in `x264-wasm/X264_COMMIT`, applies `x264-s
 | `src/lib/encode-worker.ts` | One x264 encoder per worker, fed by WebCodecs through Mediabunny |
 | `src/lib/media.ts` | Probing, the WebCodecs encoder path, the frame-by-frame quality check |
 | `x264-wasm/` | The SIMD patch, the pinned x264 commit, the C binding, and the build script |
+| `av1-wasm/` | The SVT-AV1 patch, dispatch-fallback generator, replacement intrinsic headers, C binding, build script |
 | `research/` | Write-up, benchmark scripts, corpus builder, and every measurement in `results.jsonl` |
 
 ## Limits

@@ -21,26 +21,12 @@ import singleScript from './x264/x264.mjs?url'
 import singleWasm from './x264/x264.wasm?url'
 import threadedScript from './x264/x264-mt.mjs?url'
 import threadedWasm from './x264/x264-mt.wasm?url'
+import av1Script from './av1/av1.mjs?url'
+import av1Wasm from './av1/av1.wasm?url'
 import type { EncodedChunk, FrameStat, WorkerChunk, WorkerInit, WorkerMessage } from './encode-worker'
 import { outputSize, type Preset, type Probe, type Settings } from './shared'
 
 type EncodingPreset = Exclude<Preset, 'copy'>
-
-/**
- * x264 constant-rate factors. High and compact are calibrated so "faster" lands on the sizes "veryfast" produced at
- * CRF 22/26, scoring 1-5 VMAF points higher. Visually lossless is the no-size-limit target; with the size target on it
- * instead gets the best quality that fits (see plan()).
- */
-export const CRF: Record<EncodingPreset, number> = {
-  'visually-lossless': 16,
-  high: 22.4,
-  compact: 26.4,
-}
-
-// "faster" saves 18-30% of the bits of "veryfast" at equal quality (VMAF/SSIM BD-rate on the test corpus), and
-// with the SIMD build it still encodes ~1.8x faster than scalar "veryfast" did.
-export const X264_PRESET = 'faster'
-const X264_TUNE = ''
 
 export type Progress = {
   fraction: number
@@ -70,23 +56,139 @@ const LOOKAHEAD_SHARE = 0.4
  */
 const canThread = typeof crossOriginIsolated !== 'undefined' && crossOriginIsolated
 const BUILDS = {
-  single: { script: singleScript, wasm: singleWasm },
-  threaded: { script: threadedScript, wasm: threadedWasm },
+  x264: { script: singleScript, wasm: singleWasm },
+  'x264-mt': { script: threadedScript, wasm: threadedWasm },
+  av1: { script: av1Script, wasm: av1Wasm },
 }
 type Build = keyof typeof BUILDS
 const compiled: Partial<Record<Build, Promise<WebAssembly.Module>>> = {}
 
 /** Compiles an encoder build once; every worker instantiates the same module. */
-export function loadEncoder(build: Build = 'single') {
+export function loadEncoder(build: Build) {
   compiled[build] ??= WebAssembly.compileStreaming(fetch(BUILDS[build].wasm)).catch((err) => {
     delete compiled[build]
-    throw new Error(`Couldn't load the x264 encoder (${err instanceof Error ? err.message : err}).`)
+    throw new Error(`Couldn't load the encoder (${err instanceof Error ? err.message : err}).`)
   })
   return compiled[build]
 }
 
-// Measured peak WebAssembly memory for one 1080p encoder with the preset's own lookahead; 40 frames needs ~400 MB.
-const MEMORY_1080P_MB: Record<string, number> = { veryfast: 190, faster: 275, fast: 330, medium: 400, slow: 480 }
+/** Colour description for the encoder: the source's, or BT.709 limited range for resized frames. */
+type Color = { primaries?: string; transfer?: string; matrix?: string; fullRange: boolean }
+
+/**
+ * What differs between the encoders. Everything else (the size plan, chunks, budget, refit and quality check) is
+ * shared: both builds expose the same C API (x264-wasm/pare_x264.c, av1-wasm/pare_svtav1.c).
+ */
+type Profile = {
+  /** One-thread build, and the pthreads build if there is one. */
+  single: Build
+  threaded?: Build
+  /** Mediabunny's codec, and the decoder config built from the encoder's headers. */
+  codec: 'avc' | 'av1'
+  config: (headers: Uint8Array, width: number, height: number) => VideoDecoderConfig
+  /** Rate factors without the size target. Visually lossless with it starts from `ceiling` instead. */
+  crf: Record<EncodingPreset, number>
+  ceiling: number
+  max: number
+  /** Typical change in log size per rate factor step, and the steeper one the budget assumes. */
+  slope: number
+  budgetSlope: number
+  /** How far above its first test encode the plan puts the second. */
+  span: { lossless: number; other: number }
+  /** Peak WebAssembly memory of one encoder at this size, in MB. */
+  memory: (width: number, height: number) => number
+  options: (crf: number, color: Color, width: number, height: number) => string[]
+}
+
+const scale = (width: number, height: number) => Math.max(0.35, (width * height) / (1920 * 1080))
+
+/** A 40-frame lookahead (vs. 20 in "faster") saves ~2% more bits at no speed cost, but the memory it needs at 4K
+ * would cost a worker, so it stops at 1080p. */
+const longLookahead = (width: number, height: number) => width * height <= 2.2e6
+
+const X264_PRIMARIES: Record<string, string> = {
+  bt709: 'bt709', bt470bg: 'bt470bg', smpte170m: 'smpte170m', bt2020: 'bt2020', smpte432: 'smpte432',
+}
+const X264_TRANSFER: Record<string, string> = {
+  bt709: 'bt709', smpte170m: 'smpte170m', 'iec61966-2-1': 'iec61966-2-1', linear: 'linear',
+  pq: 'smpte2084', hlg: 'arib-std-b67',
+}
+const X264_MATRIX: Record<string, string> = {
+  bt709: 'bt709', bt470bg: 'bt470bg', smpte170m: 'smpte170m', 'bt2020-ncl': 'bt2020nc', rgb: 'GBR',
+}
+
+/**
+ * x264 at "faster": 18-30% fewer bits than "veryfast" for the same quality on the test corpus. High and compact are
+ * calibrated so it lands on the sizes "veryfast" produced at CRF 22/26, scoring 1-5 VMAF points higher.
+ */
+const X264: Profile = {
+  single: 'x264',
+  threaded: 'x264-mt',
+  codec: 'avc',
+  config: (headers, width, height) => avcConfig(headers, width, height),
+  crf: { 'visually-lossless': 16, high: 22.4, compact: 26.4 },
+  /** Past this, extra bits buy nothing visible even on paused frames (VMAF NEG 95-100 on the corpus at CRF 16). */
+  ceiling: 15,
+  max: 30,
+  /** Sizes fall ~13% per step between CRF 15 and 25 (median of the corpus, range 8-25%). */
+  slope: -0.13,
+  budgetSlope: -0.15,
+  span: { lossless: 10, other: 6 },
+  // Measured peak memory at 1080p: ~400 MB with the 40-frame lookahead, 275 MB with the preset's 20.
+  memory: (width, height) => (longLookahead(width, height) ? 400 : 275) * scale(width, height),
+  options: (crf, color, width, height) => {
+    // 3 reference frames and smart weighted prediction cost no measurable speed; with the 40-frame lookahead they
+    // take "faster" from -27.8% to -29.7% BD-rate (VMAF NEG) against the old "veryfast". ssim=1 scores every frame
+    // as it's encoded. stitchable=1 keeps the picture parameter set independent of the rate factor, so chunks
+    // encoded at different ones can share it.
+    const options = ['faster', '', `crf=${crf.toFixed(1)}`, 'ref=3', 'weightp=2', 'ssim=1', 'stitchable=1']
+    if (longLookahead(width, height)) options.push('rc-lookahead=40')
+    if (color.primaries && X264_PRIMARIES[color.primaries]) options.push(`colorprim=${X264_PRIMARIES[color.primaries]}`)
+    if (color.transfer && X264_TRANSFER[color.transfer]) options.push(`transfer=${X264_TRANSFER[color.transfer]}`)
+    if (color.matrix && X264_MATRIX[color.matrix]) options.push(`colormatrix=${X264_MATRIX[color.matrix]}`)
+    options.push(`fullrange=${color.fullRange ? 'on' : 'off'}`)
+    return options
+  },
+}
+
+const SVT_PRIMARIES: Record<string, string> = {
+  bt709: 'bt709', bt470bg: 'bt470bg', smpte170m: 'bt601', bt2020: 'bt2020', smpte432: 'smpte432',
+}
+const SVT_TRANSFER: Record<string, string> = {
+  bt709: 'bt709', smpte170m: 'bt601', 'iec61966-2-1': 'srgb', linear: 'linear', pq: 'smpte2084', hlg: 'hlg',
+}
+const SVT_MATRIX: Record<string, string> = {
+  bt709: 'bt709', bt470bg: 'bt470bg', smpte170m: 'bt601', 'bt2020-ncl': 'bt2020-ncl', rgb: 'identity',
+}
+
+/**
+ * SVT-AV1 at preset 8: 30% fewer bits than the x264 setting for the same VMAF NEG on the corpus (far more on some
+ * footage, worse on rippling water). Its rate factors are the ones that score like x264's on the corpus.
+ */
+const AV1: Profile = {
+  single: 'av1',
+  codec: 'av1',
+  config: (headers, width, height) => av1Config(headers, width, height),
+  crf: { 'visually-lossless': 18, high: 36, compact: 42 },
+  ceiling: 16,
+  max: 55,
+  /** Sizes fall ~7.5% per step (median of the corpus, range 4-15%). */
+  slope: -0.075,
+  budgetSlope: -0.1,
+  span: { lossless: 24, other: 12 },
+  memory: (width, height) => 350 * scale(width, height),
+  options: (crf, color) => {
+    const options = ['8', '', `crf=${crf.toFixed(2)}`, 'ssim=1']
+    if (color.primaries && SVT_PRIMARIES[color.primaries]) options.push(`color-primaries=${SVT_PRIMARIES[color.primaries]}`)
+    if (color.transfer && SVT_TRANSFER[color.transfer]) options.push(`transfer-characteristics=${SVT_TRANSFER[color.transfer]}`)
+    if (color.matrix && SVT_MATRIX[color.matrix]) options.push(`matrix-coefficients=${SVT_MATRIX[color.matrix]}`)
+    options.push(`color-range=${color.fullRange ? 1 : 0}`)
+    return options
+  },
+}
+
+/** The encoder the settings ask for: AV1 when chosen, x264 otherwise. */
+export const profileFor = (settings: Settings) => (settings.codec === 'av1' ? AV1 : X264)
 
 export type Layout = {
   /** Encoders running side by side, one chunk each. */
@@ -102,16 +204,15 @@ export type Layout = {
  */
 export function workerCount(probe: Probe, settings: Settings): Layout {
   const { width, height } = outputSize(probe, settings.shortSide)
+  const profile = profileFor(settings)
   const cores = navigator.hardwareConcurrency || 4
   const memoryGB = (navigator as Navigator & { deviceMemory?: number }).deviceMemory ?? 8
-  const perWorker = longLookahead(width, height)
-    ? 400 * Math.max(0.35, (width * height) / (1920 * 1080))
-    : (MEMORY_1080P_MB[X264_PRESET] ?? 400) * Math.max(0.35, (width * height) / (1920 * 1080))
   const budget = Math.min(3200, memoryGB * 1024 * 0.4)
-  const encoders = Math.max(1, Math.min(cores, 8, Math.floor(budget / perWorker)))
+  const encoders = Math.max(1, Math.min(cores, 8, Math.floor(budget / profile.memory(width, height))))
   // Two threads per encoder even when there are no spare cores: while an encoder's worker waits for decoded frames
   // and copies them in, its other thread keeps x264 busy. Measured 13% faster on a 4-core, 8-thread machine.
-  const threads = canThread ? Math.max(2, Math.min(4, Math.floor(cores / encoders))) : 1
+  // SVT-AV1's own threading starts dozens of threads per encoder, so AV1 runs one thread per encoder.
+  const threads = canThread && profile.threaded ? Math.max(2, Math.min(4, Math.floor(cores / encoders))) : 1
   return { encoders, threads }
 }
 
@@ -143,50 +244,25 @@ async function timeline(file: Blob): Promise<Timeline> {
   }
 }
 
-const PRIMARIES: Record<string, string> = {
-  bt709: 'bt709', bt470bg: 'bt470bg', smpte170m: 'smpte170m', bt2020: 'bt2020', smpte432: 'smpte432',
-}
-const TRANSFER: Record<string, string> = {
-  bt709: 'bt709', smpte170m: 'smpte170m', 'iec61966-2-1': 'iec61966-2-1', linear: 'linear',
-  pq: 'smpte2084', hlg: 'arib-std-b67',
-}
-const MATRIX: Record<string, string> = {
-  bt709: 'bt709', bt470bg: 'bt470bg', smpte170m: 'smpte170m', 'bt2020-ncl': 'bt2020nc', rgb: 'GBR',
-}
-
 export function presetCrf(settings: Settings) {
-  return CRF[settings.preset === 'copy' ? 'visually-lossless' : settings.preset]
+  return profileFor(settings).crf[settings.preset === 'copy' ? 'visually-lossless' : settings.preset]
 }
-
-/** A 40-frame lookahead (vs. 20 in "faster") saves ~2% more bits at no speed cost, but the memory it needs at 4K
- * would cost a worker, so it stops at 1080p. */
-const longLookahead = (width: number, height: number) => width * height <= 2.2e6
 
 async function encoderOptions(probe: Probe, settings: Settings, crf: number) {
-  // 3 reference frames and smart weighted prediction cost no measurable speed; with the 40-frame lookahead they
-  // take "faster" from -27.8% to -29.7% BD-rate (VMAF NEG) against the old "veryfast".
-  // ssim=1 makes x264 score every frame against its input as it encodes, at no measurable cost. stitchable=1 keeps
-  // the picture parameter set independent of the rate factor, so chunks encoded at different ones can share it.
-  const options = [X264_PRESET, X264_TUNE, `crf=${crf.toFixed(1)}`, 'ref=3', 'weightp=2', 'ssim=1', 'stitchable=1']
   const { width, height } = outputSize(probe, settings.shortSide)
-  if (longLookahead(width, height)) options.push('rc-lookahead=40')
-  const resized = width !== probe.width || height !== probe.height
-  if (resized) {
-    // Resized frames go through an RGB canvas and come back as BT.709 limited range.
-    options.push('colorprim=bt709', 'transfer=bt709', 'colormatrix=bt709', 'fullrange=off')
-  } else {
+  let color: Color = { primaries: 'bt709', transfer: 'bt709', matrix: 'bt709', fullRange: false }
+  // Resized frames go through an RGB canvas and come back as BT.709 limited range; others keep the source's.
+  if (width === probe.width && height === probe.height) {
     const { input, track } = await openTrack(probe.file)
     try {
-      const color = await track.getColorSpace()
-      if (color.primaries && PRIMARIES[color.primaries]) options.push(`colorprim=${PRIMARIES[color.primaries]}`)
-      if (color.transfer && TRANSFER[color.transfer]) options.push(`transfer=${TRANSFER[color.transfer]}`)
-      if (color.matrix && MATRIX[color.matrix]) options.push(`colormatrix=${MATRIX[color.matrix]}`)
-      options.push(`fullrange=${color.fullRange ? 'on' : 'off'}`)
+      const c = await track.getColorSpace()
+      color = { primaries: c.primaries ?? undefined, transfer: c.transfer ?? undefined, matrix: c.matrix ?? undefined,
+        fullRange: !!c.fullRange }
     } finally {
       input.dispose()
     }
   }
-  return options.join(';')
+  return profileFor(settings).options(crf, color, width, height).join(';')
 }
 
 /** Encoder input size: the frame as stored (before rotation), at the requested resolution. */
@@ -216,21 +292,20 @@ type PoolInit = Omit<WorkerInit, 'type' | 'module' | 'script' | 'threads'>
  * threaded build doesn't start (it's the less travelled path, and some browsers limit nested workers). */
 let threadsFailed = false
 
-async function createPool(size: number, threads: number, init: PoolInit): Promise<Pool> {
-  if (threads > 1 && !threadsFailed) {
+async function createPool(profile: Profile, size: number, threads: number, init: PoolInit): Promise<Pool> {
+  if (threads > 1 && profile.threaded && !threadsFailed) {
     try {
-      return await startPool(size, threads, init, 20_000)
+      return await startPool(profile.threaded, size, threads, init, 20_000)
     } catch (err) {
       if (err instanceof Canceled) throw err
       threadsFailed = true
       console.warn(`[pare] threaded encoder unavailable, using one thread per encoder: ${err instanceof Error ? err.message : err}`)
     }
   }
-  return startPool(size, 1, init)
+  return startPool(profile.single, size, 1, init)
 }
 
-async function startPool(size: number, threads: number, init: PoolInit, timeout?: number): Promise<Pool> {
-  const build: Build = threads > 1 ? 'threaded' : 'single'
+async function startPool(build: Build, size: number, threads: number, init: PoolInit, timeout?: number): Promise<Pool> {
   const module = await loadEncoder(build)
   const workers = Array.from({ length: size }, () =>
     new Worker(new URL('./encode-worker.ts', import.meta.url), { type: 'module' }),
@@ -350,6 +425,69 @@ function avcConfig(headers: Uint8Array, width: number, height: number): VideoDec
   return { codec: `avc1.${hex(sps[1])}${hex(sps[2])}${hex(sps[3])}`, codedWidth: width, codedHeight: height, description: avcC }
 }
 
+/**
+ * The codec string for AV1 in MP4 ("av01.P.LLT.08"), from the sequence header OBU SVT-AV1 returns as its headers.
+ * Mediabunny builds the av1C box from it; the sequence header itself travels in every keyframe. Reads profile, and
+ * level and tier of operating point 0 (AV1 spec 5.5).
+ */
+function av1Config(headers: Uint8Array, width: number, height: number): VideoDecoderConfig {
+  let bit = 0
+  const read = (n: number) => {
+    let v = 0
+    for (let i = 0; i < n; i++, bit++) v = v * 2 + ((headers[bit >> 3] >> (7 - (bit & 7))) & 1)
+    return v
+  }
+  const uvlc = () => {
+    let zeros = 0
+    while (!read(1)) zeros++
+    return zeros >= 32 ? 2 ** 32 - 1 : read(zeros) + 2 ** zeros - 1
+  }
+  const leb128 = () => {
+    let v = 0
+    for (let i = 0; i < 8; i++) {
+      const byte = read(8)
+      v += (byte & 0x7f) * 2 ** (7 * i)
+      if (!(byte & 0x80)) break
+    }
+    return v
+  }
+  // OBU header: forbidden bit, type, extension flag, has_size_field, reserved.
+  read(1)
+  if (read(4) !== 1) throw new Error('The AV1 encoder returned no sequence header.')
+  const extension = read(1)
+  const hasSize = read(1)
+  read(1)
+  if (extension) read(8)
+  if (hasSize) leb128()
+  const profile = read(3)
+  read(1) // still_picture
+  let level = 0
+  let tier = 0
+  if (read(1)) {
+    level = read(5) // reduced_still_picture_header
+  } else {
+    if (read(1)) {
+      // timing_info, then decoder_model_info if present
+      read(32)
+      read(32)
+      if (read(1)) uvlc()
+      if (read(1)) {
+        read(5)
+        read(32)
+        read(5)
+        read(5)
+      }
+    }
+    read(1) // initial_display_delay_present_flag
+    read(5) // operating_points_cnt_minus_1
+    read(12) // operating_point_idc[0]
+    level = read(5)
+    if (level > 7) tier = read(1)
+  }
+  const codec = `av01.${profile}.${String(level).padStart(2, '0')}${tier ? 'H' : 'M'}.08`
+  return { codec, codedWidth: width, codedHeight: height }
+}
+
 const MP4_AUDIO: AudioCodec[] = ['aac', 'opus', 'mp3', 'ac3', 'eac3', 'flac']
 
 async function mux(probe: Probe, settings: Settings, chunks: EncodedChunk[], size: { width: number; height: number },
@@ -365,7 +503,8 @@ async function mux(probe: Probe, settings: Settings, chunks: EncodedChunk[], siz
   })
   const format = new Mp4OutputFormat({ fastStart: 'in-memory' })
   const output = new Output({ format, target: new StreamTarget(writable, { chunked: true, chunkSize: 8 * 2 ** 20 }) })
-  const video = new EncodedVideoPacketSource('avc')
+  const profile = profileFor(settings)
+  const video = new EncodedVideoPacketSource(profile.codec)
   output.addVideoTrack(video, { rotation })
 
   const input = new Input({ source: new BlobSource(probe.file), formats: [MP4, QTFF, WEBM, MATROSKA] })
@@ -387,7 +526,7 @@ async function mux(probe: Probe, settings: Settings, chunks: EncodedChunk[], siz
 
     await output.start()
 
-    const config = avcConfig(chunks[0].headers, size.width, size.height)
+    const config = profile.config(chunks[0].headers, size.width, size.height)
     const allTimes = chunks.flatMap((c) => c.times)
     const frameDuration = allTimes.length > 1 ? (allTimes[allTimes.length - 1] - allTimes[0]) / (allTimes.length - 1) : 1 / 30
     let first = true
@@ -442,6 +581,7 @@ type Course = {
   /** Frames in each chunk, by index. */
   frames: number[]
   floor: number
+  max: number
   crf: number
   slope: number
 }
@@ -489,7 +629,7 @@ class Budget {
         if (!this.started.has(i)) open += cost(n, true)
       })
       const left = goal - this.spent - pending
-      crf = left <= 0 ? MAX_CRF : floor + Math.log(left / open) / slope
+      crf = left <= 0 ? this.course.max : floor + Math.log(left / open) / slope
       // Move gradually: stay within 1.5 of the frame-weighted average so far. Sizes can change faster than the
       // assumed slope, and neighbouring chunks look best at similar settings.
       let weight = 0
@@ -498,7 +638,7 @@ class Budget {
       const mean = sum / weight
       crf = Math.min(mean + 1.5, Math.max(mean - 1.5, crf))
     }
-    crf = Math.min(MAX_CRF, Math.max(floor, crf))
+    crf = Math.min(this.course.max, Math.max(floor, crf))
     this.started.set(index, { crf, done: 0 })
     return crf
   }
@@ -518,7 +658,7 @@ const chunkBytes = (c: EncodedChunk) => c.packets.reduce((t, p) => t + p.data.by
  * since they save the most per step and busy, complex footage hides the change best, and enough of them are taken
  * that the rise stays within 3 steps where it can. Far too small: every chunk above the floor comes down.
  */
-function refit(chunks: EncodedChunk[], crfs: number[], excess: number, slope: number, floor: number) {
+function refit(chunks: EncodedChunk[], crfs: number[], excess: number, slope: number, floor: number, max: number) {
   let picked: EncodedChunk[]
   if (excess > 0) {
     const bySize = [...chunks].sort((a, b) => chunkBytes(b) - chunkBytes(a))
@@ -535,7 +675,7 @@ function refit(chunks: EncodedChunk[], crfs: number[], excess: number, slope: nu
   const change = excess >= pool ? 6 : Math.log(1 - excess / pool) / slope
   return picked.map((c) => ({
     index: c.index,
-    crf: Math.min(MAX_CRF, Math.max(floor, crfs[c.index] + (excess > 0 ? Math.max(0.5, change) : change))),
+    crf: Math.min(max, Math.max(floor, crfs[c.index] + (excess > 0 ? Math.max(0.5, change) : change))),
   }))
 }
 
@@ -561,7 +701,7 @@ function audioBytes(probe: Probe, settings: Settings) {
 
 /** The rate factor an encode starts from, and the lowest it may go: the quality ceiling or the preset's own. */
 export function floorCrf(settings: Settings) {
-  return settings.sizeTarget && settings.preset === 'visually-lossless' ? QUALITY_CEILING_CRF : presetCrf(settings)
+  return settings.sizeTarget && settings.preset === 'visually-lossless' ? profileFor(settings).ceiling : presetCrf(settings)
 }
 
 export type EncodeStart = {
@@ -591,9 +731,10 @@ export function encode(probe: Probe, settings: Settings, start: EncodeStart, onP
       const rotation = await track.getRotation()
       input.dispose()
       const size = frameSize(probe, settings, rotation)
+      const profile = profileFor(settings)
       const floor = floorCrf(settings)
-      const crf = Math.min(MAX_CRF, Math.max(floor, start.crf ?? floor))
-      const slope = start.slope && start.slope < -0.03 ? start.slope : DEFAULT_SLOPE
+      const crf = Math.min(profile.max, Math.max(floor, start.crf ?? floor))
+      const slope = start.slope && start.slope < -0.03 ? start.slope : profile.slope
       const [line, options] = await Promise.all([timeline(probe.file), encoderOptions(probe, settings, crf)])
       const { times } = line
       const { encoders, threads } = workerCount(probe, settings)
@@ -603,7 +744,7 @@ export function encode(probe: Probe, settings: Settings, start: EncodeStart, onP
       const cores = Math.min(navigator.hardwareConcurrency || active, active * threads)
       const fps = probe.fps || 30
       const init = { file: probe.file, options, width: size.width, height: size.height, fpsNum: Math.round(fps * 1000), fpsDen: 1000 }
-      pool = await createPool(active, threads, init)
+      pool = await createPool(profile, active, threads, init)
       let poolThreads = pool.threads
       if (canceled) throw new Canceled()
       const audio = audioBytes(probe, settings)
@@ -612,7 +753,7 @@ export function encode(probe: Probe, settings: Settings, start: EncodeStart, onP
       // A steeper slope than measured keeps the budget from overreaching when it lowers the rate factor: near the
       // sizes it lands on, noisy footage grows much faster than the plan's two distant tests suggest.
       const budget = settings.sizeTarget
-        ? new Budget({ goal, frames: frameCounts, floor, crf, slope: Math.min(slope, -0.15) })
+        ? new Budget({ goal, frames: frameCounts, floor, max: profile.max, crf, slope: Math.min(slope, profile.budgetSlope) })
         : null
       const crfs: number[] = chunks.map(() => crf)
       const withCrf = (chunk: WorkerChunk, value: number) => {
@@ -647,7 +788,7 @@ export function encode(probe: Probe, settings: Settings, start: EncodeStart, onP
         if (!over && !(total < goal * 0.8 && crfs.some((c) => c > floor + 0.25))) break
         const mean = encoded.reduce((t, c) => t + crfs[c.index] * chunkBytes(c), 0) / total
         const local = localSlope(start.points ?? [], mean, total, over, slope)
-        const redo = refit(encoded, crfs, total - goal, local, floor)
+        const redo = refit(encoded, crfs, total - goal, local, floor, profile.max)
         const again = redo.map(({ index, crf: value }) => withCrf(chunks[index], value))
         finished += work - finished
         work = finished + again.reduce((t, c) => t + frameCounts[c.index], 0)
@@ -655,7 +796,7 @@ export function encode(probe: Probe, settings: Settings, start: EncodeStart, onP
         const spare = canThread ? Math.min(4, Math.floor((navigator.hardwareConcurrency || active) / again.length)) : 1
         if (spare > poolThreads) {
           pool.terminate()
-          pool = await createPool(again.length, spare, init)
+          pool = await createPool(profile, again.length, spare, init)
           poolThreads = pool.threads
           if (canceled) throw new Canceled()
         }
@@ -698,11 +839,6 @@ export function encode(probe: Probe, settings: Settings, start: EncodeStart, onP
 /** The size target: at most half the original. Steering aims a little lower to absorb its error at the very end. */
 export const SIZE_TARGET = 0.5
 const SIZE_AIM = 0.47
-const MAX_CRF = 30
-/** x264 sizes fall ~13% per rate factor step between CRF 15 and 25 (median of the test corpus, range 8-25%). */
-const DEFAULT_SLOPE = -0.13
-/** Past this, extra bits buy nothing visible even on paused frames (VMAF NEG 95-100 on the test corpus at CRF 16). */
-const QUALITY_CEILING_CRF = 15
 /** Frames per test window: enough for x264's rate control to settle after the window's opening keyframe. */
 const WINDOW_FRAMES = 24
 /** Test-window estimates came in 3-11% under the finished files (median ~7%); scale them to match. */
@@ -753,7 +889,8 @@ export async function plan(probe: Probe, settings: Settings, signal: AbortSignal
   const fixedKeyframes = planChunks(line, encoders).length + Math.floor(times.length / 250)
   if (signal.aborted) throw new Canceled()
   const fps = probe.fps || 30
-  const pool = await createPool(count, threads, {
+  const profile = profileFor(settings)
+  const pool = await createPool(profile, count, threads, {
     file: probe.file, options, width: size.width, height: size.height, fpsNum: Math.round(fps * 1000), fpsDen: 1000,
   })
   const stop = () => pool.terminate()
@@ -801,20 +938,20 @@ export async function plan(probe: Probe, settings: Settings, signal: AbortSignal
     // Visually lossless spends the whole budget on quality: test the quality ceiling and a point well below it. Other
     // presets keep their own rate factor unless it would miss the target.
     const lossless = settings.preset === 'visually-lossless'
-    const lo = lossless ? QUALITY_CEILING_CRF : baseCrf
-    const hi = Math.min(MAX_CRF, lo + (lossless ? 10 : 6))
+    const lo = lossless ? profile.ceiling : baseCrf
+    const hi = Math.min(profile.max, lo + (lossless ? profile.span.lossless : profile.span.other))
     const [atLo, atHi] = await videoAt([lo, hi])
     // Decide against the aim, not the target itself: estimates run up to ~10% low, and a file predicted at 48% could
     // land above half.
     const goal = Math.max(probe.file.size * SIZE_AIM - audio, probe.file.size * 0.05)
     // log(size) is close to linear in the rate factor; interpolate (or extrapolate) between the two tests.
     const measured = (Math.log(atHi) - Math.log(atLo)) / (hi - lo)
-    const slope = measured < -0.03 ? measured : DEFAULT_SLOPE
+    const slope = measured < -0.03 ? measured : profile.slope
     console.info(`[pare] plan: ${(performance.now() - began) / 1000 | 0} s, ${windows.length}×${per} frames, ` +
       `crf ${lo} → ${(atLo / 1e6).toFixed(1)} MB, crf ${hi} → ${(atHi / 1e6).toFixed(1)} MB, slope ${slope.toFixed(3)}`)
     const points = [{ crf: lo, bytes: atLo }, { crf: hi, bytes: atHi }]
     if (atLo <= goal) return { crf: lo, size: atLo + audio, raised: false, fitted: false, slope, points }
-    let crf = Math.min(MAX_CRF, Math.max(lo, lo + (Math.log(goal) - Math.log(atLo)) / slope))
+    let crf = Math.min(profile.max, Math.max(lo, lo + (Math.log(goal) - Math.log(atLo)) / slope))
     // Past the higher test the straight line tends to overstate sizes (the noise stops costing bits), so land
     // halfway back: the encode checks its real size and corrects either way.
     if (crf > hi) crf = hi + (crf - hi) / 2

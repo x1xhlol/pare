@@ -26,9 +26,11 @@ type CalibrationEntry = {
   needed?: boolean
 }
 
+/** Thorough runs Pare's own WebAssembly encoders: x264 for H.264, SVT-AV1 for AV1. */
 const usesX264 = (s: Settings) => s.engine === 'thorough' && s.preset !== 'copy'
+const thoroughCodec = (s: Settings): 'avc' | 'av1' => (s.codec === 'av1' ? 'av1' : 'avc')
 const settingsKey = (s: Settings) =>
-  `${s.preset}|${usesX264(s) ? 'x264' : s.codec}|${s.shortSide}|${s.keepAudio}|${s.sizeTarget}`
+  `${s.preset}|${usesX264(s) ? `wasm-${thoroughCodec(s)}` : s.codec}|${s.shortSide}|${s.keepAudio}|${s.sizeTarget}`
 const isAbort = (err: unknown) => err instanceof Error && (err.name === 'AbortError' || err.name === 'ConversionCanceledError')
 
 // The landing page is rendered to HTML at build time, where there is no window: render it as supported, and let the
@@ -69,7 +71,7 @@ const ENGINES: Option<Engine>[] = [
 
 const ENGINE_HINT: Record<Engine, string> = {
   thorough:
-    'x264, the encoder inside HandBrake and ffmpeg, running on every CPU core. The smallest files for the quality. H.264 output plays everywhere.',
+    'Encoders compiled to WebAssembly, running on every CPU core: x264, the one inside HandBrake and ffmpeg, or SVT-AV1. The smallest files for the quality.',
   fast: "Your browser's built-in encoder, often hardware-accelerated. Several times quicker, but files come out larger at the same quality.",
 }
 
@@ -77,6 +79,16 @@ const CODEC_HINT: Record<OutputCodec, string> = {
   avc: 'Plays everywhere.',
   hevc: 'About 40% smaller than H.264. Plays on Apple devices, Windows, and Chrome.',
   av1: 'Smallest files, slowest to encode. Plays in current browsers and newer phones.',
+}
+
+const THOROUGH_CODECS: Option<'avc' | 'av1'>[] = [
+  { value: 'avc', label: 'H.264' },
+  { value: 'av1', label: 'AV1' },
+]
+
+const THOROUGH_CODEC_HINT = {
+  avc: 'x264. Plays everywhere.',
+  av1: 'SVT-AV1. About 30% smaller than H.264 at the same quality on most footage, and about half as fast. Plays in current Chrome, Edge and Firefox, on Android, and on Apple devices with AV1 hardware (iPhone 15 Pro, M3 Macs and later).',
 }
 
 function firstEncodable(probe: Probe): OutputCodec {
@@ -119,7 +131,12 @@ export default function App() {
         const codec = probe.videoCodec ? CODEC_LABEL[probe.videoCodec] ?? probe.videoCodec : 'this codec'
         throw new Error(`This browser can't decode ${codec} video. Try Chrome or Edge.`)
       }
-      setSettings((s) => ({ ...s, codec: probe.encodable[s.codec] ? s.codec : firstEncodable(probe), shortSide: null }))
+      // The browser's own encoders need browser support; Pare's WebAssembly ones work everywhere.
+      setSettings((s) => ({
+        ...s,
+        codec: s.engine === 'thorough' || probe.encodable[s.codec] ? s.codec : firstEncodable(probe),
+        shortSide: null,
+      }))
       setPhase({ kind: 'ready', probe })
     } catch (err) {
       setPhase({ kind: 'empty', error: `Couldn't open ${file.name}. ${message(err)}` })
@@ -615,9 +632,15 @@ function Ready(props: {
   const presetLabel = PRESETS.find((p) => p.value === settings.preset)?.label.toLowerCase()
   const better = (['hevc', 'av1'] as const).filter((c) => c !== settings.codec && probe.encodable[c])
   // Open by default only when something in it has been changed.
-  const [more, setMore] = useState(() => settings.engine !== 'thorough' || settings.shortSide !== null || !settings.keepAudio)
+  const [more, setMore] = useState(
+    () => settings.engine !== 'thorough' || thoroughCodec(settings) === 'av1' || settings.shortSide !== null || !settings.keepAudio,
+  )
   const summary = [
-    copy ? 'Original streams' : settings.engine === 'thorough' ? 'x264' : `Browser ${CODEC_LABEL[settings.codec]}`,
+    copy
+      ? 'Original streams'
+      : settings.engine === 'thorough'
+        ? thoroughCodec(settings) === 'av1' ? 'SVT-AV1' : 'x264'
+        : `Browser ${CODEC_LABEL[settings.codec]}`,
     copy || !settings.shortSide ? 'Original resolution' : `${settings.shortSide}p`,
     !probe.audio ? 'No audio' : settings.keepAudio ? 'Audio kept' : 'Audio removed',
   ].join(' · ')
@@ -665,6 +688,15 @@ function Ready(props: {
               onChange={(engine) => setSettings((s) => ({ ...s, engine }))}
               hint={copy ? 'Not used. Nothing is re-encoded.' : ENGINE_HINT[settings.engine]}
             />
+            {settings.engine === 'thorough' && !copy && (
+              <Choice
+                legend="Format"
+                value={thoroughCodec(settings)}
+                options={THOROUGH_CODECS}
+                onChange={(codec) => setSettings((s) => ({ ...s, codec }))}
+                hint={THOROUGH_CODEC_HINT[thoroughCodec(settings)]}
+              />
+            )}
             {settings.engine === 'fast' && !copy && (
               <Choice
                 legend="Format"

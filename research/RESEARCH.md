@@ -172,7 +172,25 @@ For scale, plain C is hopeless: 30 frames at preset 10 take 20.2 s in WebAssembl
 for native SIMD.
 
 With SVT-AV1's own threading (`--lp 8`) the WebAssembly build encodes 1080p at 11.8 fps on the 4-core, 8-thread
-test machine, against about 24 fps for Pare's chunked x264. Output is identical at every thread count.
+test machine, against about 24 fps for Pare's chunked x264. Output is identical at every thread count. At `--lp 1`,
+though, SVT-AV1 runs entirely on the calling thread (at `--lp 2` it starts 48 threads), so Pare builds it without
+pthreads and runs it exactly like x264: one encoder per core on its own chunk, with the same plan, budget and refit.
+`av1-wasm/pare_svtav1.c` gives it the same C API as the x264 binding; it splits NV12 chroma, drops the temporal
+delimiter OBUs MP4 doesn't want, and takes per-frame SSIM from SVT-AV1's stat report. Its rate factors are the ones
+that scored like x264's on the corpus: ceiling 16 (x264 15), visually lossless 18 (16), high 36 (22.4), compact 42
+(26.4).
+
+In the app, same size target, scored against the source:
+
+| Clip | x264: size, VMAF NEG (worst frame) | AV1: size, VMAF NEG (worst frame) | Time, x264 → AV1 |
+| --- | --- | --- | --- |
+| Camera footage, 10 s | 15.3 MB, 97.83 (93.87) | 11.3 MB, 96.76 (93.79) | 27 → 35 s |
+| Phone clips, 20 s | 29.4 MB, 87.70 (73.38) | 31.0 MB, 89.08 (74.58) | 54 → 93 s |
+| Big Buck Bunny, 10 s | 13.9 MB, 92.98 (89.86) | 12.9 MB, 93.72 (91.35) | 32 → 54 s |
+| Phone clip with PCM audio, 10 s | 23.2 MB, 92.46 (84.63) | 24.2 MB, 93.17 (88.91) | 40 → 54 s |
+
+Where the target binds, AV1 is 0.7–1.4 points better on average and up to 4.3 better on the worst frame. Where the
+footage already fits, it's 26% smaller at a slightly lower score, so its quality ceiling could come down a step.
 
 ## Threads
 
