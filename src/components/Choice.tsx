@@ -21,7 +21,7 @@ export function Choice<T extends string>({ legend, value, options, onChange, hin
   return (
     <fieldset className="choice" disabled={disabled}>
       <legend className="choice-legend">{legend}</legend>
-      <div className="segmented">
+      <div className="segmented" data-count={options.length}>
         {options.map((o) => (
           <label key={o.value} className="segment" title={o.title} data-disabled={o.disabled || undefined}>
             <input

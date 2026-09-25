@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useRef, useState, type DragEvent } from 'react'
 import { Choice, type Option } from './components/Choice'
 import { Compare } from './components/Compare'
+import { BENCHMARKS, BENCHMARK_SETUP } from './benchmarks'
 import * as fmt from './lib/format'
-import type { Calibration, Job, Progress, QualityReport } from './lib/media'
+import type { Calibration, Job, QualityReport } from './lib/media'
+import type { Progress } from './lib/x264'
 import { CODEC_LABEL, outputSize, type Engine, type OutputCodec, type Preset, type Probe, type Settings } from './lib/shared'
 
 const media = () => import('./lib/media')
@@ -12,7 +14,7 @@ type Phase =
   | { kind: 'empty'; error?: string }
   | { kind: 'probing'; name: string }
   | { kind: 'ready'; probe: Probe; error?: string }
-  | { kind: 'running'; probe: Probe; progress: Progress | null }
+  | { kind: 'running'; probe: Probe; progress: Progress | null; status: string }
   | { kind: 'done'; probe: Probe; blob: Blob; url: string; quality: QualityReport | 'pending' | 'failed' }
 
 type Tuning = { round: number } | { result: Calibration } | { error: string }
@@ -24,6 +26,8 @@ const settingsKey = (s: Settings) =>
 const isAbort = (err: unknown) => err instanceof Error && (err.name === 'AbortError' || err.name === 'ConversionCanceledError')
 
 const supported = typeof window !== 'undefined' && 'VideoEncoder' in window && 'VideoDecoder' in window
+
+export const REPO = 'https://github.com/x1xhlol/pare'
 
 const PRESETS: { value: Preset; label: string; hint: string }[] = [
   {
@@ -213,7 +217,13 @@ export default function App() {
       if (run.job) run.job.cancel()
       else setPhase({ kind: 'ready', probe })
     }
-    setPhase({ kind: 'running', probe, progress: null })
+    const planned = !!calibrations.current.get(settingsKey(settings))?.result
+    setPhase({
+      kind: 'running',
+      probe,
+      progress: null,
+      status: !usesX264(settings) ? 'Finishing tuning…' : planned ? 'Starting encoders…' : 'Finishing size tests…',
+    })
     const onProgress = (progress: Progress) => setPhase((p) => (p.kind === 'running' ? { ...p, progress } : p))
     try {
       if (usesX264(settings)) {
@@ -223,6 +233,7 @@ export default function App() {
           .promise.then((c) => c.crf ?? engine.presetCrf(settings))
           .catch(() => engine.presetCrf(settings))
         if (run.canceled) return
+        setPhase((p) => (p.kind === 'running' ? { ...p, status: 'Starting encoders…' } : p))
         run.job = engine.encode(probe, settings, crf, onProgress)
       } else {
         const { bitrate } = await ensureCalibration(probe, settings).promise
@@ -273,7 +284,12 @@ export default function App() {
         <a className="wordmark" href="/">
           Pare
         </a>
-        <p className="header-note">Runs on your device. Nothing is uploaded.</p>
+        <p className="header-note">
+          <span className="header-private">Runs on your device. Nothing is uploaded.</span>
+          <a className="link" href={REPO}>
+            Source
+          </a>
+        </p>
       </header>
 
       <input
@@ -312,7 +328,7 @@ export default function App() {
           <Running
             probe={phase.probe}
             progress={phase.progress}
-            preparing={usesX264(settings) ? 'Starting encoders…' : 'Finishing tuning…'}
+            status={phase.status}
             onCancel={() => cancelRun.current?.()}
           />
         ) : (
@@ -324,6 +340,23 @@ export default function App() {
           />
         )}
       </main>
+
+      <footer className="footer">
+        <p>
+          Pare runs x264 compiled to WebAssembly, in this tab. It's free software under the GPL, version 2 or later.
+        </p>
+        <nav className="footer-links" aria-label="Project">
+          <a className="link" href={REPO}>
+            Source
+          </a>
+          <a className="link" href={`${REPO}/blob/main/research/RESEARCH.md`}>
+            Research notes
+          </a>
+          <a className="link" href={`${REPO}/blob/main/LICENSE`}>
+            License
+          </a>
+        </nav>
+      </footer>
     </div>
   )
 }
@@ -347,8 +380,8 @@ function Empty(props: { dragging: boolean; probing: string | null; error?: strin
       <div className="intro-head">
         <h1 className="display">Make a video smaller without making it worse.</h1>
         <p className="lede">
-          Compression runs in this browser and the file never leaves your device. Pare tests encodes against your
-          video until it finds the smallest size that still looks the same, then checks the result frame by frame.
+          Pare cuts a video to half its size or less and keeps it looking like the original. It encodes on every core of
+          your computer, in this tab, and the file never leaves your device.
         </p>
       </div>
       <div className="drop" data-active={props.dragging || undefined} onClick={props.onPick}>
@@ -382,20 +415,103 @@ function Empty(props: { dragging: boolean; probing: string | null; error?: strin
           {props.error}
         </p>
       )}
-      <dl className="principles">
-        <div>
-          <dt>Private</dt>
-          <dd>Your browser reads the file directly. Nothing is uploaded, not even a thumbnail.</dd>
-        </div>
-        <div>
-          <dt>Tuned per video</dt>
-          <dd>Short test encodes find the lowest bitrate that meets the quality target for this footage.</dd>
-        </div>
-        <div>
-          <dt>Verified</dt>
-          <dd>The finished file is compared with the original and scored, so you can see what you're getting.</dd>
-        </div>
-      </dl>
+      <Benchmarks />
+      <HowItWorks />
+    </section>
+  )
+}
+
+function Benchmarks() {
+  return (
+    <section className="section" aria-labelledby="benchmarks">
+      <div className="section-head">
+        <h2 id="benchmarks">Measured, not promised</h2>
+        <p className="note">{BENCHMARK_SETUP}</p>
+      </div>
+      <div className="table-scroll">
+        <table className="bench">
+          <thead>
+            <tr>
+              <th scope="col">Video</th>
+              <th scope="col" className="num">
+                Original
+              </th>
+              <th scope="col" className="num">
+                Pare
+              </th>
+              <th scope="col" className="num">
+                Time
+              </th>
+              <th scope="col" className="num">
+                <abbr title="Structural similarity, from 0 to 1, averaged over every frame">SSIM</abbr>
+              </th>
+            </tr>
+          </thead>
+          <tbody>
+            {BENCHMARKS.map((b) => (
+              <tr key={b.name}>
+                <th scope="row">
+                  <span className="bench-name">{b.name}</span>
+                  <span className="bench-detail">{b.detail}</span>
+                </th>
+                <td className="num">{fmt.bytes(b.before)}</td>
+                <td className="num">
+                  {fmt.bytes(b.after)} <span className="delta">{fmt.change(b.before, b.after)}</span>
+                </td>
+                <td className="num">{b.seconds} s</td>
+                <td className="num">{b.ssim.toFixed(3)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  )
+}
+
+const STEPS = [
+  {
+    title: 'Decoded by your browser',
+    body: 'WebCodecs decodes the video, on the GPU when there is one, and frames are copied straight into the encoder’s memory.',
+  },
+  {
+    title: 'x264, rebuilt for the web',
+    body: 'x264’s speed comes from hand-written x86 and ARM assembly, which a browser can’t run. Pare replaces it with about 1,700 lines of WebAssembly SIMD, bit-exact with x264’s own code and about twice as fast.',
+  },
+  {
+    title: 'One encoder per core',
+    body: 'The video is split at keyframes into chunks, each core encodes its own, and the pieces are joined at the original frame timestamps.',
+  },
+  {
+    title: 'Steered to half the size',
+    body: 'Pare starts at the highest quality and watches the output as it grows. If the file wouldn’t come out at least 50% smaller, it lowers quality just enough, while encoding.',
+  },
+  {
+    title: 'Checked frame by frame',
+    body: 'Every frame is scored against the source. The result screen puts the weakest frames next to the original so you can judge for yourself.',
+  },
+]
+
+function HowItWorks() {
+  return (
+    <section className="section" aria-labelledby="how">
+      <div className="section-head">
+        <h2 id="how">How it works</h2>
+      </div>
+      <ol className="steps">
+        {STEPS.map((s) => (
+          <li key={s.title}>
+            <h3>{s.title}</h3>
+            <p>{s.body}</p>
+          </li>
+        ))}
+      </ol>
+      <p className="section-foot">
+        <a className="link" href={`${REPO}/blob/main/research/RESEARCH.md`}>
+          Read the research notes
+        </a>{' '}
+        for the benchmarks behind each choice.
+      </p>
     </section>
   )
 }
@@ -481,6 +597,13 @@ function Ready(props: {
   const result = tuning && 'result' in tuning ? tuning.result : null
   const presetLabel = PRESETS.find((p) => p.value === settings.preset)?.label.toLowerCase()
   const better = (['hevc', 'av1'] as const).filter((c) => c !== settings.codec && probe.encodable[c])
+  // Open by default only when something in it has been changed.
+  const [more, setMore] = useState(() => settings.engine !== 'thorough' || settings.shortSide !== null || !settings.keepAudio)
+  const summary = [
+    copy ? 'Original streams' : settings.engine === 'thorough' ? 'x264' : `Browser ${CODEC_LABEL[settings.codec]}`,
+    copy || !settings.shortSide ? 'Original resolution' : `${settings.shortSide}p`,
+    !probe.audio ? 'No audio' : settings.keepAudio ? 'Audio kept' : 'Audio removed',
+  ].join(' · ')
 
   return (
     <form
@@ -508,44 +631,55 @@ function Ready(props: {
           onChange={(v) => setSettings((s) => ({ ...s, sizeTarget: v === 'half' }))}
           hint={copy ? 'Unchanged.' : SIZE_HINT[settings.sizeTarget ? 'half' : 'any']}
         />
-        <Choice
-          legend="Encoder"
-          value={settings.engine}
-          options={ENGINES}
-          disabled={copy}
-          onChange={(engine) => setSettings((s) => ({ ...s, engine }))}
-          hint={copy ? 'Not used. Nothing is re-encoded.' : ENGINE_HINT[settings.engine]}
-        />
-        {settings.engine === 'fast' && !copy && (
-          <Choice
-            legend="Format"
-            value={settings.codec}
-            options={codecs}
-            onChange={(codec) => setSettings((s) => ({ ...s, codec }))}
-            hint={[CODEC_HINT[settings.codec], unavailable.length ? `${unavailable.join(' and ')} can't be encoded in this browser.` : '']
-              .filter(Boolean)
-              .join(' ')}
-          />
-        )}
-        <Choice
-          legend="Resolution"
-          value={settings.shortSide ? String(settings.shortSide) : 'original'}
-          options={resolutions}
-          disabled={copy || resolutions.length === 1}
-          onChange={(v) => setSettings((s) => ({ ...s, shortSide: v === 'original' ? null : Number(v) }))}
-          hint={copy ? 'Unchanged.' : `${target.width}×${target.height}`}
-        />
-        <Choice
-          legend="Audio"
-          value={settings.keepAudio && probe.audio ? 'keep' : 'remove'}
-          options={[
-            { value: 'keep', label: 'Keep' },
-            { value: 'remove', label: 'Remove' },
-          ]}
-          disabled={!probe.audio}
-          onChange={(v) => setSettings((s) => ({ ...s, keepAudio: v === 'keep' }))}
-          hint={!probe.audio ? 'This video has no audio.' : undefined}
-        />
+        <details className="more" open={more} onToggle={(e) => setMore(e.currentTarget.open)}>
+          <summary>
+            <span className="more-label">More options</span>
+            <span className="more-summary">{summary}</span>
+            <svg className="more-chevron" width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden>
+              <path d="m4 6 4 4 4-4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+            </svg>
+          </summary>
+          <div className="more-body">
+            <Choice
+              legend="Encoder"
+              value={settings.engine}
+              options={ENGINES}
+              disabled={copy}
+              onChange={(engine) => setSettings((s) => ({ ...s, engine }))}
+              hint={copy ? 'Not used. Nothing is re-encoded.' : ENGINE_HINT[settings.engine]}
+            />
+            {settings.engine === 'fast' && !copy && (
+              <Choice
+                legend="Format"
+                value={settings.codec}
+                options={codecs}
+                onChange={(codec) => setSettings((s) => ({ ...s, codec }))}
+                hint={[CODEC_HINT[settings.codec], unavailable.length ? `${unavailable.join(' and ')} can't be encoded in this browser.` : '']
+                  .filter(Boolean)
+                  .join(' ')}
+              />
+            )}
+            <Choice
+              legend="Resolution"
+              value={settings.shortSide ? String(settings.shortSide) : 'original'}
+              options={resolutions}
+              disabled={copy || resolutions.length === 1}
+              onChange={(v) => setSettings((s) => ({ ...s, shortSide: v === 'original' ? null : Number(v) }))}
+              hint={copy ? 'Unchanged.' : `${target.width}×${target.height}`}
+            />
+            <Choice
+              legend="Audio"
+              value={settings.keepAudio && probe.audio ? 'keep' : 'remove'}
+              options={[
+                { value: 'keep', label: 'Keep' },
+                { value: 'remove', label: 'Remove' },
+              ]}
+              disabled={!probe.audio}
+              onChange={(v) => setSettings((s) => ({ ...s, keepAudio: v === 'keep' }))}
+              hint={!probe.audio ? 'This video has no audio.' : undefined}
+            />
+          </div>
+        </details>
         {probe.hdr && !copy && (
           <p className="note">This is an HDR video. The compressed copy is SDR, so highlights and colors may look flatter.</p>
         )}
@@ -618,24 +752,32 @@ function Ready(props: {
   )
 }
 
-function Running(props: { probe: Probe; progress: Progress | null; preparing: string; onCancel: () => void }) {
+function Running(props: { probe: Probe; progress: Progress | null; status: string; onCancel: () => void }) {
   const { probe, progress, onCancel } = props
   const fraction = progress?.fraction ?? 0
   const speed = progress && progress.elapsed > 0.5 ? progress.processed / progress.elapsed : null
   const left = speed ? (probe.duration - (progress?.processed ?? 0)) / speed : Infinity
+  const stage = !progress
+    ? props.status
+    : progress.stage === 'finishing'
+      ? 'Writing the file…'
+      : progress.workers
+        ? `Encoding on ${progress.workers} ${progress.workers === 1 ? 'core' : 'cores'}`
+        : 'Encoding'
   return (
     <section className="stack">
       <FileSummary probe={probe} />
       <div className="panel running">
         <div className="running-head">
-          {progress ? (
-            <span className="percent" aria-hidden>
+          <div className="running-title">
+            <p className={progress ? 'running-stage' : 'running-stage pending'} aria-live="polite">
+              {stage}
+            </p>
+            <span className="percent" data-idle={!progress || undefined} aria-hidden>
               {Math.floor(fraction * 100)}
               <span className="percent-sign">%</span>
             </span>
-          ) : (
-            <span className="running-status pending">{props.preparing}</span>
-          )}
+          </div>
           <button type="button" className="button" onClick={onCancel}>
             Cancel
           </button>
@@ -661,7 +803,7 @@ function Running(props: { probe: Probe; progress: Progress | null; preparing: st
           </div>
           <div>
             <dt>Time left</dt>
-            <dd>{fmt.eta(left)}</dd>
+            <dd>{progress?.stage === 'finishing' ? 'Almost done' : fmt.eta(left)}</dd>
           </div>
         </dl>
       </div>
