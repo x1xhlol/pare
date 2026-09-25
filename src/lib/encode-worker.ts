@@ -28,6 +28,8 @@ export type WorkerChunk = {
   /** Overrides the pool's x264 options for this chunk (used when testing several rate factors). */
   options?: string
 }
+/** Asks the worker encoding chunk `index` to stop before the frame at `at`, so another worker can take the rest. */
+export type WorkerSplit = { type: 'split'; index: number; at: number }
 /** Size of one output frame, the rate factor it was encoded at, and whether it opened its chunk (an IDR frame). */
 export type FrameStat = { bytes: number; crf: number; first: boolean }
 export type EncodedChunk = {
@@ -44,6 +46,8 @@ export type WorkerMessage =
   | { type: 'ready' }
   | { type: 'progress'; index: number; fed: number; frames: number; stats: FrameStat[] }
   | { type: 'done'; chunk: EncodedChunk }
+  /** Whether the chunk now ends at `at`: it can't once that frame has gone into the encoder. */
+  | { type: 'split'; index: number; at: number; ok: boolean }
   | { type: 'error'; message: string }
 
 const CSP_I420 = 0x0002
@@ -55,6 +59,8 @@ let sink: VideoSampleSink
 let staging = 0
 let stagingSize = 0
 let enc = 0
+/** The chunk being encoded: where it ends now, and the last frame that went into the encoder. */
+let running: { index: number; end: number; fed: number } | null = null
 
 const post = (message: WorkerMessage, transfer: Transferable[] = []) => self.postMessage(message, transfer)
 
@@ -118,6 +124,7 @@ function cspFor(sample: VideoSample) {
 }
 
 async function encodeChunk({ index, start, end, options: override }: WorkerChunk): Promise<EncodedChunk> {
+  const chunk = (running = { index, end, fed: -Infinity })
   const times: number[] = []
   const packets: EncodedChunk['packets'] = []
   const stats: FrameStat[] = []
@@ -140,7 +147,9 @@ async function encodeChunk({ index, start, end, options: override }: WorkerChunk
     for await (const sample of sink.samples(start, end)) {
       timing.decode += performance.now() - mark
       try {
-        if (sample.timestamp < start - 1e-6 || sample.timestamp >= end - 1e-6) continue
+        if (sample.timestamp >= chunk.end - 1e-6) break
+        if (sample.timestamp < start - 1e-6) continue
+        chunk.fed = sample.timestamp
         if (!enc) {
           const options = x.stringToNewUTF8(text)
           enc = x._enc_open(init.width, init.height, init.fpsNum, init.fpsDen, cspFor(sample), options)
@@ -179,13 +188,19 @@ async function encodeChunk({ index, start, end, options: override }: WorkerChunk
   } finally {
     if (enc) x._enc_close(enc)
     enc = 0
+    running = null
   }
 }
 
-self.onmessage = async (event: MessageEvent<WorkerInit | WorkerChunk>) => {
+self.onmessage = async (event: MessageEvent<WorkerInit | WorkerChunk | WorkerSplit>) => {
   const message = event.data
   try {
-    if (message.type === 'init') {
+    if (message.type === 'split') {
+      // Handled between frames, while the encode loop waits on the decoder.
+      const ok = running?.index === message.index && message.at > running.fed + 1e-6 && message.at < running.end - 1e-6
+      if (ok) running!.end = message.at
+      post({ type: 'split', index: message.index, at: message.at, ok })
+    } else if (message.type === 'init') {
       init = message
       const { default: create }: { default: typeof createX264 } = await import(/* @vite-ignore */ message.script)
       x = await create({

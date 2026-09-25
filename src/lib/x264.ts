@@ -23,7 +23,7 @@ import threadedScript from './x264/x264-mt.mjs?url'
 import threadedWasm from './x264/x264-mt.wasm?url'
 import av1Script from './av1/av1.mjs?url'
 import av1Wasm from './av1/av1.wasm?url'
-import type { EncodedChunk, FrameStat, WorkerChunk, WorkerInit, WorkerMessage } from './encode-worker'
+import type { EncodedChunk, FrameStat, WorkerChunk, WorkerInit, WorkerMessage, WorkerSplit } from './encode-worker'
 import { outputSize, type Preset, type Probe, type Settings } from './shared'
 
 type EncodingPreset = Exclude<Preset, 'copy'>
@@ -45,6 +45,9 @@ class Canceled extends Error {
   name = 'AbortError'
 }
 
+
+/** Least a cut must take off the encode's wall time to be worth a keyframe, in seconds and in frames moved. */
+const MIN_CUT = { seconds: 1, frames: 8 }
 
 /** Share of a frame's time spent before x264 outputs it: decoding, copying in, and lookahead analysis. On short
  * chunks, where the lookahead holds nearly every frame, that phase took about 40% of the wall time. */
@@ -95,8 +98,12 @@ type Profile = {
   budgetSlope: number
   /** How far above its first test encode the plan puts the second. */
   span: { lossless: number; other: number }
+  /** A faster preset for the plan's test encodes, when its sizes predict the real preset's as well. */
+  planPreset?: string
   /** Peak WebAssembly memory of one encoder at this size, in MB. */
   memory: (width: number, height: number) => number
+  /** Time to decode a source frame against decoding and encoding one, with every core busy (1080p H.264 source). */
+  decodeShare: number
   options: (crf: number, color: Color, width: number, height: number) => string[]
 }
 
@@ -136,6 +143,8 @@ const X264: Profile = {
   span: { lossless: 10, other: 6 },
   // Measured peak memory at 1080p: ~400 MB with the 40-frame lookahead, 275 MB with the preset's 20.
   memory: (width, height) => (longLookahead(width, height) ? 400 : 275) * scale(width, height),
+  // 30 ms to decode, 310 ms to encode.
+  decodeShare: 0.09,
   options: (crf, color, width, height) => {
     // 3 reference frames and smart weighted prediction cost no measurable speed; with the 40-frame lookahead they
     // take "faster" from -27.8% to -29.7% BD-rate (VMAF NEG) against the old "veryfast". ssim=1 scores every frame
@@ -176,7 +185,12 @@ const AV1: Profile = {
   slope: -0.075,
   budgetSlope: -0.1,
   span: { lossless: 24, other: 12 },
+  // 1.7x faster in WebAssembly. On 24-frame windows of the corpus its sizes are 1-6% above preset 8's (4-8%
+  // spread), which doesn't show next to the windows' own error against whole encodes (21% spread either way).
+  planPreset: '10',
   memory: (width, height) => 350 * scale(width, height),
+  // 30 ms to decode, 430 ms to encode.
+  decodeShare: 0.065,
   options: (crf, color) => {
     const options = ['8', '', `crf=${crf.toFixed(2)}`, 'ssim=1']
     if (color.primaries && SVT_PRIMARIES[color.primaries]) options.push(`color-primaries=${SVT_PRIMARIES[color.primaries]}`)
@@ -280,6 +294,7 @@ type Pool = {
     chunks: WorkerChunk[],
     onProgress: (frames: number, stats: FrameStat[], index: number) => void,
     prepare?: (chunk: WorkerChunk) => WorkerChunk,
+    divider?: Divider,
   ): Promise<EncodedChunk[]>
   terminate(): void
   /** x264 threads per encoder: what was asked for, or 1 if the threaded build couldn't start. */
@@ -287,6 +302,21 @@ type Pool = {
 }
 
 type PoolInit = Omit<WorkerInit, 'type' | 'module' | 'script' | 'threads'>
+
+/**
+ * A chunk being encoded: frames that went into the encoder, frames that came out, and output frames per second
+ * once enough have come out to tell.
+ */
+type Running = { index: number; fed: number; frames: number; rate?: number }
+/**
+ * Moves the ends of chunks that will finish late onto new chunks for the encoders that will finish first.
+ * `propose` sees the running chunks once the queue is empty and returns where to cut (null until it can tell);
+ * `accept` runs once a worker has agreed to stop at the cut, and returns the new chunk.
+ */
+type Divider = {
+  propose: (running: Running[], workers: number) => { index: number; at: number }[] | null
+  accept: (index: number, at: number) => WorkerChunk
+}
 
 /** Starts `size` encoders with `threads` x264 threads each, falling back to single-threaded encoders if the
  * threaded build doesn't start (it's the less travelled path, and some browsers limit nested workers). */
@@ -341,7 +371,7 @@ async function startPool(build: Build, size: number, threads: number, init: Pool
   return {
     terminate,
     threads,
-    run: (chunks, onProgress, prepare) =>
+    run: (chunks, onProgress, prepare, divider) =>
       new Promise((resolve, reject) => {
         abort = reject
         const queue = [...chunks]
@@ -349,18 +379,63 @@ async function startPool(build: Build, size: number, threads: number, init: Pool
         // Frames count a little when they enter the lookahead and the rest when x264 outputs them, so progress
         // moves from the start even though the first output waits for 40 frames of lookahead.
         const frames = new Map<number, number>()
+        const running = new Map<Worker, Running>()
+        /** When each running chunk's first output was reported, to measure its speed from there. */
+        const clock = new Map<number, { time: number; frames: number }>()
+        const idle: Worker[] = []
+        let cuts: { index: number; at: number }[] | null = null
+        let asking = false
         let pending = chunks.length
         const next = (worker: Worker) => {
           const chunk = queue.shift()
-          if (chunk) worker.postMessage(prepare ? prepare(chunk) : chunk)
+          if (!chunk) {
+            idle.push(worker)
+            return
+          }
+          running.set(worker, { index: chunk.index, fed: 0, frames: 0 })
+          worker.postMessage(prepare ? prepare(chunk) : chunk)
+        }
+        // Cuts go to their workers one at a time; each worker says whether it can still stop there.
+        const ask = () => {
+          if (asking || !cuts?.length) return
+          const cut = cuts.shift()!
+          const worker = [...running].find(([, r]) => r.index === cut.index)?.[0]
+          if (!worker) return ask()
+          asking = true
+          worker.postMessage({ type: 'split', ...cut } satisfies WorkerSplit)
         }
         for (const worker of workers) {
           worker.onmessage = (e: MessageEvent<WorkerMessage>) => {
             const message = e.data
             if (message.type === 'progress') {
+              const r = running.get(worker)
+              if (r) {
+                r.fed = message.fed
+                r.frames = message.frames
+                const now = performance.now()
+                const start = clock.get(r.index)
+                if (!start) {
+                  if (r.frames > 0) clock.set(r.index, { time: now, frames: r.frames })
+                } else if (r.frames - start.frames >= 16) {
+                  r.rate = ((r.frames - start.frames) * 1000) / (now - start.time)
+                }
+              }
+              if (divider && !cuts && !queue.length) {
+                cuts = divider.propose([...running.values()], workers.length)
+                ask()
+              }
               frames.set(message.index, LOOKAHEAD_SHARE * message.fed + (1 - LOOKAHEAD_SHARE) * message.frames)
               onProgress([...frames.values()].reduce((s, n) => s + n, 0), message.stats, message.index)
+            } else if (message.type === 'split') {
+              asking = false
+              if (message.ok) {
+                pending++
+                queue.push(divider!.accept(message.index, message.at))
+                if (idle.length) next(idle.shift()!)
+              }
+              ask()
             } else if (message.type === 'done') {
+              running.delete(worker)
               results[message.chunk.index] = message.chunk
               if (--pending === 0) resolve(results)
               else next(worker)
@@ -379,24 +454,44 @@ async function startPool(build: Build, size: number, threads: number, init: Pool
 /**
  * Splits the video for the worker pool. At least one chunk per worker so no core idles; on longer videos about 8
  * seconds each (x264 starts a keyframe that often anyway), so there are several rounds and later chunks can be
- * steered by what earlier ones measured. Each boundary moves to the nearest source keyframe within a third of a
- * chunk: those are usually scene cuts, where a fresh keyframe costs nothing extra, and decoding a chunk then starts
- * exactly at its first frame.
+ * steered by what earlier ones measured.
+ *
+ * Every chunk costs the same: its frames, plus the frames its decoder works through from the source keyframe before
+ * its first one, at `decodeShare` of a frame each. Moving boundaries to source keyframes instead left chunks up to
+ * 1.5x apart on phone footage with a keyframe every 50 frames, and every encoder waits for the longest one. Each
+ * chunk reaching as far as the cost allows is optimal: a frame moved into a chunk costs a whole frame, while starting
+ * the next chunk later costs at most a fraction of one in extra decoding.
  */
-function planChunks({ times, keys }: Timeline, workers: number): WorkerChunk[] {
-  const n = Math.max(1, Math.min(Math.max(workers, Math.min(6 * workers, Math.ceil(times.length / 240))), Math.floor(times.length / 30)))
-  const span = times.length / n
-  const firsts = [0]
-  for (let k = 1; k < n; k++) {
-    const ideal = Math.round(k * span)
-    let best = ideal
-    let distance = span / 3
-    for (const key of keys) {
-      const d = Math.abs(key - ideal)
-      if (d < distance) (best = key), (distance = d)
-    }
-    if (best > firsts[firsts.length - 1] + 15 && best < times.length - 15) firsts.push(best)
+function planChunks({ times, keys }: Timeline, workers: number, decodeShare: number): WorkerChunk[] {
+  const total = times.length
+  const n = Math.max(1, Math.min(Math.max(workers, Math.min(6 * workers, Math.ceil(total / 240))), Math.floor(total / 30)))
+  // Frames decoded before the first one used, for a chunk starting at each frame.
+  const lead: number[] = []
+  for (let i = 0, k = 0, key = 0; i < total; i++) {
+    while (k < keys.length && keys[k] <= i) key = keys[k++]
+    lead.push(i - key)
   }
+  const split = (limit: number) => {
+    const firsts = [0]
+    for (let first = 0; total - first + decodeShare * lead[first] > limit; ) {
+      const next = first + Math.max(15, Math.floor(limit - decodeShare * lead[first]))
+      // A remainder too short to stand alone stays with this chunk.
+      if (next > total - 15) break
+      firsts.push((first = next))
+    }
+    return firsts
+  }
+  // The smallest per-chunk cost that covers the video in n chunks.
+  let lo = total / n
+  let hi = total / n + decodeShare * lead.reduce((a, b) => Math.max(a, b), 0) + 16
+  while (hi - lo > 0.5) {
+    const mid = (lo + hi) / 2
+    const firsts = split(mid)
+    const last = firsts[firsts.length - 1]
+    if (firsts.length <= n && total - last + decodeShare * lead[last] <= mid) hi = mid
+    else lo = mid
+  }
+  const firsts = split(hi)
   return firsts.map((first, index) => ({
     type: 'chunk',
     index,
@@ -653,6 +748,21 @@ function spread<T>(items: T[], first: number): T[] {
 
 const chunkBytes = (c: EncodedChunk) => c.packets.reduce((t, p) => t + p.data.byteLength, 0)
 
+/** What a chunk's opening keyframe costs over an ordinary frame, on average: the price of one more cut. */
+function keyframeCost(chunks: EncodedChunk[]) {
+  let keys = 0, rest = 0, count = 0
+  for (const c of chunks)
+    for (const p of c.packets) {
+      if (p.pts === 0) {
+        keys += p.data.byteLength
+      } else {
+        rest += p.data.byteLength
+        count++
+      }
+    }
+  return Math.max(0, keys / chunks.length - rest / Math.max(1, count))
+}
+
 /**
  * Chooses chunks to encode again so the video changes by `-excess` bytes. Too big: the biggest chunks go up first,
  * since they save the most per step and busy, complex footage hides the change best, and enough of them are taken
@@ -738,8 +848,9 @@ export function encode(probe: Probe, settings: Settings, start: EncodeStart, onP
       const [line, options] = await Promise.all([timeline(probe.file), encoderOptions(probe, settings, crf)])
       const { times } = line
       const { encoders, threads } = workerCount(probe, settings)
-      const chunks = planChunks(line, encoders)
-      const frameCounts = chunks.map((c) => times.filter((t) => t >= c.start && t < c.end).length)
+      const chunks = planChunks(line, encoders, profile.decodeShare)
+      const countFrames = (c: WorkerChunk) => times.filter((t) => t >= c.start && t < c.end).length
+      const frameCounts = chunks.map(countFrames)
       const active = Math.min(encoders, chunks.length)
       const cores = Math.min(navigator.hardwareConcurrency || active, active * threads)
       const fps = probe.fps || 30
@@ -756,6 +867,25 @@ export function encode(probe: Probe, settings: Settings, start: EncodeStart, onP
         ? new Budget({ goal, frames: frameCounts, floor, max: profile.max, crf, slope: Math.min(slope, profile.budgetSlope) })
         : null
       const crfs: number[] = chunks.map(() => crf)
+      /** Ends chunk `index` before the frame at `at`, and returns the rest as a new chunk. */
+      const cut = (index: number, at: number) => {
+        const rest: WorkerChunk = { type: 'chunk', index: chunks.length, start: at, end: chunks[index].end }
+        const moved = countFrames(rest)
+        frameCounts[index] -= moved
+        frameCounts.push(moved)
+        chunks[index] = { ...chunks[index], end: at }
+        chunks.push(rest)
+        crfs.push(crfs[index])
+        return rest
+      }
+      /** Chunk `index` in `count` pieces of about the same length, the first keeping its index. */
+      const cutInto = (index: number, count: number) => {
+        const first = times.indexOf(chunks[index].start)
+        const frames = frameCounts[index]
+        const rest: WorkerChunk[] = []
+        for (let j = count - 1; j >= 1; j--) rest.unshift(cut(index, times[first + Math.round((j * frames) / count)]))
+        return [chunks[index], ...rest]
+      }
       const withCrf = (chunk: WorkerChunk, value: number) => {
         crfs[chunk.index] = value
         return { ...chunk, options: options.replace(/crf=[\d.]+/, `crf=${value.toFixed(2)}`) }
@@ -770,6 +900,34 @@ export function encode(probe: Probe, settings: Settings, start: EncodeStart, onP
         onProgress({ fraction, processed: fraction * probe.duration, elapsed: (performance.now() - started) / 1000,
           workers: cores, stage })
       }
+      // Busy footage takes up to 1.5x longer per frame than calm footage, which splitting by frames can't know ahead,
+      // and every encoder waits for the last chunk. Once each chunk has shown its speed, the ones that will finish
+      // last hand the end of their frames to new chunks, for the encoders that will finish first: each cut where both
+      // sides should finish together. It costs a keyframe per cut (~0.4% of the file).
+      const divider: Divider = {
+        propose: (running, workers) => {
+          if (running.some((r) => !r.rate)) return null
+          const left = running.map((r) => ({ r, seconds: (frameCounts[r.index] - r.frames) / r.rate! }))
+          // When each encoder will be free: idle ones now, busy ones when their chunk ends.
+          const free = [...Array<number>(Math.max(0, workers - running.length)).fill(0), ...left.map((l) => l.seconds)]
+          const cuts: { index: number; at: number }[] = []
+          for (const { r, seconds } of left.sort((a, b) => b.seconds - a.seconds)) {
+            free.sort((a, b) => a - b)
+            const helper = free[0]
+            // The new chunk's decoder and encoder take about 4 frames' time to get going.
+            const startup = 4 / r.rate!
+            const moved = (seconds - helper - startup) / 2
+            // The cut has to be past the frames already in the encoder, with a margin for reports every 8 frames.
+            const give = Math.min(Math.floor(moved * r.rate!), frameCounts[r.index] - r.fed - 13)
+            if (give < MIN_CUT.frames || moved < MIN_CUT.seconds) continue
+            const at = times.indexOf(chunks[r.index].start) + frameCounts[r.index] - give
+            cuts.push({ index: r.index, at: times[at] })
+            free[0] = helper + startup + give / r.rate!
+          }
+          return cuts
+        },
+        accept: (index, at) => cut(index, at),
+      }
       const encoded = await pool.run(
         spread(chunks, active),
         (frames, stats, index) => {
@@ -777,6 +935,7 @@ export function encode(probe: Probe, settings: Settings, start: EncodeStart, onP
           report(frames, 'encoding')
         },
         budget ? (chunk) => withCrf(chunk, budget.assign(chunk.index)) : undefined,
+        divider,
       )
       const passes = [chunks.map((c) => crfs[c.index].toFixed(1)).join(' ')]
 
@@ -788,8 +947,16 @@ export function encode(probe: Probe, settings: Settings, start: EncodeStart, onP
         if (!over && !(total < goal * 0.8 && crfs.some((c) => c > floor + 0.25))) break
         const mean = encoded.reduce((t, c) => t + crfs[c.index] * chunkBytes(c), 0) / total
         const local = localSlope(start.points ?? [], mean, total, over, slope)
-        const redo = refit(encoded, crfs, total - goal, local, floor, profile.max)
-        const again = redo.map(({ index, crf: value }) => withCrf(chunks[index], value))
+        // A few chunks to redo would leave most encoders idle, and AV1 has no threads to give them: cut each chunk
+        // into pieces so every encoder works (x264 keeps two threads per piece), and budget for the extra keyframes.
+        const share = profile.threaded && canThread ? 2 : 1
+        const piecesFor = (count: number, index: number) =>
+          Math.max(1, Math.min(Math.floor(active / share / count), Math.floor(frameCounts[index] / 30)))
+        const cuts = (list: { index: number }[]) => list.reduce((t, r) => t + piecesFor(list.length, r.index) - 1, 0)
+        let redo = refit(encoded, crfs, total - goal, local, floor, profile.max)
+        if (cuts(redo)) redo = refit(encoded, crfs, total - goal + cuts(redo) * keyframeCost(encoded), local, floor, profile.max)
+        const again = redo.flatMap(({ index, crf: value }) =>
+          cutInto(index, piecesFor(redo.length, index)).map((c) => withCrf(c, value)))
         finished += work - finished
         work = finished + again.reduce((t, c) => t + frameCounts[c.index], 0)
         // Fewer chunks than encoders: give each the cores the others would have used, as x264 threads.
@@ -816,10 +983,12 @@ export function encode(probe: Probe, settings: Settings, start: EncodeStart, onP
         `encode ${(sum('encode') / active / 1000).toFixed(1)} s; video ${(total / 1e6).toFixed(2)} MB; rate factors ${passes.join(' | ')}`)
       onProgress({ fraction: 0.99, processed: probe.duration, elapsed: (performance.now() - started) / 1000,
         workers: cores, stage: 'finishing' })
-      const blob = await mux(probe, settings, encoded, size, rotation)
+      // Chunks split off during the encode come last by index; the file needs them in time order.
+      const ordered = [...encoded].sort((a, b) => a.times[0] - b.times[0])
+      const blob = await mux(probe, settings, ordered, size, rotation)
       onProgress({ fraction: 1, processed: probe.duration, elapsed: (performance.now() - started) / 1000 })
       const scores: FrameScores = { times: [], ssim: [] }
-      for (const chunk of encoded)
+      for (const chunk of ordered)
         for (const p of chunk.packets) {
           scores.times.push(chunk.times[p.pts])
           scores.ssim.push(p.ssim)
@@ -870,8 +1039,10 @@ export async function plan(probe: Probe, settings: Settings, signal: AbortSignal
   input.dispose()
   const size = frameSize(probe, settings, rotation)
   const baseCrf = presetCrf(settings)
-  const [line, options] = await Promise.all([timeline(probe.file), encoderOptions(probe, settings, baseCrf)])
+  const [line, full] = await Promise.all([timeline(probe.file), encoderOptions(probe, settings, baseCrf)])
   const { times } = line
+  const profile = profileFor(settings)
+  const options = profile.planPreset ? full.replace(/^[^;]*/, profile.planPreset) : full
   // One round of tests: half the cores encode short windows at the preset's rate factor, the other half the same
   // windows at a rate factor about half the size, so the curve between them is known without a second round. Each
   // window starts on a source keyframe when one is close, so its decoder doesn't work through frames it won't use.
@@ -886,14 +1057,18 @@ export async function plan(probe: Probe, settings: Settings, signal: AbortSignal
     return { start: times[first], end: first + per < times.length ? times[first + per] : Infinity }
   })
   // The real encode starts a keyframe per chunk and roughly every 250 frames, plus one per scene cut.
-  const fixedKeyframes = planChunks(line, encoders).length + Math.floor(times.length / 250)
+  const fixedKeyframes = planChunks(line, encoders, profile.decodeShare).length + Math.floor(times.length / 250)
   if (signal.aborted) throw new Canceled()
   const fps = probe.fps || 30
-  const profile = profileFor(settings)
   const pool = await createPool(profile, count, threads, {
     file: probe.file, options, width: size.width, height: size.height, fpsNum: Math.round(fps * 1000), fpsDen: 1000,
   })
   const stop = () => pool.terminate()
+  // Settings can change while the encoders start, and a listener added after the abort would never run.
+  if (signal.aborted) {
+    stop()
+    throw new Canceled()
+  }
   signal.addEventListener('abort', stop)
 
   const audio = audioBytes(probe, settings)
