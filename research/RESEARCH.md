@@ -349,6 +349,81 @@ factor), with a 4–8% spread across clips, and the slope of size against rate f
 to the windows' own error, that doesn't show. Predicting each whole clip's size from its windows is off by 21% (the
 spread of the log ratio) at either preset, with the same median bias (1.13 and 1.12).
 
+## Auto: choosing the format by measuring
+
+AV1 needs about 30% fewer bits than x264 on most of the corpus, and 34% more on the rippling water of ducks. It also
+encodes slower, and older Apple devices can't play it. So the question per video is whether AV1 looks better at the
+target size, by enough to be worth it. Answering that takes a quality metric the browser can compute on test encodes,
+and it has to agree with the one that matters. VMAF NEG is the reference here; the encoders hand out SSIM and PSNR for
+free.
+
+Neither free metric is good enough. At the sizes x264 reaches at CRF 16 to 24 on the six corpus clips (30 cases,
+whole-clip encodes), SSIM picks the same winner as VMAF NEG in 21 cases and PSNR in 23. Both lean against AV1 where it
+smooths fine grain, which VMAF doesn't mind: on town at CRF 16, AV1 is 0.9 VMAF NEG points ahead and 0.9 dB behind on
+PSNR, and 2.3 dB behind on SSIM.
+
+`research/codec_choice.py` simulates the choice the way the app makes it: encode the size plan's four 24-frame
+windows with both encoders at two rate factors, predict each one's whole-clip size and its score at the target size
+(linear in log size between the two tests), pick AV1 when its prediction is ahead by a threshold, and score the pick
+against whole-clip VMAF NEG:
+
+| Choice | Picks the better encoder | VMAF NEG lost, mean | Worst |
+| --- | --- | --- | --- |
+| Always x264 | 9 of 30 | 0.91 | 2.93 |
+| Always AV1 | 21 of 30 | 0.69 | 4.35 |
+| PSNR on the windows | 22 of 30 | 0.38 | 2.91 |
+| VMAF NEG on the windows, 2 frames each | 28 of 30 | 0.04 | 1.08 |
+| The same, AV1 on two of the four windows | 24 of 30 | 0.10 | 1.08 |
+
+Three things nearly broke it. Scoring every 8th frame, the obvious way to save time, lands on the top layers of
+SVT-AV1's 16-frame hierarchy, its best frames, and flipped ducks to AV1. Skipping frames also inflates VMAF's motion
+feature, which then forgives more distortion; a short run of consecutive frames, with one extra frame in front to
+prime the motion feature, keeps both honest. And testing AV1 at the plan's faster preset 10 misjudged tree by up to 2
+points, since preset 10 costs some footage more quality than others, so the test runs preset 8.
+
+VMAF runs in the browser as libvmaf 3.0 compiled to WebAssembly (`vmaf-wasm/`), with its AVX2 feature kernels
+translated to WebAssembly SIMD by Emscripten the same way as SVT-AV1's. It scores a 1080p test window 89.34677 where
+native libvmaf says 89.34658, at 321 ms per frame. Three quarters of that is VIF's statistics, whose per-pixel stage is
+a scalar loop of logarithms and 64-bit divisions that SIMD translation doesn't touch, which is why only two frames per
+window get scored. Each plan worker decodes its own test encode with WebCodecs and scores it against source frames it
+copied on the way into the encoder.
+
+In the app, Auto (the default format) works like this:
+
+- H.264's size plan runs with VMAF. If it already fits at its highest quality, or scores 95 at the target, H.264 is
+  the answer: in the simulation AV1 never came out a point ahead there, and nothing else is tested.
+- Otherwise AV1 is tested at preset 8 on the second and fourth of H.264's four windows. Four test encodes on four cores
+  take about half as long as eight sharing them, and two windows chose as well as four. AV1's size estimate is scaled
+  by how those two windows compare with all four in H.264's test, and its VMAF is compared with H.264's on the same
+  two windows.
+- AV1 wins when it's at least a point ahead and this device can play AV1, or when H.264 can't reach half the size at
+  its highest rate factor and AV1 can. With that margin the simulation matched "AV1 only when it's truly a point
+  better" in 27 of 30 cases, and the three misses were within a point of the margin.
+- The AV1 test runs while the settings are on screen. Starting before it ends goes ahead with H.264, unless AV1 is the
+  only way to half the size.
+
+| Clip | Auto | Predicted, AV1 − H.264 | Whole file, AV1 − H.264 |
+| --- | --- | --- | --- |
+| Camera footage, 10 s | H.264: fits at its highest quality | | |
+| Screen recording, 8 s | H.264: fits at its highest quality | | |
+| Jellyfish, 10 s, already 4.2 Mbps | AV1: H.264 stops at −30% | +1.5 | |
+| Big Buck Bunny, 10 s | AV1 | +1.3 | +0.74 |
+| Phone clips, 20 s | H.264 | +0.7 | +1.38 |
+| Phone clip with PCM audio, 10 s | H.264 | −0.4 | +0.71 |
+
+The phone clips are a miss: the test on all four windows said +1.0, the two-window test +0.7, and the whole file
+came out 1.4 points better as AV1. The other decisions hold. The jellyfish is the one that matters most: H.264 at its
+highest allowed rate factor made it 30% smaller, and the size target promises 50%.
+
+Auto costs 2–4 s of scoring on top of H.264's plan, and 11–13 s for AV1's test when it runs, in the background. A
+compression started a second after the file loads took 28, 56, 35 and 11 s on the four benchmark clips, the same as
+H.264 alone within this machine's noise.
+
+I haven't found this done before. vmaf.dev runs libvmaf in the browser to compare two files, ab-av1 searches rate
+factors with sample encodes and VMAF on the command line, and per-title encoding services choose codecs on servers.
+Measuring the test encodes of a client-side compressor to choose its format for a size target is new as far as I can
+tell.
+
 ## End to end in the browser
 
 Same headless Chrome, same files, production builds:
@@ -372,6 +447,10 @@ checking the result spends the allowance on quality.
   libvmaf, corpus in `corpus/ref/*.y4m`).
 - `research/corpus.sh` downloads the Xiph clips and builds the "phone" versions and `mix.mp4`.
 - `research/results.jsonl` holds every rate-quality point measured (native x264, VMAF/VMAF NEG/SSIM/PSNR-Y).
+- `vmaf-wasm/build.sh` builds libvmaf for WebAssembly from the pinned commit plus `libvmaf-wasm.patch`, with Pare's
+  binding, into `src/lib/vmaf/`.
+- `research/codec_choice.py` simulates Auto's choice on the corpus (native x264, SVT-AV1 and ffmpeg with libvmaf);
+  its results are in `codec_choice*.jsonl`.
 - `research/wasm-bench.mjs` times the WebAssembly encoder on raw frames in Node; `research/browser-ab.mjs` times a
   full compression in the browser against any deployment.
 
@@ -379,4 +458,6 @@ checking the result spends the allowance on quality.
 
 x264 is GPL-2.0-or-later, and the WebAssembly build is served to users, so the corresponding source (x264 at
 `X264_COMMIT` plus `x264-simd128.patch` and `pare_x264.c`) has to be offered to them. The previous ffmpeg.wasm build
-had the same obligation.
+had the same obligation. SVT-AV1 (BSD-3-Clause-Clear, with the Alliance for Open Media patent license) and libvmaf
+(BSD-2-Clause-Patent) are permissive and GPL-compatible; their patches and bindings are in `av1-wasm/` and
+`vmaf-wasm/`.

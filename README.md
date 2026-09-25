@@ -34,12 +34,15 @@ Pare now runs its own build of x264:
   least 50% smaller, the busiest chunks are encoded again.
 - **Every frame is scored.** x264 computes SSIM for each frame against its input as it encodes. The result screen
   reports the average and the worst frame, and opens a side-by-side view on the weakest ones.
-- **AV1, with SIMD.** More options → Format → AV1 runs SVT-AV1, compiled to WebAssembly with its x86 SIMD kernels
-  translated automatically, the worst emulations replaced, and motion-search kernels rewritten for WebAssembly
-  (`av1-wasm/`). Its output is byte-identical to native SVT-AV1. At the same size target it scores 0.7–1.4 VMAF NEG
-  points higher than x264, with better worst frames, and footage that already fits comes out about 26% smaller. On
-  the benchmark clips it takes 0.85× to 1.6× as long as x264. AV1 files don't play on older Apple devices, so H.264
-  stays the default.
+- **AV1, with SIMD.** SVT-AV1 compiled to WebAssembly with its x86 SIMD kernels translated automatically, the worst
+  emulations replaced, and motion-search kernels rewritten for WebAssembly (`av1-wasm/`). Its output is
+  byte-identical to native SVT-AV1. At the same size target it usually scores 0.7–1.4 VMAF NEG points higher than
+  x264, and on the benchmark clips it takes 0.85× to 1.6× as long.
+- **Auto picks the format by measuring.** Pare compiles Netflix's libvmaf to WebAssembly too (`vmaf-wasm/`). The size
+  plan's test encodes are decoded and scored with VMAF NEG in the browser, and AV1 is used only when it looks at least
+  a point better at the target size and the device can play it, or when it's the only way to half the size. On the
+  test corpus that picked the better encoder in 28 of 30 cases, where SSIM would have agreed with VMAF in 21. The AV1
+  test runs while you look at the settings; start sooner and Pare goes ahead with H.264.
 
 The encoder settings came out of a quality lab. Every candidate was swept over rate factors on a test corpus and
 scored with VMAF, VMAF NEG, SSIM and PSNR. The winner (`faster` with a 40-frame lookahead, 3 references and weighted
@@ -69,8 +72,8 @@ haven't found a setting that closes that gap without a bigger file or about 50% 
 - **Quality:** visually lossless, high, compact, or an exact copy (the original streams in a new container, every
   frame bit-identical).
 - **Size:** at least 50% smaller (default), or no limit.
-- **More options:** the encoder (x264, or the browser's own WebCodecs encoder, which is faster but less efficient and
-  can also produce HEVC or AV1), resolution, and audio.
+- **More options:** the encoder (Pare's own, or the browser's WebCodecs encoder, which is faster but less efficient),
+  the format (Auto, H.264 or AV1; the browser's encoder can also make HEVC), resolution, and audio.
 
 ## Running it
 
@@ -95,11 +98,12 @@ The script clones x264 at the commit in `x264-wasm/X264_COMMIT`, applies `x264-s
 | Path | What's there |
 | --- | --- |
 | `src/App.tsx` | The whole interface: landing, settings, progress, result |
-| `src/lib/x264.ts` | Size plan, chunking, per-chunk budget, refit, joining, audio |
-| `src/lib/encode-worker.ts` | One x264 encoder per worker, fed by WebCodecs through Mediabunny |
+| `src/lib/x264.ts` | Size plan, Auto's format choice, chunking and cuts, per-chunk budget, refit, joining, audio |
+| `src/lib/encode-worker.ts` | One encoder per worker, fed by WebCodecs through Mediabunny; scores test encodes with VMAF |
 | `src/lib/media.ts` | Probing, the WebCodecs encoder path, the frame-by-frame quality check |
 | `x264-wasm/` | The SIMD patch, the pinned x264 commit, the C binding, and the build script |
 | `av1-wasm/` | The SVT-AV1 patch, dispatch-fallback generator, replacement intrinsic header, C binding, build script |
+| `vmaf-wasm/` | The libvmaf patch (AVX2 kernels under Emscripten), the scoring binding, and the build script |
 | `research/` | Write-up, benchmark scripts, corpus builder, and every measurement in `results.jsonl` |
 
 ## Limits
@@ -116,7 +120,8 @@ The script clones x264 at the commit in `x264-wasm/X264_COMMIT`, applies `x264-s
 ## License
 
 Pare is free software under the GNU General Public License, version 2 or later, because x264 is. See
-[LICENSE](LICENSE). The x264 changes are in `x264-wasm/x264-simd128.patch`.
+[LICENSE](LICENSE). The x264 changes are in `x264-wasm/x264-simd128.patch`. SVT-AV1 (BSD-3-Clause-Clear) and libvmaf
+(BSD-2-Clause-Patent) keep their own licenses; Pare's changes to them are in `av1-wasm/` and `vmaf-wasm/`.
 
 H.264 is covered by patents in some countries. x264's own licensing notes apply to anyone distributing encoders
 built from it.
