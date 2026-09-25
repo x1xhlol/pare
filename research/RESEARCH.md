@@ -146,9 +146,13 @@ On the 4-core, 8-thread test machine, the same 240 frames split different ways:
 | 4 encoders × 2 threads | 18.4 fps | 24.43 MB |
 | 2 encoders × 4 threads | 17.7 fps | 24.07 MB |
 
-Fewer chunks compress a little better (fewer keyframes) but run slower, so independent encoders stay the default.
-Threads are used where they're free: cores beyond the 8 encoders memory allows, and refits, which usually redo fewer
-chunks than there are cores (the phone clip's one-chunk refit went from 18 s on one core to 7 s on four).
+Fewer chunks compress a little better (fewer keyframes) but run slower, so there's still one encoder per core. What
+does pay is giving each of those encoders two threads anyway, on the same 8 hardware threads: the 20-second mix clip
+encodes in 41.1 s instead of 47.0 s (13% faster), with the same size and quality, and 3 or 4 threads per encoder add
+nothing more. With one thread, a core sits idle whenever its worker waits for the decoder or copies a frame in; the
+second thread keeps x264 busy through those gaps. Beyond that, threads take cores the 8 encoders memory allows can't,
+and refits, which usually redo fewer chunks than there are cores (the phone clip's one-chunk refit went from 18 s on
+one core to 7 s on four).
 
 One stream with no chunks at all would need size control without chunks. x264's one-pass average bitrate mode was
 tested on the mix clip, whose four scenes differ a lot: it spent early (VMAF NEG by scene: 92.8, 86.7, 89.5, 77.6),
@@ -208,9 +212,10 @@ Same headless Chrome, same files, production builds:
 
 | Clip | ffmpeg.wasm build | SIMD build, first size target | Now |
 | --- | --- | --- | --- |
-| 20 s 1080p50 phone-style (65.5 MB) | 105.2 s, no size target | 75 s, −61%, SSIM 0.943 | 60 s, −55%, SSIM 0.951 |
-| 10 s 1080p30 camera (77.9 MB) | 27.3 s | 31 s, −80% | 27 s, −80%, SSIM 0.994 |
-| 10 s Big Buck Bunny (30.7 MB) | | 41 s, −60%, SSIM 0.980 | 34 s, −55%, SSIM 0.983 |
+| 20 s 1080p50 phone-style (65.5 MB) | 105.2 s, no size target | 75 s, −61%, SSIM 0.943 | 53 s, −55%, SSIM 0.951 |
+| 10 s 1080p30 camera (77.9 MB) | 27.3 s | 31 s, −80% | 26 s, −80%, SSIM 0.994 |
+| 10 s Big Buck Bunny (30.7 MB) | | 41 s, −60%, SSIM 0.980 | 33 s, −55%, SSIM 0.983 |
+| 2 min 1080p50 phone-style (392 MB) | | | 260 s, −51%, SSIM 0.954 |
 
 "Now" includes the size plan when Compress is clicked a second after the file loads. The ffmpeg.wasm build had no
 size target, and the middle column aimed at 44% of the original and often landed far below it; aiming at 47% and
