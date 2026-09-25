@@ -423,7 +423,8 @@ export default function App() {
 
       <footer className="footer">
         <p>
-          Pare runs x264 compiled to WebAssembly, in this tab. It's free software under the GPL, version 2 or later.
+          Pare runs x264, SVT-AV1 and VMAF compiled to WebAssembly, in this tab. It's free software under the GPL, version 2
+          or later.
         </p>
         <nav className="footer-links" aria-label="Project">
           <a className="link" href={REPO}>
@@ -566,11 +567,15 @@ const STEPS = [
   },
   {
     title: 'One encoder per core',
-    body: 'The video is split at keyframes into chunks, each core encodes its own, and the chunks are joined at the original frame timestamps.',
+    body: 'The video is split into chunks of equal work and each core encodes its own. A chunk that turns out slow hands its last frames to whichever core will be free first, and the chunks are joined at the original frame timestamps.',
   },
   {
     title: 'Held to half the size',
     body: 'Short test encodes measure how size falls as quality drops, and each chunk gets its setting from what the finished ones really cost. The file is weighed at the end, and if it isn’t at least 50% smaller, the busiest chunks are encoded again.',
+  },
+  {
+    title: 'H.264 or AV1, by measuring',
+    body: 'Netflix’s VMAF, compiled to WebAssembly too, scores test encodes in both formats. AV1 is used when it looks clearly better at the target size and your device plays it; otherwise H.264, which is faster and plays everywhere.',
   },
   {
     title: 'Checked frame by frame',
