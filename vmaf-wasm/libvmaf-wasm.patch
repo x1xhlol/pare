@@ -1,0 +1,62 @@
+diff --git a/libvmaf/src/cpu.c b/libvmaf/src/cpu.c
+index 013a7c5..ca41753 100644
+--- a/libvmaf/src/cpu.c
++++ b/libvmaf/src/cpu.c
+@@ -24,7 +24,9 @@ static unsigned flags_mask = -1;
+ 
+ void vmaf_init_cpu(void)
+ {
+-#if ARCH_X86
++#if defined(__EMSCRIPTEN__) && ARCH_X86
++    flags = VMAF_X86_CPU_FLAG_SSE2 | VMAF_X86_CPU_FLAG_SSSE3 | VMAF_X86_CPU_FLAG_SSE41 | VMAF_X86_CPU_FLAG_AVX2;
++#elif ARCH_X86
+     flags = vmaf_get_cpu_flags_x86();
+ #elif ARCH_AARCH64
+     flags = vmaf_get_cpu_flags_arm();
+diff --git a/libvmaf/src/meson.build b/libvmaf/src/meson.build
+index 623639d..6106214 100644
+--- a/libvmaf/src/meson.build
++++ b/libvmaf/src/meson.build
+@@ -33,6 +33,15 @@ is_asm_enabled = get_option('enable_asm') == true
+ is_cuda_enabled = get_option('enable_cuda') == true
+ is_avx512_enabled = get_option('enable_avx512') == true
+ is_nvtx_enabled = get_option('enable_nvtx') == true
++# WebAssembly: the AVX2 kernels are C intrinsics, which Emscripten translates to WebAssembly SIMD. There's no NASM
++# and no cpuid, so src/cpu.c reports the translated instruction sets directly.
++is_wasm_simd = host_machine.system() == 'emscripten' and is_asm_enabled
++if is_wasm_simd
++    cdata.set10('HAVE_ASM', true)
++    cdata.set10('ARCH_X86', true)
++    cdata.set10('ARCH_X86_64', true)
++    cdata.set10('ARCH_X86_32', false)
++endif
+ 
+ if is_nvtx_enabled    
+     cdata.set10('HAVE_NVTX', is_nvtx_enabled)
+@@ -175,7 +184,7 @@ libvmaf_cpu_sources = [
+     src_dir + 'cpu.c',
+ ]
+ 
+-if is_asm_enabled
++if is_asm_enabled and not is_wasm_simd
+     if host_machine.cpu_family().startswith('x86')
+         # NASM source files
+         libvmaf_sources_asm = files(
+@@ -229,7 +238,7 @@ if is_asm_enabled
+         platform_specific_cpu_objects += arm64_static_lib.extract_all_objects()
+     endif
+ 
+-    if host_machine.cpu_family().startswith('x86')
++    if host_machine.cpu_family().startswith('x86') or is_wasm_simd
+       x86_avx2_sources = [
+           feature_src_dir + 'common/convolution_avx.c',
+           feature_src_dir + 'x86/motion_avx2.c',
+@@ -242,7 +251,7 @@ if is_asm_enabled
+           'x86_avx2',
+           x86_avx2_sources,
+           include_directories : vmaf_base_include,
+-          c_args : ['-mavx', '-mavx2'] + vmaf_cflags_common,
++          c_args : ['-mavx', '-mavx2'] + (is_wasm_simd ? ['-msimd128'] : []) + vmaf_cflags_common,
+       )
+ 
+       platform_specific_cpu_objects += x86_avx2_static_lib.extract_all_objects(recursive: true)

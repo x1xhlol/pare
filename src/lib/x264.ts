@@ -23,7 +23,10 @@ import threadedScript from './x264/x264-mt.mjs?url'
 import threadedWasm from './x264/x264-mt.wasm?url'
 import av1Script from './av1/av1.mjs?url'
 import av1Wasm from './av1/av1.wasm?url'
+import vmafScript from './vmaf/vmaf.mjs?url'
+import vmafWasm from './vmaf/vmaf.wasm?url'
 import type { EncodedChunk, FrameStat, WorkerChunk, WorkerInit, WorkerMessage, WorkerSplit } from './encode-worker'
+import { av1Config, avcConfig } from './codec-config'
 import { outputSize, type Preset, type Probe, type Settings } from './shared'
 
 type EncodingPreset = Exclude<Preset, 'copy'>
@@ -62,8 +65,10 @@ const BUILDS = {
   x264: { script: singleScript, wasm: singleWasm },
   'x264-mt': { script: threadedScript, wasm: threadedWasm },
   av1: { script: av1Script, wasm: av1Wasm },
+  vmaf: { script: vmafScript, wasm: vmafWasm },
 }
 type Build = keyof typeof BUILDS
+type EncoderBuild = Exclude<Build, 'vmaf'>
 const compiled: Partial<Record<Build, Promise<WebAssembly.Module>>> = {}
 
 /** Compiles an encoder build once; every worker instantiates the same module. */
@@ -84,8 +89,8 @@ type Color = { primaries?: string; transfer?: string; matrix?: string; fullRange
  */
 type Profile = {
   /** One-thread build, and the pthreads build if there is one. */
-  single: Build
-  threaded?: Build
+  single: EncoderBuild
+  threaded?: EncoderBuild
   /** Mediabunny's codec, and the decoder config built from the encoder's headers. */
   codec: 'avc' | 'av1'
   config: (headers: Uint8Array, width: number, height: number) => VideoDecoderConfig
@@ -301,7 +306,10 @@ type Pool = {
   threads: number
 }
 
-type PoolInit = Omit<WorkerInit, 'type' | 'module' | 'script' | 'threads'>
+type PoolInit = Omit<WorkerInit, 'type' | 'module' | 'script' | 'threads' | 'codec' | 'vmaf'> & {
+  /** Load the VMAF module too, for chunks that ask to be scored. */
+  scoring?: boolean
+}
 
 /**
  * A chunk being encoded: frames that went into the encoder, frames that came out, and output frames per second
@@ -325,18 +333,20 @@ let threadsFailed = false
 async function createPool(profile: Profile, size: number, threads: number, init: PoolInit): Promise<Pool> {
   if (threads > 1 && profile.threaded && !threadsFailed) {
     try {
-      return await startPool(profile.threaded, size, threads, init, 20_000)
+      return await startPool(profile, profile.threaded, size, threads, init, 20_000)
     } catch (err) {
       if (err instanceof Canceled) throw err
       threadsFailed = true
       console.warn(`[pare] threaded encoder unavailable, using one thread per encoder: ${err instanceof Error ? err.message : err}`)
     }
   }
-  return startPool(profile.single, size, 1, init)
+  return startPool(profile, profile.single, size, 1, init)
 }
 
-async function startPool(build: Build, size: number, threads: number, init: PoolInit, timeout?: number): Promise<Pool> {
-  const module = await loadEncoder(build)
+async function startPool(profile: Profile, build: EncoderBuild, size: number, threads: number, init: PoolInit,
+                         timeout?: number): Promise<Pool> {
+  const { scoring, ...rest } = init
+  const [module, vmaf] = await Promise.all([loadEncoder(build), scoring ? loadEncoder('vmaf') : undefined])
   const workers = Array.from({ length: size }, () =>
     new Worker(new URL('./encode-worker.ts', import.meta.url), { type: 'module' }),
   )
@@ -356,7 +366,10 @@ async function startPool(build: Build, size: number, threads: number, init: Pool
               else if (e.data.type === 'error') reject(failed(e.data.message))
             }
             worker.onerror = (e) => reject(failed(e.message))
-            worker.postMessage({ type: 'init', module, script: BUILDS[build].script, threads, ...init } satisfies WorkerInit)
+            worker.postMessage({
+              type: 'init', module, script: BUILDS[build].script, threads, codec: profile.codec, ...rest,
+              vmaf: vmaf && { module: vmaf, script: BUILDS.vmaf.script },
+            } satisfies WorkerInit)
           }),
       ),
     )
@@ -498,89 +511,6 @@ function planChunks({ times, keys }: Timeline, workers: number, decodeShare: num
     start: times[first],
     end: index === firsts.length - 1 ? Infinity : times[firsts[index + 1]],
   }))
-}
-
-/** Splits x264's headers (4-byte length-prefixed SPS, PPS, SEI) into an avcC record and codec string. */
-function avcConfig(headers: Uint8Array, width: number, height: number): VideoDecoderConfig {
-  const nals: Uint8Array[] = []
-  for (let i = 0; i < headers.length; ) {
-    const len = (headers[i] << 24) | (headers[i + 1] << 16) | (headers[i + 2] << 8) | headers[i + 3]
-    nals.push(headers.subarray(i + 4, i + 4 + len))
-    i += 4 + len
-  }
-  const sps = nals.find((n) => (n[0] & 0x1f) === 7)
-  const pps = nals.find((n) => (n[0] & 0x1f) === 8)
-  if (!sps || !pps) throw new Error('The encoder produced no SPS/PPS.')
-  const avcC = new Uint8Array(11 + sps.length + pps.length)
-  avcC.set([1, sps[1], sps[2], sps[3], 0xff, 0xe1, sps.length >> 8, sps.length & 0xff])
-  avcC.set(sps, 8)
-  avcC.set([1, pps.length >> 8, pps.length & 0xff], 8 + sps.length)
-  avcC.set(pps, 11 + sps.length)
-  const hex = (b: number) => b.toString(16).padStart(2, '0')
-  return { codec: `avc1.${hex(sps[1])}${hex(sps[2])}${hex(sps[3])}`, codedWidth: width, codedHeight: height, description: avcC }
-}
-
-/**
- * The codec string for AV1 in MP4 ("av01.P.LLT.08"), from the sequence header OBU SVT-AV1 returns as its headers.
- * Mediabunny builds the av1C box from it; the sequence header itself travels in every keyframe. Reads profile, and
- * level and tier of operating point 0 (AV1 spec 5.5).
- */
-function av1Config(headers: Uint8Array, width: number, height: number): VideoDecoderConfig {
-  let bit = 0
-  const read = (n: number) => {
-    let v = 0
-    for (let i = 0; i < n; i++, bit++) v = v * 2 + ((headers[bit >> 3] >> (7 - (bit & 7))) & 1)
-    return v
-  }
-  const uvlc = () => {
-    let zeros = 0
-    while (!read(1)) zeros++
-    return zeros >= 32 ? 2 ** 32 - 1 : read(zeros) + 2 ** zeros - 1
-  }
-  const leb128 = () => {
-    let v = 0
-    for (let i = 0; i < 8; i++) {
-      const byte = read(8)
-      v += (byte & 0x7f) * 2 ** (7 * i)
-      if (!(byte & 0x80)) break
-    }
-    return v
-  }
-  // OBU header: forbidden bit, type, extension flag, has_size_field, reserved.
-  read(1)
-  if (read(4) !== 1) throw new Error('The AV1 encoder returned no sequence header.')
-  const extension = read(1)
-  const hasSize = read(1)
-  read(1)
-  if (extension) read(8)
-  if (hasSize) leb128()
-  const profile = read(3)
-  read(1) // still_picture
-  let level = 0
-  let tier = 0
-  if (read(1)) {
-    level = read(5) // reduced_still_picture_header
-  } else {
-    if (read(1)) {
-      // timing_info, then decoder_model_info if present
-      read(32)
-      read(32)
-      if (read(1)) uvlc()
-      if (read(1)) {
-        read(5)
-        read(32)
-        read(5)
-        read(5)
-      }
-    }
-    read(1) // initial_display_delay_present_flag
-    read(5) // operating_points_cnt_minus_1
-    read(12) // operating_point_idc[0]
-    level = read(5)
-    if (level > 7) tier = read(1)
-  }
-  const codec = `av01.${profile}.${String(level).padStart(2, '0')}${tier ? 'H' : 'M'}.08`
-  return { codec, codedWidth: width, codedHeight: height }
 }
 
 const MP4_AUDIO: AudioCodec[] = ['aac', 'opus', 'mp3', 'ac3', 'eac3', 'flac']
@@ -859,7 +789,7 @@ export function encode(probe: Probe, settings: Settings, start: EncodeStart, onP
       let poolThreads = pool.threads
       if (canceled) throw new Canceled()
       const audio = audioBytes(probe, settings)
-      const goal = Math.max(probe.file.size * SIZE_AIM - audio, probe.file.size * 0.05)
+      const goal = videoGoal(probe, settings)
       const limit = Math.max(probe.file.size * SIZE_TARGET - audio - 64e3, probe.file.size * 0.05)
       // A steeper slope than measured keeps the budget from overreaching when it lowers the rate factor: near the
       // sizes it lands on, noisy footage grows much faster than the plan's two distant tests suggest.
@@ -1015,6 +945,23 @@ const SIZE_AIM = 0.47
 const WINDOW_FRAMES = 24
 /** Test-window estimates came in 3-11% under the finished files (median ~7%); scale them to match. */
 const ESTIMATE_BIAS = 1.08
+/** Frames of each test window scored with VMAF when choosing the codec (research/codec_choice.py). */
+const SCORED_FRAMES = 2
+/**
+ * H.264 scoring this well at the target leaves AV1 nothing visible to add: in the corpus test AV1 never came out a
+ * point ahead where H.264 was predicted at 95 or more, so Auto skips the AV1 test there.
+ */
+const AUTO_HIGH = 95
+/**
+ * How much better AV1 has to look before Auto picks it: it encodes slower and some older devices can't play it.
+ * One VMAF NEG point; in the corpus test, AV1 gained 0.3 to 2.9 at sizes where it won.
+ */
+const AUTO_MARGIN = 1
+
+/** Video bytes the size target leaves once the audio is paid for. */
+function videoGoal(probe: Probe, settings: Settings) {
+  return Math.max(probe.file.size * SIZE_AIM - audioBytes(probe, settings), probe.file.size * 0.05)
+}
 
 export type SizePlan = {
   crf: number
@@ -1026,8 +973,10 @@ export type SizePlan = {
   fitted?: boolean
   /** Measured change in log size per rate factor step. */
   slope?: number
-  /** Predicted video bytes at the tested rate factors. */
-  points?: { crf: number; bytes: number }[]
+  /** Predicted video bytes at the tested rate factors, and VMAF NEG of the test windows when measured. */
+  points?: { crf: number; bytes: number; vmaf?: number }[]
+  /** The size target binds: the lower test didn't fit, so the rate factor was raised to make it fit. */
+  bound?: boolean
 }
 
 /**
@@ -1035,7 +984,7 @@ export type SizePlan = {
  * rate factor would leave the file bigger than half the original, searches for the lowest rate factor that gets
  * there (x264 roughly halves the bits every +6).
  */
-export async function plan(probe: Probe, settings: Settings, signal: AbortSignal): Promise<SizePlan> {
+export async function plan(probe: Probe, settings: Settings, signal: AbortSignal, measure = false): Promise<SizePlan> {
   const began = performance.now()
   const { input, track } = await openTrack(probe.file)
   const rotation = await track.getRotation()
@@ -1045,7 +994,8 @@ export async function plan(probe: Probe, settings: Settings, signal: AbortSignal
   const [line, full] = await Promise.all([timeline(probe.file), encoderOptions(probe, settings, baseCrf)])
   const { times } = line
   const profile = profileFor(settings)
-  const options = profile.planPreset ? full.replace(/^[^;]*/, profile.planPreset) : full
+  // Quality measurements need the real preset: a faster one changes how AV1 looks more on some footage than others.
+  const options = profile.planPreset && !measure ? full.replace(/^[^;]*/, profile.planPreset) : full
   // One round of tests: half the cores encode short windows at the preset's rate factor, the other half the same
   // windows at a rate factor about half the size, so the curve between them is known without a second round. Each
   // window starts on a source keyframe when one is close, so its decoder doesn't work through frames it won't use.
@@ -1065,7 +1015,11 @@ export async function plan(probe: Probe, settings: Settings, signal: AbortSignal
   const fps = probe.fps || 30
   const pool = await createPool(profile, count, threads, {
     file: probe.file, options, width: size.width, height: size.height, fpsNum: Math.round(fps * 1000), fpsDen: 1000,
+    scoring: measure,
   })
+  // A short run from a third of the way into each window: the first frame primes VMAF's motion feature, and a run
+  // covers every layer of the encoders' hierarchical frame structures. Every 8th frame would land on their best ones.
+  const score = measure && per >= 12 ? { from: Math.floor(per / 3), count: SCORED_FRAMES + 1 } : undefined
   const stop = () => pool.terminate()
   // Settings can change while the encoders start, and a listener added after the abort would never run.
   if (signal.aborted) {
@@ -1076,7 +1030,8 @@ export async function plan(probe: Probe, settings: Settings, signal: AbortSignal
 
   const audio = audioBytes(probe, settings)
 
-  /** Predicted video bytes for the whole file at each rate factor, all encoded in one round. */
+  let lastScores = [0]
+  /** Predicted video bytes for the whole file at each rate factor, all encoded in one round, and VMAF NEG. */
   const videoAt = async (crfs: number[]) => {
     const chunks: WorkerChunk[] = crfs.flatMap((crf, c) =>
       windows.map((w, i) => ({
@@ -1084,10 +1039,12 @@ export async function plan(probe: Probe, settings: Settings, signal: AbortSignal
         index: c * windows.length + i,
         ...w,
         options: options.replace(/crf=[\d.]+/, `crf=${crf.toFixed(1)}`),
+        score,
       })),
     )
     const encoded = await pool.run(chunks, () => {})
     if (signal.aborted) throw new Canceled()
+    lastScores = encoded.map((c) => c.timing.score ?? 0)
     return crfs.map((_, c) => {
       // Keyframes are priced separately: every window starts with one, which would over-count them. Keyframes
       // later in a window are scene cuts, and their rate carries over to the whole video.
@@ -1104,40 +1061,111 @@ export async function plan(probe: Probe, settings: Settings, signal: AbortSignal
       const perKey = keyCount ? keyBytes / keyCount : 0
       const perFrame = restCount ? restBytes / restCount : perKey
       // Short windows see less of the lookahead's bit redistribution and ran 3-11% low against full encodes.
-      return ESTIMATE_BIAS * (perKey * keyframes + perFrame * Math.max(0, times.length - keyframes))
+      const bytes = ESTIMATE_BIAS * (perKey * keyframes + perFrame * Math.max(0, times.length - keyframes))
+      const scores = encoded.slice(c * windows.length, (c + 1) * windows.length).flatMap((w) => (w.vmaf! >= 0 ? [w.vmaf!] : []))
+      return { crf: crfs[c], bytes, vmaf: scores.length ? scores.reduce((a, b) => a + b, 0) / scores.length : undefined }
     })
   }
 
   try {
     if (!settings.sizeTarget) {
       const [base] = await videoAt([baseCrf])
-      return { crf: baseCrf, size: base + audio, raised: false }
+      return { crf: baseCrf, size: base.bytes + audio, raised: false, points: [base] }
     }
     // Visually lossless spends the whole budget on quality: test the quality ceiling and a point well below it. Other
     // presets keep their own rate factor unless it would miss the target.
     const lossless = settings.preset === 'visually-lossless'
     const lo = lossless ? profile.ceiling : baseCrf
     const hi = Math.min(profile.max, lo + (lossless ? profile.span.lossless : profile.span.other))
-    const [atLo, atHi] = await videoAt([lo, hi])
+    const points = await videoAt([lo, hi])
+    const [atLo, atHi] = points.map((p) => p.bytes)
     // Decide against the aim, not the target itself: estimates run up to ~10% low, and a file predicted at 48% could
     // land above half.
-    const goal = Math.max(probe.file.size * SIZE_AIM - audio, probe.file.size * 0.05)
+    const goal = videoGoal(probe, settings)
     // log(size) is close to linear in the rate factor; interpolate (or extrapolate) between the two tests.
     const measured = (Math.log(atHi) - Math.log(atLo)) / (hi - lo)
     const slope = measured < -0.03 ? measured : profile.slope
-    console.info(`[pare] plan: ${(performance.now() - began) / 1000 | 0} s, ${windows.length}×${per} frames, ` +
+    const scoring = measure ? `, scoring ${(Math.max(...lastScores) / 1000).toFixed(1)} s per window` : ''
+    console.info(`[pare] plan: ${(performance.now() - began) / 1000 | 0} s${scoring}, ${windows.length}×${per} frames, ` +
       `crf ${lo} → ${(atLo / 1e6).toFixed(1)} MB, crf ${hi} → ${(atHi / 1e6).toFixed(1)} MB, slope ${slope.toFixed(3)}`)
-    const points = [{ crf: lo, bytes: atLo }, { crf: hi, bytes: atHi }]
-    if (atLo <= goal) return { crf: lo, size: atLo + audio, raised: false, fitted: false, slope, points }
+    if (atLo <= goal) return { crf: lo, size: atLo + audio, raised: false, fitted: false, slope, points, bound: false }
     let crf = Math.min(profile.max, Math.max(lo, lo + (Math.log(goal) - Math.log(atLo)) / slope))
     // Past the higher test the straight line tends to overstate sizes (the noise stops costing bits), so land
     // halfway back: the encode checks its real size and corrects either way.
     if (crf > hi) crf = hi + (crf - hi) / 2
     const video = Math.exp(Math.log(atLo) + slope * (crf - lo))
     console.info(`[pare] plan: crf ${crf.toFixed(1)} → ${(video / 1e6).toFixed(2)} MB video`)
-    return { crf: Math.round(crf * 10) / 10, size: Math.min(video, goal) + audio, raised: crf > baseCrf, fitted: lossless, slope, points }
+    return { crf: Math.round(crf * 10) / 10, size: Math.min(video, goal) + audio, raised: crf > baseCrf, fitted: lossless, slope,
+      points, bound: true }
   } finally {
     signal.removeEventListener('abort', stop)
     pool.terminate()
   }
+}
+
+export type Choice = {
+  codec: 'avc' | 'av1'
+  /** The chosen encoder's size plan, to start the encode from. */
+  plan: SizePlan
+  /** Predicted VMAF NEG at the target size, of H.264 and, when it was tested, AV1. */
+  vmaf?: { avc: number; av1?: number }
+  /**
+   * unlimited: no size target to compare at. fits: H.264 already fits at its best quality. high: H.264 already scores
+   * AUTO_HIGH. device: this device can't play AV1. size: only AV1 reaches the target. better: AV1 looks better by the
+   * margin. even: it doesn't.
+   */
+  reason: 'unlimited' | 'fits' | 'high' | 'device' | 'size' | 'better' | 'even'
+}
+
+/** Predicted bytes at rate factor `crf`, log size straight through the plan's two tests. */
+function bytesAt(points: SizePlan['points'], crf: number) {
+  const [lo, hi] = points ?? []
+  if (!lo || !hi) return Infinity
+  return lo.bytes * Math.exp((Math.log(hi.bytes / lo.bytes) / (hi.crf - lo.crf)) * (crf - lo.crf))
+}
+
+/** VMAF NEG at `bytes`, linear in log size through the plan's two tests. */
+function vmafAt(points: SizePlan['points'], bytes: number) {
+  const [lo, hi] = points ?? []
+  if (lo?.vmaf === undefined || hi?.vmaf === undefined) return undefined
+  return lo.vmaf + ((Math.log(bytes) - Math.log(lo.bytes)) / (Math.log(hi.bytes) - Math.log(lo.bytes))) * (hi.vmaf - lo.vmaf)
+}
+
+async function playsAv1(width: number, height: number, fps: number) {
+  try {
+    const info = await navigator.mediaCapabilities.decodingInfo({
+      type: 'file',
+      video: { contentType: 'video/mp4; codecs="av01.0.08M.08"', width, height, bitrate: 8e6, framerate: fps || 30 },
+    })
+    return info.supported && info.smooth
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Auto: tests both encoders on the size plan's windows and keeps the one that looks better at the target size, by
+ * VMAF NEG measured in the browser on a few frames of each window. H.264 wins ties and needs no AV1 test when it
+ * already fits at its best quality. In the corpus test (research/codec_choice.py) this picked the better encoder in 28
+ * of 30 cases, and the two it missed were within 0.31 points.
+ */
+export async function choose(probe: Probe, settings: Settings, signal: AbortSignal): Promise<Choice> {
+  const avc = await plan(probe, { ...settings, codec: 'avc' }, signal, settings.sizeTarget)
+  if (!settings.sizeTarget) return { codec: 'avc', plan: avc, reason: 'unlimited' }
+  if (!avc.bound) return { codec: 'avc', plan: avc, reason: 'fits' }
+  const goal = videoGoal(probe, settings)
+  const reaches = bytesAt(avc.points, X264.max) <= goal
+  const avcScore = vmafAt(avc.points, goal)
+  if (avcScore === undefined) return { codec: 'avc', plan: avc, reason: 'even' }
+  if (reaches && avcScore >= AUTO_HIGH) return { codec: 'avc', plan: avc, vmaf: { avc: avcScore }, reason: 'high' }
+  const { width, height } = outputSize(probe, settings.shortSide)
+  if (!(await playsAv1(width, height, probe.fps))) return { codec: 'avc', plan: avc, vmaf: { avc: avcScore }, reason: 'device' }
+  const av1 = await plan(probe, { ...settings, codec: 'av1' }, signal, true)
+  const vmaf = { avc: avcScore, av1: vmafAt(av1.points, goal) }
+  console.info(`[pare] auto: VMAF NEG at ${(goal / 1e6).toFixed(1)} MB, H.264 ${vmaf.avc.toFixed(2)}, AV1 ${vmaf.av1?.toFixed(2)}; ` +
+    `rate factors ${avc.crf} / ${av1.crf}`)
+  // x264 at its highest rate factor still over the target: only AV1 can keep the size promise.
+  if (!reaches && bytesAt(av1.points, AV1.max) <= goal) return { codec: 'av1', plan: av1, vmaf, reason: 'size' }
+  if (vmaf.av1 !== undefined && vmaf.av1 - vmaf.avc >= AUTO_MARGIN) return { codec: 'av1', plan: av1, vmaf, reason: 'better' }
+  return { codec: 'avc', plan: avc, vmaf, reason: 'even' }
 }

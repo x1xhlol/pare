@@ -650,6 +650,8 @@ label {
 
 .settings {
   display: grid;
+  /* A shrinkable column, so the one-line "More options" summary truncates instead of widening the panel. */
+  grid-template-columns: minmax(0, 1fr);
   gap: 24px;
 }
 
@@ -834,6 +836,7 @@ label {
 .estimate {
   display: flex;
   flex-direction: column;
+  min-width: 0;
 }
 
 .estimate-label {
@@ -1318,6 +1321,10 @@ label {
   }
   .choice-hint {
     grid-column: 1;
+  }
+  /* The detail line wraps to two lines here; keep room for both while the estimate is still coming. */
+  .estimate-detail {
+    min-height: 2lh;
   }
   .action-bar {
     position: sticky;

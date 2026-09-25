@@ -178,6 +178,9 @@ export type Calibration = {
   /** x264 only: measured change in log size per rate factor step, and predicted video bytes at tested rate factors. */
   slope?: number
   points?: { crf: number; bytes: number }[]
+  /** Auto: the encoder the in-browser test picked, why, and each one's predicted VMAF NEG at the target size. */
+  codec?: 'avc' | 'av1'
+  choice?: { reason: 'unlimited' | 'fits' | 'high' | 'device' | 'size' | 'better' | 'even'; vmaf?: { avc: number; av1?: number } }
 }
 
 type Segment = {

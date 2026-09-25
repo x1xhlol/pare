@@ -10,6 +10,8 @@ export type Settings = {
   preset: Preset
   engine: Engine
   codec: OutputCodec
+  /** Thorough only: test H.264 and AV1 on this video and keep the one that looks better at the target size. */
+  autoCodec: boolean
   /** Target length of the short side in pixels, or null to keep the source resolution. */
   shortSide: number | null
   keepAudio: boolean

@@ -2,6 +2,9 @@
 // Encodes chunks of one video with x264 (WebAssembly SIMD). Frames come from the browser's decoder via
 // Mediabunny and are copied straight into x264's input planes whenever the pixel format allows it.
 import { BlobSource, Input, MATROSKA, MP4, QTFF, VideoSampleSink, WEBM, type VideoSample } from 'mediabunny'
+import { decoderConfig } from './codec-config'
+import type createVmaf from './vmaf/vmaf.mjs'
+import type { VmafModule } from './vmaf/vmaf.mjs'
 import type createX264 from './x264/x264.mjs'
 import type { X264Module } from './x264/x264.mjs'
 
@@ -12,6 +15,10 @@ export type WorkerInit = {
   script: string
   /** x264 frame threads; above 1 the module must be the threaded build. */
   threads: number
+  /** What the module encodes, for decoding test encodes back to score them. */
+  codec: 'avc' | 'av1'
+  /** The VMAF module, when chunks will be scored. */
+  vmaf?: { module: WebAssembly.Module; script: string }
   file: File
   /** x264 options: "preset;tune;key=value;..." */
   options: string
@@ -27,6 +34,11 @@ export type WorkerChunk = {
   end: number
   /** Overrides the pool's x264 options for this chunk (used when testing several rate factors). */
   options?: string
+  /**
+   * Score `count` frames from frame `from` with VMAF NEG against the source. The first only primes VMAF's motion
+   * feature; the mean covers the rest.
+   */
+  score?: { from: number; count: number }
 }
 /** Asks the worker encoding chunk `index` to stop before the frame at `at`, so another worker can take the rest. */
 export type WorkerSplit = { type: 'split'; index: number; at: number }
@@ -34,13 +46,15 @@ export type WorkerSplit = { type: 'split'; index: number; at: number }
 export type FrameStat = { bytes: number; crf: number; first: boolean }
 export type EncodedChunk = {
   index: number
-  /** Milliseconds spent waiting for decoded frames, copying them in, and encoding. */
-  timing: { decode: number; load: number; encode: number }
+  /** Milliseconds spent waiting for decoded frames, copying them in, encoding, and scoring the result. */
+  timing: { decode: number; load: number; encode: number; score?: number }
   /** Source timestamp of each input frame, by x264 pts. */
   times: number[]
   /** SSIM of each output frame against its input, as measured by x264 (luma). */
   packets: { data: Uint8Array<ArrayBuffer>; pts: number; key: boolean; ssim: number }[]
   headers: Uint8Array<ArrayBuffer>
+  /** VMAF NEG of the scored frames, when the chunk asked for it. */
+  vmaf?: number
 }
 export type WorkerMessage =
   | { type: 'ready' }
@@ -54,6 +68,7 @@ const CSP_I420 = 0x0002
 const CSP_NV12 = 0x0004
 
 let x: X264Module
+let vmaf: Promise<VmafModule> | null = null
 let init: WorkerInit
 let sink: VideoSampleSink
 let staging = 0
@@ -123,7 +138,76 @@ function cspFor(sample: VideoSample) {
   return direct && (sample.format === 'I420' || sample.format === 'I420A') ? CSP_I420 : CSP_NV12
 }
 
-async function encodeChunk({ index, start, end, options: override }: WorkerChunk): Promise<EncodedChunk> {
+/** The luma plane the encoder is about to read, copied out tightly packed. */
+function luma() {
+  const { width, height } = init
+  const offset = x._enc_plane(enc, 0)
+  const stride = x._enc_stride(enc, 0)
+  const out = new Uint8Array(width * height)
+  for (let y = 0; y < height; y++) out.set(x.HEAPU8.subarray(offset + y * stride, offset + y * stride + width), y * width)
+  return out
+}
+
+/** Decodes a finished test encode and returns the luma of the wanted frames, by frame number. */
+async function decodeLuma(chunk: Omit<EncodedChunk, 'vmaf'>, wanted: Set<number>) {
+  const { width, height } = init
+  const frames: VideoFrame[] = []
+  let failure: unknown = null
+  const decoder = new VideoDecoder({
+    output: (frame) => (wanted.has(Math.round(frame.timestamp)) ? frames.push(frame) : frame.close()),
+    error: (err) => (failure = err),
+  })
+  decoder.configure(decoderConfig(init.codec, chunk.headers, width, height))
+  // Frames only reference packets decoded before them, so decoding can stop at the last packet shown in range.
+  const last = Math.max(...wanted)
+  const through = chunk.packets.findLastIndex((p) => p.pts <= last)
+  for (const p of chunk.packets.slice(0, through + 1))
+    decoder.decode(new EncodedVideoChunk({ type: p.key ? 'key' : 'delta', timestamp: p.pts, data: p.data }))
+  await decoder.flush()
+  decoder.close()
+  if (failure) throw failure
+  const out = new Map<number, Uint8Array>()
+  for (const frame of frames) {
+    try {
+      const data = new Uint8Array(frame.allocationSize())
+      const [plane] = await frame.copyTo(data)
+      const y = new Uint8Array(width * height)
+      for (let row = 0; row < height; row++)
+        y.set(data.subarray(plane.offset + row * plane.stride, plane.offset + row * plane.stride + width), row * width)
+      out.set(Math.round(frame.timestamp), y)
+    } finally {
+      frame.close()
+    }
+  }
+  return out
+}
+
+/** VMAF NEG of decoded frames against their sources, skipping the first pair, which only primes motion. */
+async function scoreFrames(sources: Map<number, Uint8Array>, decoded: Map<number, Uint8Array>) {
+  const v = await (vmaf ??= import(/* @vite-ignore */ init.vmaf!.script).then(({ default: create }: { default: typeof createVmaf }) =>
+    create({
+      instantiateWasm: (imports, done) => {
+        void WebAssembly.instantiate(init.vmaf!.module, imports).then((instance) => done(instance, init.vmaf!.module))
+        return {}
+      },
+    })))
+  const scorer = v._score_open(init.width, init.height)
+  try {
+    const numbers = [...sources.keys()].sort((a, b) => a - b)
+    for (const n of numbers) {
+      const dist = decoded.get(n)
+      if (!dist) throw new Error(`Frame ${n} of the test encode didn't decode.`)
+      v.HEAPU8.set(sources.get(n)!, v._score_ref(scorer))
+      v.HEAPU8.set(dist, v._score_dist(scorer))
+      if (v._score_add(scorer)) throw new Error('VMAF rejected a frame.')
+    }
+    return v._score_finish(scorer, 1)
+  } finally {
+    v._score_close(scorer)
+  }
+}
+
+async function encodeChunk({ index, start, end, options: override, score }: WorkerChunk): Promise<EncodedChunk> {
   const chunk = (running = { index, end, fed: -Infinity })
   const times: number[] = []
   const packets: EncodedChunk['packets'] = []
@@ -139,6 +223,8 @@ async function encodeChunk({ index, start, end, options: override }: WorkerChunk
     stats.push({ bytes: size, crf, first: pts === 0 })
   }
   const report = () => post({ type: 'progress', index, fed: times.length, frames: packets.length, stats: stats.splice(0) })
+  /** Source luma of the frames to score, by frame number. */
+  const sources = new Map<number, Uint8Array>()
 
   const timing = { decode: 0, load: 0, encode: 0 }
   let mark = performance.now()
@@ -160,6 +246,7 @@ async function encodeChunk({ index, start, end, options: override }: WorkerChunk
         let t = performance.now()
         await load!(sample)
         timing.load += performance.now() - t
+        if (score && times.length >= score.from && times.length < score.from + score.count) sources.set(times.length, luma())
         times.push(sample.timestamp)
         t = performance.now()
         collect(x._enc_encode(enc, times.length - 1))
@@ -184,7 +271,11 @@ async function encodeChunk({ index, start, end, options: override }: WorkerChunk
     const headerSize = x._enc_headers(enc)
     const headersPtr = x._enc_headers_ptr(enc)
     report()
-    return { index, times, packets, timing, headers: x.HEAPU8.slice(headersPtr, headersPtr + headerSize) }
+    const encoded = { index, times, packets, timing, headers: x.HEAPU8.slice(headersPtr, headersPtr + headerSize) }
+    if (!sources.size) return encoded
+    const began = performance.now()
+    const vmaf = await scoreFrames(sources, await decodeLuma(encoded, new Set(sources.keys())))
+    return { ...encoded, vmaf, timing: { ...timing, score: performance.now() - began } }
   } finally {
     if (enc) x._enc_close(enc)
     enc = 0

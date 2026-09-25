@@ -15,7 +15,15 @@ type Phase =
   | { kind: 'probing'; name: string }
   | { kind: 'ready'; probe: Probe; error?: string }
   | { kind: 'running'; probe: Probe; progress: Progress | null; status: string }
-  | { kind: 'done'; probe: Probe; blob: Blob; url: string; quality: QualityReport | 'pending' | 'failed' }
+  | {
+      kind: 'done'
+      probe: Probe
+      blob: Blob
+      url: string
+      quality: QualityReport | 'pending' | 'failed'
+      /** The format Pare's own encoders wrote, when they ran. */
+      codec?: 'avc' | 'av1'
+    }
 
 type Tuning = { round: number } | { result: Calibration } | { error: string }
 type CalibrationEntry = {
@@ -29,8 +37,9 @@ type CalibrationEntry = {
 /** Thorough runs Pare's own WebAssembly encoders: x264 for H.264, SVT-AV1 for AV1. */
 const usesX264 = (s: Settings) => s.engine === 'thorough' && s.preset !== 'copy'
 const thoroughCodec = (s: Settings): 'avc' | 'av1' => (s.codec === 'av1' ? 'av1' : 'avc')
+const thoroughFormat = (s: Settings): ThoroughFormat => (s.autoCodec ? 'auto' : thoroughCodec(s))
 const settingsKey = (s: Settings) =>
-  `${s.preset}|${usesX264(s) ? `wasm-${thoroughCodec(s)}` : s.codec}|${s.shortSide}|${s.keepAudio}|${s.sizeTarget}`
+  `${s.preset}|${usesX264(s) ? `wasm-${thoroughFormat(s)}` : s.codec}|${s.shortSide}|${s.keepAudio}|${s.sizeTarget}`
 const isAbort = (err: unknown) => err instanceof Error && (err.name === 'AbortError' || err.name === 'ConversionCanceledError')
 
 // The landing page is rendered to HTML at build time, where there is no window: render it as supported, and let the
@@ -81,12 +90,16 @@ const CODEC_HINT: Record<OutputCodec, string> = {
   av1: 'Smallest files, slowest to encode. Plays in current browsers and newer phones.',
 }
 
-const THOROUGH_CODECS: Option<'avc' | 'av1'>[] = [
+type ThoroughFormat = 'auto' | 'avc' | 'av1'
+
+const THOROUGH_CODECS: Option<ThoroughFormat>[] = [
+  { value: 'auto', label: 'Auto' },
   { value: 'avc', label: 'H.264' },
   { value: 'av1', label: 'AV1' },
 ]
 
 const THOROUGH_CODEC_HINT = {
+  auto: 'Test-encodes this video and measures the results with VMAF, in this browser. AV1 when it looks clearly better at this size and this device plays it, otherwise H.264: faster, and plays everywhere.',
   avc: 'x264. Plays everywhere.',
   av1: 'SVT-AV1. About 30% smaller than H.264 at the same quality on most footage, and about half as fast. Plays in current Chrome, Edge and Firefox, on Android, and on Apple devices with AV1 hardware (iPhone 15 Pro, M3 Macs and later).',
 }
@@ -101,6 +114,7 @@ export default function App() {
     preset: 'visually-lossless',
     engine: 'thorough',
     codec: 'avc',
+    autoCodec: true,
     shortSide: null,
     keepAudio: true,
     sizeTarget: true,
@@ -182,6 +196,12 @@ export default function App() {
       controller,
       promise: usesX264(settings)
         ? x264().then(async (m) => {
+            if (settings.autoCodec) {
+              const { codec, plan, reason, vmaf } = await m.choose(probe, settings, controller.signal)
+              const { size, crf, raised, fitted, slope, points } = plan
+              return { bitrate: 0, size, ssim: 0, target: 0, reached: true, crf, raised, fitted, slope, points, codec,
+                choice: { reason, vmaf } }
+            }
             const { size, crf, raised, fitted, slope, points } = await m.plan(probe, settings, controller.signal)
             return { bitrate: 0, size, ssim: 0, target: 0, reached: true, crf, raised, fitted, slope, points }
           })
@@ -253,16 +273,23 @@ export default function App() {
       kind: 'running',
       probe,
       progress: null,
-      status: !usesX264(settings) ? 'Finishing tuning…' : waitFor && !waitFor.result ? 'Finishing size tests…' : 'Starting encoders…',
+      status: !usesX264(settings)
+        ? 'Finishing tuning…'
+        : waitFor && !waitFor.result
+          ? settings.autoCodec ? 'Finishing format tests…' : 'Finishing size tests…'
+          : 'Starting encoders…',
     })
     const onProgress = (progress: Progress) => setPhase((p) => (p.kind === 'running' ? { ...p, progress } : p))
+    let codec: 'avc' | 'av1' | undefined
     try {
       if (usesX264(settings)) {
         const engine = await x264()
         const plan = waitFor ? await waitFor.promise.catch(() => undefined) : undefined
         if (run.canceled) return
         setPhase((p) => (p.kind === 'running' ? { ...p, status: 'Starting encoders…' } : p))
-        run.job = engine.encode(probe, settings, { crf: plan?.crf, slope: plan?.slope, points: plan?.points }, onProgress)
+        codec = settings.autoCodec ? plan?.codec ?? 'avc' : thoroughCodec(settings)
+        run.job = engine.encode(probe, { ...settings, codec }, { crf: plan?.crf, slope: plan?.slope, points: plan?.points },
+          onProgress)
       } else {
         const { bitrate } = await ensureCalibration(probe, settings).promise
         if (run.canceled) return
@@ -271,7 +298,7 @@ export default function App() {
       const { measureQuality } = await media()
       const { blob, scores } = await run.job.promise
       const url = URL.createObjectURL(blob)
-      setPhase({ kind: 'done', probe, blob, url, quality: settings.preset === 'copy' ? 'failed' : 'pending' })
+      setPhase({ kind: 'done', probe, blob, url, quality: settings.preset === 'copy' ? 'failed' : 'pending', codec })
       if (settings.preset === 'copy') return
       const quality = await measureQuality(probe, blob, scores).catch(() => 'failed' as const)
       setPhase((p) => (p.kind === 'done' && p.blob === blob ? { ...p, quality } : p))
@@ -600,6 +627,17 @@ function FileSummary({ probe, onReplace }: { probe: Probe; onReplace?: () => voi
   )
 }
 
+/** What Auto picked and why, as "format: reason" in one line on wide screens (two on phones). */
+function choiceDetail({ reason, vmaf }: NonNullable<Calibration['choice']>) {
+  const gain = vmaf?.av1 !== undefined ? vmaf.av1 - vmaf.avc : 0
+  if (reason === 'high' && vmaf) return `H.264: already ${Math.round(vmaf.avc)} VMAF here`
+  if (vmaf?.av1 === undefined && reason === 'even') return 'Measured on short test encodes'
+  if (reason === 'device') return "H.264: this device can't play AV1"
+  if (reason === 'size') return "AV1: H.264 can't reach half the size"
+  if (reason === 'better') return `AV1: ${gain.toFixed(1)} VMAF above H.264 here`
+  return gain > 0 ? `H.264: AV1 only ${gain.toFixed(1)} VMAF better` : `H.264: ${(-gain).toFixed(1)} VMAF above AV1 here`
+}
+
 function Ready(props: {
   probe: Probe
   settings: Settings
@@ -633,13 +671,16 @@ function Ready(props: {
   const better = (['hevc', 'av1'] as const).filter((c) => c !== settings.codec && probe.encodable[c])
   // Open by default only when something in it has been changed.
   const [more, setMore] = useState(
-    () => settings.engine !== 'thorough' || thoroughCodec(settings) === 'av1' || settings.shortSide !== null || !settings.keepAudio,
+    () => settings.engine !== 'thorough' || !settings.autoCodec || settings.shortSide !== null || !settings.keepAudio,
   )
+  const thoroughName = (c: 'avc' | 'av1') => (c === 'av1' ? 'SVT-AV1' : 'x264')
   const summary = [
     copy
       ? 'Original streams'
       : settings.engine === 'thorough'
-        ? thoroughCodec(settings) === 'av1' ? 'SVT-AV1' : 'x264'
+        ? settings.autoCodec
+          ? result?.codec ? `Auto: ${thoroughName(result.codec)}` : 'Auto'
+          : thoroughName(thoroughCodec(settings))
         : `Browser ${CODEC_LABEL[settings.codec]}`,
     copy || !settings.shortSide ? 'Original resolution' : `${settings.shortSide}p`,
     !probe.audio ? 'No audio' : settings.keepAudio ? 'Audio kept' : 'Audio removed',
@@ -691,10 +732,12 @@ function Ready(props: {
             {settings.engine === 'thorough' && !copy && (
               <Choice
                 legend="Format"
-                value={thoroughCodec(settings)}
+                value={thoroughFormat(settings)}
                 options={THOROUGH_CODECS}
-                onChange={(codec) => setSettings((s) => ({ ...s, codec }))}
-                hint={THOROUGH_CODEC_HINT[thoroughCodec(settings)]}
+                onChange={(format) =>
+                  setSettings((s) => (format === 'auto' ? { ...s, autoCodec: true } : { ...s, autoCodec: false, codec: format }))
+                }
+                hint={THOROUGH_CODEC_HINT[thoroughFormat(settings)]}
               />
             )}
             {settings.engine === 'fast' && !copy && (
@@ -750,7 +793,11 @@ function Ready(props: {
             </span>
           )}
           <span className="estimate-detail">
-            {result?.fitted === false
+            {result?.choice && result.choice.reason !== 'unlimited' && result.choice.reason !== 'fits'
+              ? choiceDetail(result.choice)
+              : !result && usesX264(settings) && settings.autoCodec && settings.sizeTarget && !(tuning && 'error' in tuning)
+              ? 'Test-encoding to pick the format'
+              : result?.fitted === false
               ? 'Highest quality already fits in half the size'
               : result?.fitted
               ? 'Best quality that fits in half the size'
@@ -886,7 +933,10 @@ function Done(props: {
   return (
     <section className="stack">
       <div className="panel result">
-        <p className="result-kicker">{smaller ? 'Done' : 'Done, but the original is smaller'}</p>
+        <p className="result-kicker">
+          {smaller ? 'Done' : 'Done, but the original is smaller'}
+          {props.phase.codec && ` · ${props.phase.codec === 'av1' ? 'AV1' : 'H.264'}`}
+        </p>
         <p className="result-sizes">
           <span className="from">{fmt.bytes(before)}</span>
           <span className="arrow" aria-label="to">
