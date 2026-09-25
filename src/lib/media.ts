@@ -178,6 +178,8 @@ export type Calibration = {
   /** x264 only: measured change in log size per rate factor step, and predicted video bytes at tested rate factors. */
   slope?: number
   points?: { crf: number; bytes: number }[]
+  /** x264 only: plan test windows the encode can keep. */
+  reuse?: import('./x264').Reusable[]
   /** Auto: the encoder the in-browser test picked, why, and each one's predicted VMAF NEG at the target size. */
   codec?: 'avc' | 'av1'
   choice?: {

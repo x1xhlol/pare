@@ -424,6 +424,40 @@ factors with sample encodes and VMAF on the command line, and per-title encoding
 Measuring the test encodes of a client-side compressor to choose its format for a size target is new as far as I can
 tell.
 
+## How close to 1:1 half the size can get
+
+VMAF NEG 93 to 95 is about where a re-encode stops looking different from its source at normal viewing distance.
+From the whole-clip sweeps above, this is the file size each encoder needs to get there, against the 50% budget:
+
+| Clip (source) | x264 at 93 | x264 at 95 | AV1 at 93 | AV1 at 95 |
+| --- | --- | --- | --- | --- |
+| Big Buck Bunny (24 Mbps animation) | 39% | over the tested range | 26% | 61% |
+| town (25 Mbps "phone" re-encode) | 76% | 120% | 28% | 66% |
+| tree | 99% | 134% | 50% | 107% |
+| park | over the tested range | 100% | 84% | 99% |
+| ducks (rippling water) | 124% | 142% | 171% | 204% |
+
+So half the size at about 1:1 is out of reach for park and ducks with any encoder here: the source's noise is the
+detail, and it needs more bits than the source already spends. On town and tree it's within reach, but only with AV1,
+which is why Auto's shortcut changed: a compression started before AV1's test ends goes ahead with H.264 only when H.264
+is predicted at 93 or more. Town went from 90.3 to 94.0 at the same size, its worst frame from 84.2 to 90.6.
+
+The same data says where AV1 usually lands: at equal size its rate factor is about 1.88 times x264's minus 10.7 (5.6
+spread across clips). AV1's test now brackets that guess, 6 either side, instead of starting at its quality ceiling,
+the slowest rate factor to encode.
+
+## Plans that miss less
+
+The size plan interpolates log size between two test rate factors, 15 and 25 for visually lossless. Noisy footage
+doesn't follow a straight line there: bits fall off steeply once the noise stops being coded, and 5-second clips of
+town and tree came out 46% and 52% bigger than planned, then noisy 46% smaller. Each miss cost a second encode of
+most chunks. When the answer falls more than 1.5 steps from both tests, or past the higher one, the plan now runs a
+third round of the same windows near it and fits between the two tests either side of the target. Town and tree then
+landed within 2% and 6% with no second encode (31.3 → 27.0 s, 32.9 → 27.8 s), and noisy within 4% (38.5 → 29.8 s).
+
+Auto's VMAF scoring used to hold the plan up by 3 to 4 s per round. Workers now hand each test encode over first and
+score it afterwards, from copies, so a compression can start on the sizes alone; scoring only gates Auto's decision.
+
 ## End to end in the browser
 
 Same headless Chrome, same files, production builds:

@@ -200,8 +200,8 @@ export default function App() {
     const onRound = (round: number) => {
       if (currentKey.current === key) setTuning({ key, round })
     }
-    const fromPlan = ({ size, crf, raised, fitted, slope, points }: SizePlan): Calibration =>
-      ({ bitrate: 0, size, ssim: 0, target: 0, reached: true, crf, raised, fitted, slope, points })
+    const fromPlan = ({ size, crf, raised, fitted, slope, points, reuse }: SizePlan): Calibration =>
+      ({ bitrate: 0, size, ssim: 0, target: 0, reached: true, crf, raised, fitted, slope, points, reuse })
     // Auto tests AV1 while the settings are on screen. Starting before the test ends goes ahead with H.264 when it
     // meets the size target, so a quick start doesn't wait for a test that rarely changes the answer.
     const test = new AbortController()
@@ -326,8 +326,8 @@ export default function App() {
         if (run.canceled) return
         setPhase((p) => (p.kind === 'running' ? { ...p, status: 'Starting encoders…' } : p))
         codec = settings.autoCodec ? plan?.codec ?? 'avc' : thoroughCodec(settings)
-        run.job = engine.encode(probe, { ...settings, codec }, { crf: plan?.crf, slope: plan?.slope, points: plan?.points },
-          onProgress)
+        run.job = engine.encode(probe, { ...settings, codec },
+          { crf: plan?.crf, slope: plan?.slope, points: plan?.points, reuse: codec === 'avc' ? plan?.reuse : undefined }, onProgress)
       } else {
         const { bitrate } = await ensureCalibration(probe, settings).promise
         if (run.canceled) return

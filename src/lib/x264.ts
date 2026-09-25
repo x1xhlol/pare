@@ -532,6 +532,44 @@ function planChunks({ times, keys }: Timeline, workers: number, decodeShare: num
   }))
 }
 
+/**
+ * Chunks for a video some stretches of which are already encoded: those stay as they are, and the frames between them
+ * are split for the workers in proportion to each gap's length. Returns every chunk in time order, and the finished
+ * ones by their new index.
+ */
+function planAround({ times }: Timeline, workers: number, done: Reusable[]) {
+  const total = times.length
+  const fixed = done
+    .map((r) => ({ ...r, first: times.indexOf(r.start), last: r.end === Infinity ? total : times.indexOf(r.end) }))
+    .filter((r) => r.first >= 0 && r.last > r.first)
+    .sort((a, b) => a.first - b.first)
+  const gaps: { first: number; last: number }[] = []
+  let at = 0
+  for (const f of fixed) {
+    if (f.first > at) gaps.push({ first: at, last: f.first })
+    at = f.last
+  }
+  if (at < total) gaps.push({ first: at, last: total })
+  const open = gaps.reduce((t, g) => t + g.last - g.first, 0)
+  const n = Math.max(workers, Math.min(6 * workers, Math.ceil(open / 240)))
+  const pieces = gaps.flatMap((g) => {
+    const frames = g.last - g.first
+    const count = Math.max(1, Math.min(Math.round((n * frames) / Math.max(1, open)), Math.floor(frames / 15)))
+    return Array.from({ length: count }, (_, k) => ({
+      first: g.first + Math.round((k * frames) / count),
+      last: g.first + Math.round(((k + 1) * frames) / count),
+    }))
+  })
+  const all = [...pieces.map((p) => ({ ...p, chunk: undefined as EncodedChunk | undefined })), ...fixed]
+    .sort((a, b) => a.first - b.first)
+  const reused = new Map<number, EncodedChunk>()
+  const chunks = all.map((c, index): WorkerChunk => {
+    if (c.chunk) reused.set(index, { ...c.chunk, index })
+    return { type: 'chunk', index, start: times[c.first], end: c.last >= total ? Infinity : times[c.last] }
+  })
+  return { chunks, reused }
+}
+
 const MP4_AUDIO: AudioCodec[] = ['aac', 'opus', 'mp3', 'ac3', 'eac3', 'flac']
 
 async function mux(probe: Probe, settings: Settings, chunks: EncodedChunk[], size: { width: number; height: number },
@@ -770,7 +808,12 @@ export type EncodeStart = {
   slope?: number
   /** The plan's predicted video bytes at the rate factors it tested. */
   points?: { crf: number; bytes: number }[]
+  /** Test windows the plan encoded with exactly the settings this encode starts with, to keep as finished chunks. */
+  reuse?: Reusable[]
 }
+
+/** A finished stretch of the video: one of the plan's test windows. */
+export type Reusable = { start: number; end: number; chunk: EncodedChunk }
 
 /**
  * Encodes the video in parallel chunks with x264 and stitches them into one MP4. With the size target on, the rate
@@ -797,10 +840,15 @@ export function encode(probe: Probe, settings: Settings, start: EncodeStart, onP
       const [line, options] = await Promise.all([timeline(probe.file), encoderOptions(probe, settings, crf)])
       const { times } = line
       const { encoders, threads } = workerCount(probe, settings)
-      const chunks = planChunks(line, encoders, profile.decodeShare)
+      // The plan's test windows are finished chunks when they were encoded with exactly these settings: x264 at the
+      // rate factor this encode starts from.
+      const reuse = profile === X264 && start.reuse?.length && crf === floor ? start.reuse : []
+      const { chunks, reused } = reuse.length
+        ? planAround(line, encoders, reuse)
+        : { chunks: planChunks(line, encoders, profile.decodeShare), reused: new Map<number, EncodedChunk>() }
       const countFrames = (c: WorkerChunk) => times.filter((t) => t >= c.start && t < c.end).length
       const frameCounts = chunks.map(countFrames)
-      const active = Math.min(encoders, chunks.length)
+      const active = Math.min(encoders, chunks.length - reused.size)
       const cores = Math.min(navigator.hardwareConcurrency || active, active * threads)
       const fps = probe.fps || 30
       const init = { file: probe.file, options, width: size.width, height: size.height, fpsNum: Math.round(fps * 1000), fpsDen: 1000 }
@@ -877,8 +925,13 @@ export function encode(probe: Probe, settings: Settings, start: EncodeStart, onP
         },
         accept: (index, at) => cut(index, at),
       }
+      for (const [index, chunk] of reused) {
+        budget?.assign(index)
+        budget?.add(index, chunk.packets.map((p) => ({ bytes: p.data.byteLength, crf, first: p.pts === 0 })))
+        finished += chunk.times.length
+      }
       const encoded = await pool.run(
-        spread(chunks, active),
+        spread(chunks.filter((c) => !reused.has(c.index)), active),
         (frames, stats, index) => {
           budget?.add(index, stats)
           report(frames, 'encoding')
@@ -886,6 +939,7 @@ export function encode(probe: Probe, settings: Settings, start: EncodeStart, onP
         budget ? (chunk) => withCrf(chunk, budget.assign(chunk.index)) : undefined,
         divider,
       )
+      for (const [index, chunk] of reused) encoded[index] = chunk
       const passes = [chunks.map((c) => crfs[c.index].toFixed(1)).join(' ')]
 
       // The size limit is a promise, so check the real total and encode chunks again until it holds. A total far
@@ -966,6 +1020,8 @@ const WINDOW_FRAMES = 24
 const ESTIMATE_BIAS = 1.08
 /** How far from both of the plan's tests its answer has to fall before a third test near it. */
 const MID_TEST = 1.5
+/** How far either side of its predicted rate factor AV1's test encodes, when choosing the codec. */
+const AV1_BRACKET = 6
 /** The plan windows AV1's test uses when choosing the codec: every other one of four. */
 const AV1_TEST_WINDOWS = [1, 3]
 /** Frames of each test window scored with VMAF when choosing the codec (research/codec_choice.py). */
@@ -1011,6 +1067,8 @@ export type SizePlan = {
   bound?: boolean
   /** Resolves once every point's VMAF NEG is in, when the plan measured quality. */
   scored?: Promise<void>
+  /** Test windows encoded exactly as the encode will be, when it starts from the plan's lowest test. */
+  reuse?: Reusable[]
 }
 
 /**
@@ -1039,8 +1097,17 @@ function fit(probe: Probe, settings: Settings, points: PlanPoint[]): SizePlan {
   // two either side of the goal.
   const measured = Math.log(b.bytes / a.bytes) / (b.crf - a.crf)
   const slope = measured < -0.03 ? measured : profile.slope
-  if (first.bytes <= goal)
+  if (first.bytes <= goal) {
+    // A test that started above the floor (AV1's, bracketing a prediction) can land lower, halfway to be safe.
+    const floor = floorCrf(settings)
+    if (first.crf > floor) {
+      const crf = Math.max(floor, first.crf + Math.log(goal / first.bytes) / slope / 2)
+      const video = first.bytes * Math.exp(slope * (crf - first.crf))
+      return { crf: Math.round(crf * 10) / 10, size: video + audio, raised: crf > baseCrf,
+        fitted: settings.preset === 'visually-lossless', slope, points: sorted, bound: true }
+    }
     return { crf: first.crf, size: first.bytes + audio, raised: false, fitted: false, slope, points: sorted, bound: false }
+  }
   let crf = Math.min(profile.max, Math.max(first.crf, a.crf + Math.log(goal / a.bytes) / slope))
   // Past the highest test the straight line tends to overstate sizes (the noise stops costing bits), so land halfway
   // back: the encode checks its real size and corrects either way.
@@ -1059,7 +1126,7 @@ function around<T extends { crf: number; bytes: number }>(points: T[], bytes: nu
 }
 
 export async function plan(probe: Probe, settings: Settings, signal: AbortSignal, measure = false,
-                           only?: number[]): Promise<SizePlan> {
+                           only?: number[], tests?: [number, number]): Promise<SizePlan> {
   const began = performance.now()
   const { input, track } = await openTrack(probe.file)
   const rotation = await track.getRotation()
@@ -1111,6 +1178,8 @@ export async function plan(probe: Probe, settings: Settings, signal: AbortSignal
 
   let issued = 0
   let succeeded = false
+  /** Each test's encoded windows, by rate factor, for the encode to keep when they match its settings. */
+  const tested = new Map<number, EncodedChunk[]>()
   /** VMAF NEG of each point, filled in as the workers score their windows after handing them over. */
   const scoring: Promise<void>[] = []
   /** Predicted video bytes for the whole file at each rate factor, all encoded in one round. */
@@ -1152,6 +1221,7 @@ export async function plan(probe: Probe, settings: Settings, signal: AbortSignal
     }
     return crfs.map((crf, c): PlanPoint => {
       const tests = windows.map((_, i) => encoded[base + c * windows.length + i])
+      tested.set(crf, tests)
       const some = tests.filter((_, i) => AV1_TEST_WINDOWS.includes(i))
       const point: PlanPoint = {
         crf,
@@ -1174,8 +1244,11 @@ export async function plan(probe: Probe, settings: Settings, signal: AbortSignal
     }
     // Visually lossless spends the whole budget on quality: test the quality ceiling and a point well below it. Other
     // presets keep their own rate factor unless it would miss the target.
-    const lo = settings.preset === 'visually-lossless' ? profile.ceiling : baseCrf
-    const hi = Math.min(profile.max, lo + (settings.preset === 'visually-lossless' ? profile.span.lossless : profile.span.other))
+    const [lo, hi] = tests ?? [
+      settings.preset === 'visually-lossless' ? profile.ceiling : baseCrf,
+      Math.min(profile.max, (settings.preset === 'visually-lossless' ? profile.ceiling : baseCrf) +
+        (settings.preset === 'visually-lossless' ? profile.span.lossless : profile.span.other)),
+    ]
     const points = await videoAt([lo, hi])
     let planned = fit(probe, settings, points)
     // Far from both tests, or past the higher one, the straight line can be badly off: noisy footage sheds bits
@@ -1188,7 +1261,10 @@ export async function plan(probe: Probe, settings: Settings, signal: AbortSignal
     console.info(`[pare] plan: ${(performance.now() - began) / 1000 | 0} s, ${windows.length}×${per} frames, ` +
       points.map((p) => `crf ${p.crf} → ${(p.bytes / 1e6).toFixed(1)} MB`).join(', '))
     succeeded = true
-    return { ...planned, scored: scoring.length ? Promise.all(scoring).then(() => undefined) : undefined }
+    // H.264 fitting at the rate factor it starts from: those test windows are that encode's output already.
+    const same = profile === X264 && options === full && !planned.bound && tested.has(planned.crf)
+    const reuse = same ? windows.map((w, i) => ({ ...w, chunk: tested.get(planned.crf)![i] })) : undefined
+    return { ...planned, reuse, scored: scoring.length ? Promise.all(scoring).then(() => undefined) : undefined }
   } finally {
     // The workers are still scoring when the sizes are in; they stop once the scores are, or on cancel.
     const done = () => {
@@ -1285,7 +1361,12 @@ export async function settle(probe: Probe, settings: Settings, avc: SizePlan, si
   // Two windows choose as well as four (research/codec_choice.py), and four test encodes on four cores take about half
   // as long as eight sharing them. Their size estimate is off by however those two windows differ from the video, which
   // H.264's test on all four measured: scale by that.
-  const tested = await plan(probe, { ...settings, codec: 'av1' }, signal, true, AV1_TEST_WINDOWS)
+  // Test AV1 either side of where H.264's answer usually maps to (research/RESEARCH.md: 1.88 x H.264's - 10.7, give
+  // or take 5.6), which is quicker than from its quality ceiling, the slowest rate factor to encode.
+  const guess = 1.88 * avc.crf - 10.7
+  const low = Math.round(Math.min(AV1.max - AV1_BRACKET * 2, Math.max(AV1.ceiling, guess - AV1_BRACKET)))
+  const tested = await plan(probe, { ...settings, codec: 'av1' }, signal, true, AV1_TEST_WINDOWS,
+    [low, low + AV1_BRACKET * 2])
   await tested.scored
   const ratios = avc.points!.flatMap((p) => (p.subset ? [Math.log(p.bytes / p.subset.bytes)] : []))
   const scale = ratios.length ? Math.exp(ratios.reduce((a, b) => a + b, 0) / ratios.length) : 1
