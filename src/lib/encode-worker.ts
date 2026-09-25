@@ -46,20 +46,20 @@ export type WorkerSplit = { type: 'split'; index: number; at: number }
 export type FrameStat = { bytes: number; crf: number; first: boolean }
 export type EncodedChunk = {
   index: number
-  /** Milliseconds spent waiting for decoded frames, copying them in, encoding, and scoring the result. */
-  timing: { decode: number; load: number; encode: number; score?: number }
+  /** Milliseconds spent waiting for decoded frames, copying them in, and encoding. */
+  timing: { decode: number; load: number; encode: number }
   /** Source timestamp of each input frame, by x264 pts. */
   times: number[]
   /** SSIM of each output frame against its input, as measured by x264 (luma). */
   packets: { data: Uint8Array<ArrayBuffer>; pts: number; key: boolean; ssim: number }[]
   headers: Uint8Array<ArrayBuffer>
-  /** VMAF NEG of the scored frames, when the chunk asked for it. */
-  vmaf?: number
 }
 export type WorkerMessage =
   | { type: 'ready' }
   | { type: 'progress'; index: number; fed: number; frames: number; stats: FrameStat[] }
   | { type: 'done'; chunk: EncodedChunk }
+  /** VMAF NEG of a chunk that asked to be scored, after its 'done' (-1 if scoring failed). */
+  | { type: 'scored'; index: number; vmaf: number }
   /** Whether the chunk now ends at `at`: it can't once that frame has gone into the encoder. */
   | { type: 'split'; index: number; at: number; ok: boolean }
   | { type: 'error'; message: string }
@@ -149,7 +149,7 @@ function luma() {
 }
 
 /** Decodes a finished test encode and returns the luma of the wanted frames, by frame number. */
-async function decodeLuma(chunk: Omit<EncodedChunk, 'vmaf'>, wanted: Set<number>) {
+async function decodeLuma(chunk: EncodedChunk, wanted: Set<number>) {
   const { width, height } = init
   const frames: VideoFrame[] = []
   let failure: unknown = null
@@ -207,7 +207,9 @@ async function scoreFrames(sources: Map<number, Uint8Array>, decoded: Map<number
   }
 }
 
-async function encodeChunk({ index, start, end, options: override, score }: WorkerChunk): Promise<EncodedChunk> {
+/** Encodes a chunk, and when it asks to be scored, returns how to score it once the chunk has been handed over. */
+async function encodeChunk({ index, start, end, options: override, score }: WorkerChunk):
+  Promise<{ chunk: EncodedChunk; scoring?: () => Promise<number> }> {
   const chunk = (running = { index, end, fed: -Infinity })
   const times: number[] = []
   const packets: EncodedChunk['packets'] = []
@@ -272,10 +274,10 @@ async function encodeChunk({ index, start, end, options: override, score }: Work
     const headersPtr = x._enc_headers_ptr(enc)
     report()
     const encoded = { index, times, packets, timing, headers: x.HEAPU8.slice(headersPtr, headersPtr + headerSize) }
-    if (!sources.size) return encoded
-    const began = performance.now()
-    const vmaf = await scoreFrames(sources, await decodeLuma(encoded, new Set(sources.keys())))
-    return { ...encoded, vmaf, timing: { ...timing, score: performance.now() - began } }
+    if (!sources.size) return { chunk: encoded }
+    // Handing the chunk over transfers its buffers, so scoring keeps its own copies.
+    const kept = { ...encoded, headers: encoded.headers.slice(), packets: packets.map((p) => ({ ...p, data: p.data.slice() })) }
+    return { chunk: encoded, scoring: async () => scoreFrames(sources, await decodeLuma(kept, new Set(sources.keys()))) }
   } finally {
     if (enc) x._enc_close(enc)
     enc = 0
@@ -309,8 +311,10 @@ self.onmessage = async (event: MessageEvent<WorkerInit | WorkerChunk | WorkerSpl
       sink = new VideoSampleSink(track)
       post({ type: 'ready' })
     } else {
-      const chunk = await encodeChunk(message)
+      const { chunk, scoring } = await encodeChunk(message)
       post({ type: 'done', chunk }, [chunk.headers.buffer, ...chunk.packets.map((p) => p.data.buffer)])
+      // Scores come after: the size plan only needs the chunk, and a compression can start without the score.
+      if (scoring) post({ type: 'scored', index: chunk.index, vmaf: await scoring().catch(() => -1) })
     }
   } catch (err) {
     post({ type: 'error', message: err instanceof Error ? err.message : String(err) })

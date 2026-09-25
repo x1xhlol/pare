@@ -37,6 +37,8 @@ type CalibrationEntry = {
    * test when the compression starts without it.
    */
   first?: Promise<Calibration & { reaches: boolean }>
+  /** Whether a compression started before AV1's test ends may go ahead with H.264 (it's near 1:1 already). */
+  quick?: Promise<boolean>
   skipTest?: () => void
 }
 
@@ -210,9 +212,15 @@ export default function App() {
     const entry: CalibrationEntry = {
       controller,
       first: first?.then(({ m, avc }) => ({ ...fromPlan(avc), codec: 'avc' as const, reaches: m.avcReaches(probe, settings, avc) })),
-      skipTest: () => test.abort(),
+      quick: first?.then(async ({ m, avc }) => {
+        await avc.scored
+        return m.quickStart(probe, settings, avc)
+      }),
+      // Stops H.264's scoring as well as AV1's test: neither may compete with the encode for the cores.
+      skipTest: () => controller.abort(),
       promise: first
         ? first.then(async ({ m, avc }) => {
+            await avc.scored
             if (m.testsAv1(probe, settings, avc) && currentKey.current === key && !entry.result)
               setTuning({ key, result: { ...fromPlan(avc), codec: 'avc', choice: { reason: 'testing' } } })
             const { codec, plan, reason, vmaf } = await m.settle(probe, settings, avc, test.signal)
@@ -233,6 +241,9 @@ export default function App() {
         if (currentKey.current === key) setTuning({ key, error: message(err) })
       },
     )
+    // Nothing may be waiting on the early plan when it's canceled; the full promise reports the failure.
+    entry.first?.catch(() => {})
+    entry.quick?.catch(() => {})
     calibrations.current.set(key, entry)
     return entry
   }
@@ -302,11 +313,13 @@ export default function App() {
         let plan: Calibration | undefined
         if (waitFor?.first && !waitFor.result) {
           const first = await waitFor.first.catch(() => undefined)
-          if (first?.reaches && !waitFor.result) {
+          const quick = first?.reaches && (await waitFor.quick?.catch(() => false))
+          if (quick && first && !waitFor.result) {
             waitFor.skipTest?.()
             plan = first
           } else if (!waitFor.result) {
-            setPhase((p) => (p.kind === 'running' ? { ...p, status: "Testing AV1: H.264 can't reach half the size…" } : p))
+            const why = first?.reaches ? 'it looks clearly better on some footage' : "H.264 can't reach half the size"
+            setPhase((p) => (p.kind === 'running' ? { ...p, status: `Testing AV1: ${why}…` } : p))
           }
         }
         plan ??= waitFor ? await waitFor.promise.catch(() => undefined) : undefined
