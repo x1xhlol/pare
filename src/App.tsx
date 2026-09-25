@@ -18,7 +18,13 @@ type Phase =
   | { kind: 'done'; probe: Probe; blob: Blob; url: string; quality: QualityReport | 'pending' | 'failed' }
 
 type Tuning = { round: number } | { result: Calibration } | { error: string }
-type CalibrationEntry = { promise: Promise<Calibration>; controller: AbortController; result?: Calibration }
+type CalibrationEntry = {
+  promise: Promise<Calibration>
+  controller: AbortController
+  result?: Calibration
+  /** A compression is waiting on this result, so leaving the settings screen mustn't cancel it. */
+  needed?: boolean
+}
 
 const usesX264 = (s: Settings) => s.engine === 'thorough' && s.preset !== 'copy'
 const settingsKey = (s: Settings) =>
@@ -157,8 +163,8 @@ export default function App() {
       controller,
       promise: usesX264(settings)
         ? x264().then(async (m) => {
-            const { size, crf, raised, fitted } = await m.plan(probe, settings, controller.signal)
-            return { bitrate: 0, size, ssim: 0, target: 0, reached: true, crf, raised, fitted }
+            const { size, crf, raised, fitted, slope, points } = await m.plan(probe, settings, controller.signal)
+            return { bitrate: 0, size, ssim: 0, target: 0, reached: true, crf, raised, fitted, slope, points }
           })
         : media().then((m) => m.calibrate(probe, settings, controller.signal, onRound)),
     }
@@ -178,8 +184,10 @@ export default function App() {
   }
 
   // Tune the bitrate for the current settings while the user is still choosing. Results are cached per setting.
+  // Leaving the settings screen cancels unfinished tests (x264 encodes don't wait for them) and returning restarts them.
+  const choosing = phase.kind === 'ready'
   useEffect(() => {
-    if (!probe) return
+    if (!probe || !choosing) return
     currentKey.current = key
     const map = calibrations.current
     const cached = map.get(key)
@@ -192,14 +200,14 @@ export default function App() {
     return () => {
       clearTimeout(timer)
       const entry = map.get(key)
-      if (entry && !entry.result) {
+      if (entry && !entry.result && !entry.needed) {
         entry.controller.abort()
         map.delete(key)
       }
     }
     // `key` captures every setting that matters.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [probe, key])
+  }, [probe, key, choosing])
 
   useEffect(() => {
     if (phase.kind !== 'running') return
@@ -217,24 +225,25 @@ export default function App() {
       if (run.job) run.job.cancel()
       else setPhase({ kind: 'ready', probe })
     }
-    const planned = !!calibrations.current.get(settingsKey(settings))?.result
+    // With the size target, x264 starts from the size plan's rate factor and steers from there while it encodes.
+    // Without it there is nothing to plan, and the browser's encoders need their tuned bitrate up front.
+    const planned = usesX264(settings) && settings.sizeTarget
+    const waitFor = !usesX264(settings) || planned ? ensureCalibration(probe, settings) : null
+    if (waitFor) waitFor.needed = true
     setPhase({
       kind: 'running',
       probe,
       progress: null,
-      status: !usesX264(settings) ? 'Finishing tuning…' : planned ? 'Starting encoders…' : 'Finishing size tests…',
+      status: !usesX264(settings) ? 'Finishing tuning…' : waitFor && !waitFor.result ? 'Finishing size tests…' : 'Starting encoders…',
     })
     const onProgress = (progress: Progress) => setPhase((p) => (p.kind === 'running' ? { ...p, progress } : p))
     try {
       if (usesX264(settings)) {
-        // The plan decides the rate factor (it may raise it to meet the size target), so wait for it.
         const engine = await x264()
-        const crf = await ensureCalibration(probe, settings)
-          .promise.then((c) => c.crf ?? engine.presetCrf(settings))
-          .catch(() => engine.presetCrf(settings))
+        const plan = waitFor ? await waitFor.promise.catch(() => undefined) : undefined
         if (run.canceled) return
         setPhase((p) => (p.kind === 'running' ? { ...p, status: 'Starting encoders…' } : p))
-        run.job = engine.encode(probe, settings, crf, onProgress)
+        run.job = engine.encode(probe, settings, { crf: plan?.crf, slope: plan?.slope, points: plan?.points }, onProgress)
       } else {
         const { bitrate } = await ensureCalibration(probe, settings).promise
         if (run.canceled) return
@@ -459,7 +468,7 @@ function Benchmarks() {
                   {fmt.bytes(b.after)} <span className="delta">{fmt.change(b.before, b.after)}</span>
                 </td>
                 <td className="num">{b.seconds} s</td>
-                <td className="num">{b.ssim.toFixed(3)}</td>
+                <td className="num">{b.ssim.toFixed(4)}</td>
               </tr>
             ))}
           </tbody>
@@ -483,8 +492,8 @@ const STEPS = [
     body: 'The video is split at keyframes into chunks, each core encodes its own, and the pieces are joined at the original frame timestamps.',
   },
   {
-    title: 'Steered to half the size',
-    body: 'Pare starts at the highest quality and watches the output as it grows. If the file wouldn’t come out at least 50% smaller, it lowers quality just enough, while encoding.',
+    title: 'Held to half the size',
+    body: 'Short test encodes measure how size falls as quality drops, and each chunk gets its setting from what the finished ones really cost. The file is weighed at the end: if it isn’t at least 50% smaller, the busiest parts are encoded again.',
   },
   {
     title: 'Checked frame by frame',
@@ -756,12 +765,15 @@ function Running(props: { probe: Probe; progress: Progress | null; status: strin
   const { probe, progress, onCancel } = props
   const fraction = progress?.fraction ?? 0
   const speed = progress && progress.elapsed > 0.5 ? progress.processed / progress.elapsed : null
-  const left = speed ? (probe.duration - (progress?.processed ?? 0)) / speed : Infinity
+  // Encoders start slower than they run, so wait for some progress before predicting the end.
+  const left = speed && fraction > 0.1 ? (probe.duration - (progress?.processed ?? 0)) / speed : Infinity
   const stage = !progress
     ? props.status
     : progress.stage === 'finishing'
       ? 'Writing the file…'
-      : progress.workers
+      : progress.stage === 'refitting'
+        ? 'Encoding the busiest parts again to reach 50% smaller'
+        : progress.workers
         ? `Encoding on ${progress.workers} ${progress.workers === 1 ? 'core' : 'cores'}`
         : 'Encoding'
   return (

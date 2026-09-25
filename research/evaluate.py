@@ -16,8 +16,8 @@ from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
-ROOT = os.path.expanduser('~/pare-research')
-FFMPEG = f'{ROOT}/ffmpeg-master-latest-linux64-gpl/bin/ffmpeg'
+ROOT = os.environ.get('PARE_RESEARCH', os.path.expanduser('~/pare-research'))
+FFMPEG = os.environ.get('FFMPEG', f'{ROOT}/ffmpeg-master-latest-linux64-gpl/bin/ffmpeg')
 X264 = {'asm': f'{ROOT}/build-asm/x264', 'noasm': f'{ROOT}/build-noasm/x264'}
 REF = f'{ROOT}/corpus/ref'
 CLIPS = ['town', 'park', 'tree', 'ducks', 'bbb', 'screen']

@@ -8,12 +8,6 @@
 #include <emscripten/emscripten.h>
 #include "x264.h"
 
-typedef struct Denoiser Denoiser;
-Denoiser *denoiser_new(double luma_spatial, double chroma_spatial, double luma_tmp, double chroma_tmp, int width);
-void denoiser_free(Denoiser *d);
-void denoiser_run(Denoiser *d, uint8_t *y, int sy, uint8_t *u, int su, uint8_t *v, int sv, int w, int h,
-                  int interleaved);
-
 typedef struct {
   x264_t *h;
   x264_picture_t in;
@@ -24,7 +18,6 @@ typedef struct {
   uint8_t *headers;
   int headers_size;
   int width, height;
-  Denoiser *denoiser;
 } Encoder;
 
 // x264 only computes per-frame SSIM when logging at INFO or above; keep the level there but print errors only.
@@ -129,24 +122,7 @@ EMSCRIPTEN_KEEPALIVE int enc_out_keyframe(Encoder *e) { return e->out.b_keyframe
 // SSIM of the frame just output against its input (only computed when the "ssim" option is on).
 EMSCRIPTEN_KEEPALIVE double enc_out_ssim(Encoder *e) { return e->out.prop.f_ssim; }
 
-// Enables the hqdn3d pre-filter (strengths as in FFmpeg; 0 disables that part). Temporal state starts empty.
-EMSCRIPTEN_KEEPALIVE void enc_denoise_setup(Encoder *e, double luma_spatial, double chroma_spatial, double luma_tmp,
-                                            double chroma_tmp) {
-  denoiser_free(e->denoiser);
-  e->denoiser = denoiser_new(luma_spatial, chroma_spatial, luma_tmp, chroma_tmp, e->width);
-}
-
-// Denoises the frame currently in the input planes, in place. Call before enc_encode (or alone, to warm up the
-// temporal filter on frames that won't be encoded).
-EMSCRIPTEN_KEEPALIVE void enc_denoise(Encoder *e) {
-  if (!e->denoiser) return;
-  x264_image_t *img = &e->in.img;
-  denoiser_run(e->denoiser, img->plane[0], img->i_stride[0], img->plane[1], img->i_stride[1], img->plane[2],
-               img->i_stride[2], e->width, e->height, e->csp == X264_CSP_NV12);
-}
-
 EMSCRIPTEN_KEEPALIVE void enc_close(Encoder *e) {
-  denoiser_free(e->denoiser);
   x264_encoder_close(e->h);
   x264_picture_clean(&e->in);
   free(e);

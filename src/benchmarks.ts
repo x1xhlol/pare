@@ -1,10 +1,11 @@
-// Results of full compressions in the production build (visually lossless, at least 50% smaller).
-// Regenerate with research/browser-ab.mjs; the machine is described in BENCHMARK_SETUP.
+// Full compressions in the production build: visually lossless, at least 50% smaller, Compress clicked a second
+// after the file loaded. Time runs from that click to the finished file. See research/RESEARCH.md for the clips.
 export const BENCHMARK_SETUP =
-  'Visually lossless, at least 50% smaller. Chrome on a 4-core, 8-thread cloud machine with no GPU, time from clicking Compress to download.'
+  'Visually lossless, at least 50% smaller, in Chrome on a 4-core, 8-thread cloud machine with no GPU. Time runs from clicking Compress to the finished file, and SSIM is averaged over every frame.'
 
 export const BENCHMARKS: { name: string; detail: string; before: number; after: number; seconds: number; ssim: number }[] = [
-  { name: 'Action camera', detail: '1080p30, 10 s, H.264 60 Mbps', before: 75e6, after: 15e6, seconds: 31, ssim: 0.994 },
-  { name: 'Phone clip', detail: '1080p50, 20 s, H.264 25 Mbps', before: 79e6, after: 31e6, seconds: 75, ssim: 0.943 },
-  { name: 'Animation', detail: 'Big Buck Bunny, 1080p30, 30 s', before: 90e6, after: 36e6, seconds: 41, ssim: 0.98 },
+  { name: 'Camera footage', detail: '1080p30, 10 s, H.264 at 62 Mbps', before: 77_919_498, after: 15_345_808, seconds: 28, ssim: 0.9942 },
+  { name: 'Phone clips', detail: '1080p50, 20 s, H.264 at 26 Mbps', before: 65_458_226, after: 29_386_413, seconds: 61, ssim: 0.9505 },
+  { name: 'Animation', detail: 'Big Buck Bunny, 1080p30, 10 s', before: 30_704_510, after: 13_930_407, seconds: 34, ssim: 0.9825 },
+  { name: 'Screen recording', detail: '1080p30, 8 s, scrolling text', before: 10_814_518, after: 3_333_278, seconds: 10, ssim: 0.9996 },
 ]

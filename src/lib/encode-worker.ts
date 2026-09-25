@@ -23,6 +23,8 @@ export type WorkerChunk = {
   /** Overrides the pool's x264 options for this chunk (used when testing several rate factors). */
   options?: string
 }
+/** Size of one output frame, the rate factor it was encoded at, and whether it opened its chunk (an IDR frame). */
+export type FrameStat = { bytes: number; crf: number; first: boolean }
 export type EncodedChunk = {
   index: number
   /** Milliseconds spent waiting for decoded frames, copying them in, and encoding. */
@@ -35,7 +37,7 @@ export type EncodedChunk = {
 }
 export type WorkerMessage =
   | { type: 'ready' }
-  | { type: 'progress'; index: number; frames: number }
+  | { type: 'progress'; index: number; fed: number; frames: number; stats: FrameStat[] }
   | { type: 'done'; chunk: EncodedChunk }
   | { type: 'error'; message: string }
 
@@ -47,6 +49,7 @@ let init: WorkerInit
 let sink: VideoSampleSink
 let staging = 0
 let stagingSize = 0
+let enc = 0
 
 const post = (message: WorkerMessage, transfer: Transferable[] = []) => self.postMessage(message, transfer)
 
@@ -112,18 +115,18 @@ function cspFor(sample: VideoSample) {
 async function encodeChunk({ index, start, end, options: override }: WorkerChunk): Promise<EncodedChunk> {
   const times: number[] = []
   const packets: EncodedChunk['packets'] = []
-  let enc = 0
+  const stats: FrameStat[] = []
+  const text = override ?? init.options
+  const crf = Number(/crf=([\d.]+)/.exec(text)?.[1] ?? 0)
   let load: Loader | null = null
   const collect = (size: number) => {
     if (size <= 0) return
     const ptr = x._enc_payload(enc)
-    packets.push({
-      data: x.HEAPU8.slice(ptr, ptr + size),
-      pts: x._enc_out_pts(enc),
-      key: !!x._enc_out_keyframe(enc),
-      ssim: x._enc_out_ssim(enc),
-    })
+    const pts = x._enc_out_pts(enc)
+    packets.push({ data: x.HEAPU8.slice(ptr, ptr + size), pts, key: !!x._enc_out_keyframe(enc), ssim: x._enc_out_ssim(enc) })
+    stats.push({ bytes: size, crf, first: pts === 0 })
   }
+  const report = () => post({ type: 'progress', index, fed: times.length, frames: packets.length, stats: stats.splice(0) })
 
   const timing = { decode: 0, load: 0, encode: 0 }
   let mark = performance.now()
@@ -134,7 +137,6 @@ async function encodeChunk({ index, start, end, options: override }: WorkerChunk
       try {
         if (sample.timestamp < start - 1e-6 || sample.timestamp >= end - 1e-6) continue
         if (!enc) {
-          const text = override ?? init.options
           const options = x.stringToNewUTF8(text)
           enc = x._enc_open(init.width, init.height, init.fpsNum, init.fpsDen, cspFor(sample), options)
           x._free(options)
@@ -149,22 +151,29 @@ async function encodeChunk({ index, start, end, options: override }: WorkerChunk
         collect(x._enc_encode(enc, times.length - 1))
         timing.encode += performance.now() - t
         // Report frames x264 has finished, not frames fed in: the lookahead buffers ~40 before any output.
-        if (times.length % 8 === 0) post({ type: 'progress', index, frames: packets.length })
+        if (times.length % 8 === 0) report()
       } finally {
         sample.close()
         mark = performance.now()
       }
     }
     if (!enc) throw new Error(`No frames decoded between ${start.toFixed(3)} s and ${end.toFixed(3)} s.`)
-    const t = performance.now()
-    for (let size; (size = x._enc_flush(enc)) >= 0; ) collect(size)
-    timing.encode += performance.now() - t
+    // The lookahead still holds up to 40 frames, which can be most of a short chunk: report them as they come out.
+    for (let size, n = 1; ; n++) {
+      const t = performance.now()
+      size = x._enc_flush(enc)
+      timing.encode += performance.now() - t
+      if (size < 0) break
+      collect(size)
+      if (n % 4 === 0) report()
+    }
     const headerSize = x._enc_headers(enc)
     const headersPtr = x._enc_headers_ptr(enc)
-    post({ type: 'progress', index, frames: times.length })
+    report()
     return { index, times, packets, timing, headers: x.HEAPU8.slice(headersPtr, headersPtr + headerSize) }
   } finally {
     if (enc) x._enc_close(enc)
+    enc = 0
   }
 }
 

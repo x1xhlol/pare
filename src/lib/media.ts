@@ -175,6 +175,9 @@ export type Calibration = {
   raised?: boolean
   /** Visually lossless with the size target: tuned to fill the budget (true) or at the quality ceiling (false). */
   fitted?: boolean
+  /** x264 only: measured change in log size per rate factor step, and predicted video bytes at tested rate factors. */
+  slope?: number
+  points?: { crf: number; bytes: number }[]
 }
 
 type Segment = {
