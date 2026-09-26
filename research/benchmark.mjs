@@ -3,7 +3,7 @@
 //
 //   URL=http://localhost:4173 OUT=/tmp/bench TAG=now node research/benchmark.mjs clip.mp4 ...
 //   CODEC=auto|avc|av1 (the Format setting; default Auto), ENGINE=fast (the browser's encoder), NOLIMIT=1 (no size
-//   target), CORES=n (pretend core count), CLICK_AFTER=seconds after the file loads (default 1)
+//   target), CORES=n (pretend core count), CLICK_AFTER=seconds after the file loads (default 1), RES=720 (short side)
 //
 // Prints one JSON line per video: seconds, sizes, the app's quality line, and the encoder log.
 import { chromium } from 'playwright-core'
@@ -37,6 +37,10 @@ for (const file of process.argv.slice(2)) {
   if (codec !== 'auto' && process.env.ENGINE !== 'fast') {
     if (!(await page.$('.more[open]'))) await page.click('.more summary')
     await page.getByRole('radio', { name: codec === 'av1' ? 'AV1' : 'H.264', exact: true }).check()
+  }
+  if (process.env.RES) {
+    if (!(await page.$('.more[open]'))) await page.click('.more summary')
+    await page.getByRole('radio', { name: `${process.env.RES}p`, exact: true }).check()
   }
   if (process.env.WAIT === '1')
     await page.waitForFunction(() => !document.querySelector('.estimate-value.pending') &&

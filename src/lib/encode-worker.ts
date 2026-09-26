@@ -29,6 +29,11 @@ export type WorkerInit = {
   height: number
   fpsNum: number
   fpsDen: number
+  /**
+   * Frames go in as decoded (the output keeps the source's colour tags and, for HDR in AV1, its 10 bits), rather than
+   * through an RGB canvas (BT.709 SDR). Planned from the probe's decoded frame (copiesFrames).
+   */
+  direct: boolean
 }
 export type WorkerChunk = {
   type: 'chunk'
@@ -149,25 +154,34 @@ function scratch(size: number) {
 
 type Loader = (sample: VideoSample) => Promise<void>
 
-/** Picks the cheapest way to get this sample's pixels into x264, and the colour space x264 should expect. */
+/** Whether a sample is the size the encoder takes, as stored (before rotation). */
+const fits = (sample: VideoSample) => sample.visibleRect.width === init.width && sample.visibleRect.height === init.height
+
+/** Picks the cheapest way to get this sample's pixels into the encoder. */
 function planInput(sample: VideoSample, enc: number): Loader {
   const { width, height } = init
   const heap = () => new Uint8Array(x.HEAPU8.buffer)
-  const direct = sample.visibleRect.width === width && sample.visibleRect.height === height
   const plane = (i: number) => ({ offset: x._enc_plane(enc, i), stride: x._enc_stride(enc, i) })
 
-  if (direct && sample.format === 'NV12')
-    return async (s) => void (await s.copyTo(heap(), { layout: [plane(0), plane(1)] }))
-  if (direct && (sample.format === 'I420' || sample.format === 'I420A'))
-    return async (s) => {
-      const layout = [plane(0), plane(1), plane(2)]
-      if (s.format === 'I420A') layout.push({ offset: scratch(width * height), stride: width })
-      await s.copyTo(heap(), { layout })
-    }
-  // A 10-bit encoder (AV1 for HDR sources) takes 10-bit frames as they are: its planes hold 16-bit samples.
-  if (direct && sample.format === 'I420P10' && tenBit)
-    return async (s) => void (await s.copyTo(heap(), { layout: [plane(0), plane(1), plane(2)] }))
-  if (direct && (sample.format === 'I420P10' || sample.format === 'I420P12')) {
+  if (init.direct) {
+    const deep = sample.format === 'I420P10' || sample.format === 'I420P12'
+    // The output is tagged for frames like the probed one. One that decodes differently would be written wrong, in
+    // colour or, into a 10-bit encoder, as noise.
+    if (!fits(sample) || (tenBit && !deep) || !(deep || sample.format === 'NV12' || sample.format === 'I420' ||
+        sample.format === 'I420A'))
+      throw new Error(`The video decoded as ${sample.format ?? 'an unnamed format'} at ${sample.visibleRect.width}×` +
+        `${sample.visibleRect.height}, not as planned.`)
+    if (sample.format === 'NV12')
+      return async (s) => void (await s.copyTo(heap(), { layout: [plane(0), plane(1)] }))
+    if (sample.format === 'I420' || sample.format === 'I420A')
+      return async (s) => {
+        const layout = [plane(0), plane(1), plane(2)]
+        if (s.format === 'I420A') layout.push({ offset: scratch(width * height), stride: width })
+        await s.copyTo(heap(), { layout })
+      }
+    // A 10-bit encoder (AV1 for HDR sources) takes 10-bit frames as they are: its planes hold 16-bit samples.
+    if (sample.format === 'I420P10' && tenBit)
+      return async (s) => void (await s.copyTo(heap(), { layout: [plane(0), plane(1), plane(2)] }))
     const bits = sample.format === 'I420P10' ? 10 : 12
     return async (s) => {
       const size = s.allocationSize()
@@ -178,9 +192,13 @@ function planInput(sample: VideoSample, enc: number): Loader {
         ly.stride / 2, lu.stride / 2, lv.stride / 2, width, height, bits)
     }
   }
-  // Anything else (resizing, 4:2:2/4:4:4, RGB) goes through an RGB frame at the target size.
+  // Anything else (resizing, 4:2:2/4:4:4, formats WebCodecs doesn't name, RGB) goes through an RGB frame at the
+  // target size, as stored: the container carries the rotation and flip, as the source's did. Drawn with them, a
+  // portrait video would come out turned twice and squeezed into the stored frame's shape.
   return async (s) => {
-    const resized = direct && (s.format === 'RGBA' || s.format === 'RGBX' || s.format === 'BGRA' || s.format === 'BGRX')
+    s.setRotation(0)
+    s.setFlip(false)
+    const resized = fits(s) && (s.format === 'RGBA' || s.format === 'RGBX' || s.format === 'BGRA' || s.format === 'BGRX')
       ? s
       : await s.transform({ width, height, fit: 'fill' })
     try {
@@ -196,9 +214,8 @@ function planInput(sample: VideoSample, enc: number): Loader {
 }
 
 function cspFor(sample: VideoSample, tenBit: boolean) {
-  const direct = sample.visibleRect.width === init.width && sample.visibleRect.height === init.height
   // A 10-bit encoder only takes planar input; x264's 10-to-8-bit import writes interleaved chroma.
-  return tenBit || (direct && (sample.format === 'I420' || sample.format === 'I420A')) ? CSP_I420 : CSP_NV12
+  return tenBit || (init.direct && (sample.format === 'I420' || sample.format === 'I420A')) ? CSP_I420 : CSP_NV12
 }
 
 /** The luma plane the encoder is about to read, copied out tightly packed. */

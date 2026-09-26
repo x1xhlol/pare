@@ -5,7 +5,10 @@ import { BENCHMARKS, BENCHMARK_SETUP } from './benchmarks'
 import * as fmt from './lib/format'
 import type { Calibration, Job, QualityReport } from './lib/media'
 import type { Progress, SizePlan } from './lib/x264'
-import { CODEC_LABEL, outputSize, type Engine, type OutputCodec, type Preset, type Probe, type Settings } from './lib/shared'
+import {
+  CODEC_LABEL, copiesFrames, deepFormat, keepsHdr, outputSize, type Engine, type OutputCodec, type Preset, type Probe,
+  type Settings,
+} from './lib/shared'
 
 const media = () => import('./lib/media')
 const x264 = () => import('./lib/x264')
@@ -375,7 +378,8 @@ export default function App() {
         plan ??= waitFor ? await waitFor.promise.catch(() => undefined) : undefined
         if (run.canceled) return
         setPhase((p) => (p.kind === 'running' ? { ...p, status: 'Starting encoders…' } : p))
-        codec = settings.autoCodec ? plan?.codec ?? 'avc' : thoroughCodec(settings)
+        // Auto without a size target has nothing to compare, and only an HDR video it keeps in 10 bits goes to AV1.
+        codec = settings.autoCodec ? plan?.codec ?? (keepsHdr(probe, settings) ? 'av1' : 'avc') : thoroughCodec(settings)
         run.job = engine.encode(probe, { ...settings, codec },
           { crf: plan?.crf, slope: plan?.slope, points: plan?.points, reuse: codec === 'avc' ? plan?.reuse : undefined,
             fast: codec === 'avc' && plan?.fast }, onProgress)
@@ -772,14 +776,14 @@ function Ready(props: {
   )
   const thoroughName = (c: 'avc' | 'av1') => (c === 'av1' ? 'SVT-AV1' : 'x264')
   const hdrNote = () => {
-    if (settings.engine === 'fast' || target.width !== probe.width || target.height !== probe.height)
+    // Resized frames, and frames in a format the encoders don't take as they are, go through an SDR canvas.
+    if (settings.engine === 'fast' || !copiesFrames(probe, settings))
       return 'This is an HDR video. The compressed copy is SDR, so highlights and colors may look flatter.'
-    const codec = settings.autoCodec ? result?.codec : thoroughCodec(settings)
-    if (codec === 'av1') return 'This is an HDR video. It stays HDR, as 10-bit AV1.'
-    if (codec === 'avc' && settings.autoCodec)
-      return 'This is an HDR video. This device can’t play HDR in AV1, so the copy is 8-bit H.264 and smooth gradients may band.'
+    if (!deepFormat(probe.frame?.format)) return 'This is an HDR video in 8 bits. The copy stays HDR.'
+    const codec = settings.autoCodec ? (keepsHdr(probe, settings) ? 'av1' : null) : thoroughCodec(settings)
+    if (codec === 'av1' && keepsHdr(probe, settings)) return 'This is an HDR video. It stays HDR, as 10-bit AV1.'
     if (codec === 'avc') return 'This is an HDR video. H.264 here is 8-bit, so smooth gradients may band; AV1 keeps it in 10 bits.'
-    return 'This is an HDR video. Checking whether this device plays it in 10-bit AV1…'
+    return 'This is an HDR video. This device can’t play 10-bit AV1, so the copy is 8-bit and smooth gradients may band.'
   }
   const summary = [
     copy

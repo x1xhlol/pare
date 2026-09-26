@@ -27,7 +27,7 @@ import vmafScript from './vmaf/vmaf.mjs?url'
 import vmafWasm from './vmaf/vmaf.wasm?url'
 import type { EncodedChunk, FrameStat, WorkerChunk, WorkerInit, WorkerMessage, WorkerSplit } from './encode-worker'
 import { av1Config, avcConfig } from './codec-config'
-import { outputSize, type Preset, type Probe, type Settings } from './shared'
+import { copiesFrames, keepsHdr, outputSize, playsAv1, type Preset, type Probe, type Settings } from './shared'
 
 type EncodingPreset = Exclude<Preset, 'copy'>
 
@@ -287,28 +287,68 @@ async function timeline(file: Blob): Promise<Timeline> {
   }
 }
 
+/** Bytes and packets of the source's audio, from the container's index: only packet sizes are read. */
+async function audioPackets(file: Blob) {
+  const input = new Input({ source: new BlobSource(file), formats: [MP4, QTFF, WEBM, MATROSKA] })
+  try {
+    const track = await input.getPrimaryAudioTrack()
+    let bytes = 0, count = 0
+    if (track)
+      for await (const packet of new EncodedPacketSink(track).packets(undefined, undefined, { metadataOnly: true }))
+        (bytes += packet.byteLength), count++
+    return { bytes, count }
+  } finally {
+    input.dispose()
+  }
+}
+
+/**
+ * Bytes of the output outside its video stream. Copied audio is counted exactly; a transcode by its bitrate plus 10%,
+ * since encoders overshoot a little (the PCM clip's AAC came out 4% over). The container is an upper bound from Pare's
+ * own files: about 1.3 KB of boxes, then 4-5.5 bytes per AV1 frame and 13 per H.264 frame (sizes, and timing offsets
+ * for B-frames), up to 20 with variable frame timing, and about 4 per audio packet. The flat 64 KB this replaces took
+ * 1.3-1.9% off a 3-5 MB file's limit, which sent every small AV1 encode to a second pass.
+ */
+function besidesVideo(probe: Probe, settings: Settings, frames: number, audio: { bytes: number; count: number }) {
+  const kept = settings.keepAudio && probe.audio
+  const copied = kept && !!probe.audio!.codec && MP4_AUDIO.includes(probe.audio!.codec)
+  const audioOut = !kept ? 0 : copied ? audio.bytes : audioBytes(probe, settings) * 1.1
+  // AAC and Opus both make about 50 packets a second.
+  const packets = !kept ? 0 : copied ? audio.count : Math.ceil(probe.duration * 50)
+  return audioOut + 4096 + 24 * frames + 12 * packets
+}
+
 export function presetCrf(settings: Settings) {
   return profileFor(settings).crf[settings.preset === 'copy' ? 'visually-lossless' : settings.preset]
 }
 
-async function encoderOptions(probe: Probe, settings: Settings, crf: number) {
+/**
+ * The output's colour tags and bit depth. Frames copied in as decoded keep the source's tags, and 10-bit HDR stays
+ * 10-bit in AV1 (keepsHdr); x264's build here is 8-bit, so H.264 gets those frames rounded to 8 bits with the same
+ * tags. Frames drawn on an RGB canvas (resized, or in a format the encoders don't take) come out as BT.709 SDR.
+ */
+function outputColor(probe: Probe, settings: Settings): Color {
+  if (!copiesFrames(probe, settings)) return { primaries: 'bt709', transfer: 'bt709', matrix: 'bt709', fullRange: false }
+  const c = probe.colorSpace
+  return { primaries: c.primaries ?? undefined, transfer: c.transfer ?? undefined, matrix: c.matrix ?? undefined,
+    fullRange: !!c.fullRange, depth: settings.codec === 'av1' && keepsHdr(probe, settings) ? 10 : undefined }
+}
+
+function encoderOptions(probe: Probe, settings: Settings, crf: number) {
   const { width, height } = outputSize(probe, settings.shortSide)
-  let color: Color = { primaries: 'bt709', transfer: 'bt709', matrix: 'bt709', fullRange: false }
-  // Resized frames go through an RGB canvas and come back as BT.709 limited range; others keep the source's.
-  if (width === probe.width && height === probe.height) {
-    const { input, track } = await openTrack(probe.file)
-    try {
-      const c = await track.getColorSpace()
-      color = { primaries: c.primaries ?? undefined, transfer: c.transfer ?? undefined, matrix: c.matrix ?? undefined,
-        fullRange: !!c.fullRange }
-      // HDR stays HDR in AV1: 10-bit frames go in as they are. x264's build here is 8-bit, so H.264 gets the frames
-      // rounded to 8 bits with the same colour tags.
-      if (probe.hdr && settings.codec === 'av1') color.depth = 10
-    } finally {
-      input.dispose()
-    }
+  return profileFor(settings).options(crf, outputColor(probe, settings), width, height).join(';')
+}
+
+type Orientation = { rotation: 0 | 90 | 180 | 270; flip: boolean }
+
+/** How the source's frames are turned for display. Pare encodes them as stored and passes this on. */
+async function orientation(file: Blob): Promise<Orientation> {
+  const { input, track } = await openTrack(file)
+  try {
+    return { rotation: await track.getRotation(), flip: await track.getFlip() }
+  } finally {
+    input.dispose()
   }
-  return profileFor(settings).options(crf, color, width, height).join(';')
 }
 
 /** Encoder input size: the frame as stored (before rotation), at the requested resolution. */
@@ -601,7 +641,7 @@ function planAround({ times }: Timeline, workers: number, done: (Omit<Reusable, 
 const MP4_AUDIO: AudioCodec[] = ['aac', 'opus', 'mp3', 'ac3', 'eac3', 'flac']
 
 async function mux(probe: Probe, settings: Settings, chunks: EncodedChunk[], size: { width: number; height: number },
-                   rotation: 0 | 90 | 180 | 270) {
+                   { rotation, flip }: Orientation) {
   const parts: Uint8Array<ArrayBuffer>[] = []
   let written = 0
   const writable = new WritableStream<{ type: 'write'; data: Uint8Array<ArrayBuffer>; position: number }>({
@@ -615,7 +655,8 @@ async function mux(probe: Probe, settings: Settings, chunks: EncodedChunk[], siz
   const output = new Output({ format, target: new StreamTarget(writable, { chunked: true, chunkSize: 8 * 2 ** 20 }) })
   const profile = profileFor(settings)
   const video = new EncodedVideoPacketSource(profile.codec)
-  output.addVideoTrack(video, { rotation })
+  // The frames went in as stored, so the container turns them, as the source's did.
+  output.addVideoTrack(video, { rotation, flip })
 
   const input = new Input({ source: new BlobSource(probe.file), formats: [MP4, QTFF, WEBM, MATROSKA] })
   try {
@@ -636,7 +677,12 @@ async function mux(probe: Probe, settings: Settings, chunks: EncodedChunk[], siz
 
     await output.start()
 
-    const config = profile.config(chunks[0].headers, size.width, size.height)
+    // The colour tags go in the container too (a colr box), which some players read instead of the bitstream's.
+    const color = outputColor(probe, settings)
+    const colorSpace = color.primaries || color.transfer || color.matrix
+      ? { primaries: color.primaries, transfer: color.transfer, matrix: color.matrix, fullRange: color.fullRange } as VideoColorSpaceInit
+      : undefined
+    const config = { ...profile.config(chunks[0].headers, size.width, size.height), colorSpace }
     const allTimes = chunks.flatMap((c) => c.times)
     const frameDuration = allTimes.length > 1 ? (allTimes[allTimes.length - 1] - allTimes[0]) / (allTimes.length - 1) : 1 / 30
     let first = true
@@ -859,15 +905,14 @@ export function encode(probe: Probe, settings: Settings, start: EncodeStart, onP
 
   const promise = (async () => {
     try {
-      const { input, track } = await openTrack(probe.file)
-      const rotation = await track.getRotation()
-      input.dispose()
-      const size = frameSize(probe, settings, rotation)
+      const turn = await orientation(probe.file)
+      const size = frameSize(probe, settings, turn.rotation)
       const profile = profileFor(settings)
       const floor = floorCrf(settings)
       const crf = Math.min(profile.max, Math.max(floor, start.crf ?? floor))
       const slope = start.slope && start.slope < -0.03 ? start.slope : profile.slope
-      const [line, tuned] = await Promise.all([timeline(probe.file), encoderOptions(probe, settings, crf)])
+      const [line, tuned, sound] = await Promise.all([timeline(probe.file), encoderOptions(probe, settings, crf),
+        audioPackets(probe.file)])
       const options = start.fast && profile === X264 ? fastest(tuned) : tuned
       const { times } = line
       const { encoders, threads } = workerCount(probe, settings, times.length)
@@ -882,13 +927,14 @@ export function encode(probe: Probe, settings: Settings, start: EncodeStart, onP
       const active = Math.min(encoders, chunks.length - reused.size)
       const cores = Math.min(navigator.hardwareConcurrency || active, active * threads)
       const fps = probe.fps || 30
-      const init = { file: probe.file, options, width: size.width, height: size.height, fpsNum: Math.round(fps * 1000), fpsDen: 1000 }
+      const init = { file: probe.file, options, width: size.width, height: size.height, fpsNum: Math.round(fps * 1000), fpsDen: 1000,
+        direct: copiesFrames(probe, settings) }
       pool = await createPool(profile, active, threads, init)
       let poolThreads = pool.threads
       if (canceled) throw new Canceled()
-      const audio = audioBytes(probe, settings)
       const goal = videoGoal(probe, settings)
-      const limit = Math.max(probe.file.size * SIZE_TARGET - audio - 64e3, probe.file.size * 0.05)
+      const target = probe.file.size * SIZE_TARGET
+      let limit = Math.max(target - besidesVideo(probe, settings, times.length, sound), probe.file.size * 0.05)
       // A steeper slope than measured keeps the budget from overreaching when it lowers the rate factor: near the
       // sizes it lands on, noisy footage grows much faster than the plan's two distant tests suggest.
       const budget = settings.sizeTarget
@@ -975,45 +1021,51 @@ export function encode(probe: Probe, settings: Settings, start: EncodeStart, onP
 
       // The size limit is a promise, so check the real total and encode chunks again until it holds. A total far
       // under the goal means the plan was pessimistic, and the room is spent on quality instead. Far means under
-      // UNDER_GOAL: at 78% of it, tree's AV1 encode went again for +0.5 VMAF NEG in 40% more time.
+      // UNDER_GOAL: at 78% of it, tree's AV1 encode went again for +0.5 VMAF NEG in 40% more time. Either way the
+      // second pass aims just under the limit rather than back at the first pass's aim.
       let total = encoded.reduce((t, c) => t + chunkBytes(c), 0)
-      for (let round = 0; budget && round < 3; round++) {
-        const over = total > limit
-        if (!over && !(total < goal * UNDER_GOAL && crfs.some((c) => c > floor + 0.25))) break
-        const mean = encoded.reduce((t, c) => t + crfs[c.index] * chunkBytes(c), 0) / total
-        const local = localSlope(start.points ?? [], mean, total, over, slope)
-        // A few chunks to redo would leave most encoders idle, and AV1 has no threads to give them: cut each chunk
-        // into pieces of at least 20 frames so every encoder works (x264 keeps two threads per piece), and budget for
-        // the extra keyframes. With 30, Jellyfish's two 41- and 44-frame chunks went again whole, on 2 of 8 encoders.
-        const share = profile.threaded && canThread ? 2 : 1
-        const piecesFor = (count: number, index: number) =>
-          Math.max(1, Math.min(Math.floor(active / share / count), Math.floor(frameCounts[index] / 20)))
-        const cuts = (list: { index: number }[]) => list.reduce((t, r) => t + piecesFor(list.length, r.index) - 1, 0)
-        // Chunks already at the limit of the range would come out the same.
-        const changing = (list: { index: number; crf: number }[]) => list.filter((r) => Math.abs(r.crf - crfs[r.index]) >= 0.05)
-        let redo = changing(refit(encoded, crfs, total - goal, local, floor, profile.max))
-        if (cuts(redo)) redo = changing(refit(encoded, crfs, total - goal + cuts(redo) * keyframeCost(encoded), local, floor, profile.max))
-        if (!redo.length) break
-        const again = redo.flatMap(({ index, crf: value }) =>
-          cutInto(index, piecesFor(redo.length, index)).map((c) => withCrf(c, value)))
-        finished += work - finished
-        work = finished + again.reduce((t, c) => t + frameCounts[c.index], 0)
-        // Fewer chunks than encoders: give each the cores the others would have used, as x264 threads.
-        const spare = canThread ? Math.min(4, Math.floor((navigator.hardwareConcurrency || active) / again.length)) : 1
-        if (spare > poolThreads) {
-          pool.terminate()
-          pool = await createPool(profile, again.length, spare, init)
-          poolThreads = pool.threads
-          if (canceled) throw new Canceled()
+      const fitTo = async (limit: number) => {
+        for (let round = 0; budget && round < 3; round++) {
+          const over = total > limit
+          if (!over && !(total < goal * UNDER_GOAL && crfs.some((c) => c > floor + 0.25))) break
+          const mean = encoded.reduce((t, c) => t + crfs[c.index] * chunkBytes(c), 0) / total
+          const local = localSlope(start.points ?? [], mean, total, over, slope)
+          // A few chunks to redo would leave most encoders idle, and AV1 has no threads to give them: cut each chunk
+          // into pieces of at least 20 frames so every encoder works (x264 keeps two threads per piece), and budget for
+          // the extra keyframes. With 30, Jellyfish's two 41- and 44-frame chunks went again whole, on 2 of 8 encoders.
+          const share = profile.threaded && canThread ? 2 : 1
+          const piecesFor = (count: number, index: number) =>
+            Math.max(1, Math.min(Math.floor(active / share / count), Math.floor(frameCounts[index] / 20)))
+          const cuts = (list: { index: number }[]) => list.reduce((t, r) => t + piecesFor(list.length, r.index) - 1, 0)
+          // Chunks already at the limit of the range would come out the same.
+          const changing = (list: { index: number; crf: number }[]) => list.filter((r) => Math.abs(r.crf - crfs[r.index]) >= 0.05)
+          const aim = limit * REFIT_AIM
+          let redo = changing(refit(encoded, crfs, total - aim, local, floor, profile.max))
+          if (cuts(redo)) redo = changing(refit(encoded, crfs, total - aim + cuts(redo) * keyframeCost(encoded), local, floor, profile.max))
+          if (!redo.length) break
+          const again = redo.flatMap(({ index, crf: value }) =>
+            cutInto(index, piecesFor(redo.length, index)).map((c) => withCrf(c, value)))
+          finished += work - finished
+          work = finished + again.reduce((t, c) => t + frameCounts[c.index], 0)
+          // Fewer chunks than encoders: give each the cores the others would have used, as x264 threads. SVT-AV1 has
+          // none to take, and a new pool would only cost its start.
+          const spare = canThread && profile.threaded
+            ? Math.min(4, Math.floor((navigator.hardwareConcurrency || active) / again.length)) : 1
+          if (spare > poolThreads) {
+            pool!.terminate()
+            pool = await createPool(profile, again.length, spare, init)
+            poolThreads = pool.threads
+            if (canceled) throw new Canceled()
+          }
+          const redone = await pool!.run(again, (frames) => report(frames, 'refitting'))
+          for (const c of redone) if (c) encoded[c.index] = c
+          const before = total
+          total = encoded.reduce((t, c) => t + chunkBytes(c), 0)
+          passes.push(`${(before / 1e6).toFixed(2)} MB, slope ${local.toFixed(3)}, ${poolThreads} threads: ` +
+            redo.map((r) => `${r.index}→${r.crf.toFixed(1)}`).join(' '))
         }
-        const redone = await pool.run(again, (frames) => report(frames, 'refitting'))
-        for (const c of redone) if (c) encoded[c.index] = c
-        const before = total
-        total = encoded.reduce((t, c) => t + chunkBytes(c), 0)
-        passes.push(`${(before / 1e6).toFixed(2)} MB, slope ${local.toFixed(3)}, ${poolThreads} threads: ` +
-          redo.map((r) => `${r.index}→${r.crf.toFixed(1)}`).join(' '))
       }
-      pool.terminate()
+      await fitTo(limit)
       if (canceled) throw new Canceled()
       const wall = performance.now() - started
       const sum = (k: 'decode' | 'load' | 'encode') => encoded.reduce((t, c) => t + c.timing[k], 0)
@@ -1023,8 +1075,19 @@ export function encode(probe: Probe, settings: Settings, start: EncodeStart, onP
       onProgress({ fraction: 0.99, processed: probe.duration, elapsed: (performance.now() - started) / 1000,
         workers: cores, stage: 'finishing' })
       // Chunks split off during the encode come last by index; the file needs them in time order.
-      const ordered = [...encoded].sort((a, b) => a.times[0] - b.times[0])
-      const blob = await mux(probe, settings, ordered, size, rotation)
+      const inOrder = () => [...encoded].sort((a, b) => a.times[0] - b.times[0])
+      let blob = await mux(probe, settings, inOrder(), size, turn)
+      // The allowance for everything but the video is an upper bound, so this shouldn't happen; if the file still came
+      // out over, the video makes up the difference.
+      if (budget && blob.size > target) {
+        console.warn(`[pare] ${blob.size - target} bytes over after muxing; encoding again`)
+        limit -= blob.size - target
+        await fitTo(limit)
+        blob = await mux(probe, settings, inOrder(), size, turn)
+      }
+      pool.terminate()
+      if (canceled) throw new Canceled()
+      const ordered = inOrder()
       onProgress({ fraction: 1, processed: probe.duration, elapsed: (performance.now() - started) / 1000 })
       const scores: FrameScores = { times: [], ssim: [] }
       for (const chunk of ordered)
@@ -1049,6 +1112,11 @@ export const SIZE_TARGET = 0.5
 const SIZE_AIM = 0.47
 /** A first pass landing under this share of the goal is encoded again at a lower rate factor. */
 const UNDER_GOAL = 0.75
+/**
+ * Where a second pass aims, as a share of the real limit. The first pass aims at SIZE_AIM to absorb the plan's error; a
+ * second pass re-encodes chunks it has measured, and across 11 logged refits landed 9% under to 1.1% over its target.
+ */
+const REFIT_AIM = 0.985
 /** Frames per test window: enough for x264's rate control to settle after the window's opening keyframe. */
 const WINDOW_FRAMES = 24
 /** Test-window estimates came in 3-11% under the finished files (median ~7%); scale them to match. */
@@ -1083,6 +1151,17 @@ const CURVED = -0.18
 const AV1_BRACKET = 6
 /** The plan windows AV1's test uses when choosing the codec: every other one of four. */
 const AV1_TEST_WINDOWS = [1, 3]
+/**
+ * The windows AV1's test uses out of `count`: AV1_TEST_WINDOWS where they exist, otherwise all of them (a 4K video, a
+ * clip under 80 frames or a device with 2-3 encoders gets one window).
+ */
+const av1Windows = (count: number) => pick(AV1_TEST_WINDOWS, count)
+
+/** The `wanted` windows that exist out of `count`, or all of them if none do. */
+function pick(wanted: number[], count: number) {
+  const some = wanted.filter((i) => i < count)
+  return some.length ? some : Array.from({ length: count }, (_, i) => i)
+}
 /** Frames of each test window scored with VMAF when choosing the codec (research/codec_choice.py). */
 const SCORED_FRAMES = 2
 /**
@@ -1216,10 +1295,7 @@ export async function plan(probe: Probe, settings: Settings, signal: AbortSignal
                            only?: number[], tests?: [number, number],
                            onFirst?: (first: SizePlan) => boolean | void | Promise<boolean | void>): Promise<SizePlan> {
   const began = performance.now()
-  const { input, track } = await openTrack(probe.file)
-  const rotation = await track.getRotation()
-  input.dispose()
-  const size = frameSize(probe, settings, rotation)
+  const size = frameSize(probe, settings, (await orientation(probe.file)).rotation)
   const baseCrf = presetCrf(settings)
   const [line, full] = await Promise.all([timeline(probe.file), encoderOptions(probe, settings, baseCrf)])
   const { times } = line
@@ -1234,7 +1310,10 @@ export async function plan(probe: Probe, settings: Settings, signal: AbortSignal
   // windows at a rate factor about half the size, so the curve between them is known without a second round. Each
   // window starts on a source keyframe when one is close, so its decoder doesn't work through frames it won't use.
   const { encoders, threads } = workerCount(probe, settings)
-  const windowCount = Math.max(1, Math.min(Math.floor(encoders / 2) || 1, Math.floor(times.length / 40)))
+  // A test on some of the windows (AV1's for Auto) places them as H.264's plan did, so they're the same frames. At
+  // 1440p, say, x264 runs 6 encoders and SVT-AV1 5, which would make 3 windows against 2.
+  const layout = only ? workerCount(probe, { ...settings, codec: 'avc' }).encoders : encoders
+  const windowCount = Math.max(1, Math.min(Math.floor(layout / 2) || 1, Math.floor(times.length / 40)))
   const per = Math.min(Math.floor(times.length / windowCount), WINDOW_FRAMES)
   const all = Array.from({ length: windowCount }, (_, i) => {
     const ideal = Math.min(times.length - per, Math.max(0, Math.round(((i + 0.5) / windowCount) * times.length - per / 2)))
@@ -1244,8 +1323,9 @@ export async function plan(probe: Probe, settings: Settings, signal: AbortSignal
   })
   // A test on some of the windows (AV1 when choosing the codec) keeps their positions, so another encoder's test on
   // all of them can tell how the rest compare.
-  const picked = only?.filter((i) => i < all.length)
-  const windows = picked?.length ? picked.map((i) => all[i]) : all
+  const picked = only && pick(only, all.length)
+  const windows = picked ? picked.map((i) => all[i]) : all
+  const subset = av1Windows(windows.length)
   const count = Math.min(encoders, windows.length * 2)
   // The real encode starts a keyframe per chunk and roughly every 250 frames, plus one per scene cut.
   // Counted for 8 chunks even when a short video is encoded in fewer: ESTIMATE_BIAS was calibrated there, and a test
@@ -1256,7 +1336,7 @@ export async function plan(probe: Probe, settings: Settings, signal: AbortSignal
   const fps = probe.fps || 30
   const pool = await createPool(profile, count, threads, {
     file: probe.file, options, width: size.width, height: size.height, fpsNum: Math.round(fps * 1000), fpsDen: 1000,
-    scoring: measure || fastFirst,
+    direct: copiesFrames(probe, settings), scoring: measure || fastFirst,
   })
   // A short run from a third of the way into each window: the first frame primes VMAF's motion feature, and a run
   // covers every layer of the encoders' hierarchical frame structures. Every 8th frame would land on their best ones.
@@ -1318,7 +1398,7 @@ export async function plan(probe: Probe, settings: Settings, signal: AbortSignal
     return crfs.map((crf, c): PlanPoint => {
       const tests = windows.map((_, i) => encoded[base + c * windows.length + i])
       tested.set(crf, tests)
-      const some = tests.filter((_, i) => AV1_TEST_WINDOWS.includes(i))
+      const some = tests.filter((_, i) => subset.includes(i))
       const point: PlanPoint = {
         crf,
         bytes: estimate(tests),
@@ -1327,7 +1407,7 @@ export async function plan(probe: Probe, settings: Settings, signal: AbortSignal
       if (scored && score)
         scoring.push(Promise.all(tests.map((t) => pool.score(t.index))).then((all) => {
           point.vmaf = mean(all)
-          if (point.subset) point.subset.vmaf = mean(all.filter((_, i) => AV1_TEST_WINDOWS.includes(i)))
+          if (point.subset) point.subset.vmaf = mean(all.filter((_, i) => subset.includes(i)))
         }))
       return point
     })
@@ -1432,38 +1512,8 @@ function vmafAt(points: SizePlan['points'], bytes: number) {
   if (!points || points.length < 2) return undefined
   const [lo, hi] = around(points, bytes)
   if (lo.vmaf === undefined || hi.vmaf === undefined) return undefined
-  return lo.vmaf + ((Math.log(bytes) - Math.log(lo.bytes)) / (Math.log(hi.bytes) - Math.log(lo.bytes))) * (hi.vmaf - lo.vmaf)
-}
-
-/**
- * Whether this device decodes AV1 at this size smoothly, in 10 bits for an HDR source. Not whether it shows HDR: Chrome
- * reports HDR transfer functions unsupported on a screen without HDR, and still plays the file, tone-mapped.
- */
-async function playsAv1(width: number, height: number, fps: number, tenBit = false) {
-  try {
-    const info = await navigator.mediaCapabilities.decodingInfo({
-      type: 'file',
-      video: { contentType: `video/mp4; codecs="av01.0.08M.${tenBit ? 10 : '08'}"`, width, height, bitrate: 8e6,
-        framerate: fps || 30 },
-    })
-    return info.supported && info.smooth
-  } catch {
-    return false
-  }
-}
-
-/** The source's HDR transfer when it's encoded at its own size (resizing goes through an SDR canvas), or null. */
-async function hdrTransfer(probe: Probe, settings: Settings): Promise<TransferFunction | null> {
-  const { width, height } = outputSize(probe, settings.shortSide)
-  if (!probe.hdr || width !== probe.width || height !== probe.height) return null
-  const { input, track } = await openTrack(probe.file)
-  try {
-    // TypeScript's DOM types lag the WebCodecs spec, which has 'pq' and 'hlg'.
-    const transfer: string | null | undefined = (await track.getColorSpace()).transfer
-    return transfer === 'pq' || transfer === 'hlg' ? transfer : null
-  } finally {
-    input.dispose()
-  }
+  const vmaf = lo.vmaf + ((Math.log(bytes) - Math.log(lo.bytes)) / (Math.log(hi.bytes) - Math.log(lo.bytes))) * (hi.vmaf - lo.vmaf)
+  return Number.isFinite(vmaf) ? vmaf : undefined
 }
 
 /** Auto, first step: H.264's size plan, with VMAF measured on its test windows. */
@@ -1474,7 +1524,7 @@ async function hdrTransfer(probe: Probe, settings: Settings): Promise<TransferFu
  */
 export async function planAvc(probe: Probe, settings: Settings, signal: AbortSignal): Promise<SizePlan> {
   // An HDR video keeps its 10 bits in AV1 where this device plays that; H.264 here would round it to 8.
-  if ((await hdrTransfer(probe, settings)) && (await playsAv1(probe.width, probe.height, probe.fps, true))) {
+  if (keepsHdr(probe, settings)) {
     const av1 = await plan(probe, { ...settings, codec: 'av1' }, signal, false)
     return { ...av1, av1Plan: Promise.resolve(av1), hdr: true }
   }
@@ -1538,6 +1588,7 @@ async function planAv1(probe: Probe, settings: Settings, avc: SizePlan, signal: 
 /** How much bigger the whole video is than AV1's two test windows suggest, going by H.264's test of all four. */
 function subsetScale(avc: SizePlan) {
   const ratios = avc.points!.flatMap((p) => (p.subset ? [Math.log(p.bytes / p.subset.bytes)] : []))
+    .filter(Number.isFinite)
   return ratios.length ? Math.exp(ratios.reduce((a, b) => a + b, 0) / ratios.length) : 1
 }
 

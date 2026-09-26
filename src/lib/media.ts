@@ -13,6 +13,7 @@ import {
   QTFF,
   Quality,
   StreamTarget,
+  VideoSampleSink,
   WEBM,
   canEncodeAudio,
   canEncodeVideo,
@@ -22,7 +23,7 @@ import {
   type InputVideoTrack,
 } from 'mediabunny'
 import { lumaOf, psnr, ssim } from './metrics'
-import { even, outputSize, type OutputCodec, type Preset, type Probe, type Settings } from './shared'
+import { deepFormat, even, outputSize, playsAv1, type OutputCodec, type Preset, type Probe, type Settings } from './shared'
 
 type EncodingPreset = Exclude<Preset, 'copy'>
 
@@ -55,17 +56,24 @@ export async function probeFile(file: File): Promise<Probe> {
     const video = await input.getPrimaryVideoTrack()
     if (!video) throw new Error('This file has no video track.')
 
-    const [format, duration, videoCodec, width, height, canDecode, hdr, stats] = await Promise.all([
+    const [format, duration, videoCodec, width, height, canDecode, tags, stats] = await Promise.all([
       input.getFormat(),
       input.computeDuration(),
       video.getCodec(),
       video.getDisplayWidth(),
       video.getDisplayHeight(),
       video.canDecode(),
-      video.hasHighDynamicRange(),
+      video.getColorSpace(),
       video.computePacketStats(),
     ])
     const firstTimestamp = Math.max(0, await video.getFirstTimestamp())
+    const frame = canDecode ? await firstFrame(video, firstTimestamp) : null
+    // TypeScript's DOM types lag the WebCodecs spec, which has 'pq' and 'hlg'.
+    const isHdr = (c?: VideoColorSpaceInit) => ['pq', 'hlg'].includes(c?.transfer as string)
+    const colorSpace = !tags.transfer && isHdr(frame?.colorSpace) ? frame!.colorSpace : tags
+    const hdr = isHdr(colorSpace)
+    const fps = stats.averagePacketRate
+    const playsHdrAv1 = hdr && deepFormat(frame?.format) && (await playsAv1(width, height, fps, true))
 
     const audioTrack = await input.getPrimaryAudioTrack()
     const audio = audioTrack
@@ -95,17 +103,35 @@ export async function probeFile(file: File): Promise<Probe> {
       firstTimestamp,
       width,
       height,
-      fps: stats.averagePacketRate,
+      fps,
       videoCodec,
       videoBitrate: stats.averageBitrate,
       canDecode,
       hdr,
+      colorSpace,
+      frame: frame && { format: frame.format, width: frame.width, height: frame.height },
+      playsHdrAv1,
       audio,
       poster,
       encodable,
     }
   } finally {
     input.dispose()
+  }
+}
+
+/** The first frame's pixel format, visible size (turned to display orientation) and colour space. */
+async function firstFrame(track: InputVideoTrack, timestamp: number) {
+  const sample = await new VideoSampleSink(track).getSample(timestamp).catch(() => null)
+  if (!sample) return null
+  try {
+    const { width, height } = sample.visibleRect
+    const turned = sample.rotation % 180 !== 0
+    const { primaries, transfer, matrix, fullRange } = sample.colorSpace
+    return { format: sample.format, width: turned ? height : width, height: turned ? width : height,
+      colorSpace: { primaries, transfer, matrix, fullRange } as VideoColorSpaceInit }
+  } finally {
+    sample.close()
   }
 }
 
