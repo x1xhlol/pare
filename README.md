@@ -113,6 +113,7 @@ it took town from 90.3 to 93.9 and noisy from 80.9 to 87.5.
 ```sh
 bun install
 bun dev
+bun test    # the WebAssembly scaler and RGB import against reference code, audio and size rules, AV1 headers
 ```
 
 The x264 module is checked in at `src/lib/x264/`. To rebuild it from source you need an activated
