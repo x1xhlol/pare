@@ -172,7 +172,7 @@ and took as long as the first pass. Refit chunks are now cut into pieces of at l
 works, and the refit budgets for the extra keyframes. Shorter pieces were slower here (the minimum later came down
 to 20 frames for a different case: see "Deciding on AV1 from H.264's plan"). At a high-quality rate factor an
 AV1 keyframe costs about 250 KB, and budgeting for four more of them pulled a third chunk into the refit. On a
-10-second phone clip with PCM audio, AV1 went from 50 s to 41 s.
+20-second phone clip with PCM audio, AV1 went from 50 s to 41 s.
 
 Before and after in the browser, clicking Compress a second after the file loads, alternating the two builds. The
 machine was shared with other work during these runs (load average 8 to 13 on 8 threads), so differences under about
@@ -261,7 +261,7 @@ In the app, same size target, scored against the source:
 | Camera footage, 10 s | 15.3 MB, 97.83 (93.87) | 11.3 MB, 96.76 (93.79) | 27 → 35 s |
 | Phone clips, 20 s | 29.4 MB, 87.70 (73.38) | 31.0 MB, 89.08 (74.58) | 54 → 93 s |
 | Big Buck Bunny, 10 s | 13.9 MB, 92.98 (89.86) | 12.9 MB, 93.72 (91.35) | 32 → 54 s |
-| Phone clip with PCM audio, 10 s | 23.2 MB, 92.46 (84.63) | 24.2 MB, 93.17 (88.91) | 40 → 54 s |
+| Phone clip with PCM audio, 20 s | 23.2 MB, 92.46 (84.63) | 24.2 MB, 93.17 (88.91) | 40 → 54 s |
 
 Where the target binds, AV1 is 0.7–1.4 points better on average and up to 4.3 better on the worst frame. Where the
 footage already fits, it's 26% smaller at a slightly lower score, so its quality ceiling could come down a step.
@@ -423,7 +423,7 @@ shortens the AV1 path.
 | Jellyfish, 10 s, already 4.2 Mbps | AV1: H.264 stops at −30% | +1.5 | |
 | Big Buck Bunny, 10 s | AV1 | +1.3 | +0.74 |
 | Phone clips, 20 s | H.264 | +0.7 | +1.38 |
-| Phone clip with PCM audio, 10 s | H.264 | −0.4 | +0.71 |
+| Phone clip with PCM audio, 20 s | H.264 | −0.4 | +0.71 |
 
 The phone clips are a miss: the test on all four windows said +1.0, the two-window test +0.7, and the whole file
 came out 1.4 points better as AV1. The other decisions hold. The jellyfish is the one that matters most: H.264 at its
@@ -769,6 +769,8 @@ The AV1 sequence header now tells the MP4 codec string its bit depth (`av01.0.08
 config rather than assumed. What isn't tested: phone HDR is HEVC, which headless Chrome on Linux can't decode. If a
 Mac's hardware decoder hands frames over in another format, they take the RGB path and come out 8-bit, as before.
 
+As first shipped, this went by the container's tags, and that was wrong. See "Bit depth from the decoded frame" below.
+
 ## Threaded AV1 instead of chunks (not shipped)
 
 Chunk keyframes cost AV1 the most, and x264 answered that with fewer, longer chunks and more threads each. SVT-AV1
@@ -803,6 +805,139 @@ each encoder needs about 1.5 GB and 80 workers. The size plan also needs recalib
 instead of eight, its estimate came out 14% low on town, the first pass went over, and a second pass took the time to
 39.6 s against 29.3. About 0.8 VMAF NEG isn't worth that, so AV1 stays at one thread per chunk.
 
+## Bit depth from the decoded frame
+
+A review of the HDR change turned up the case it broke. Whether to encode 10-bit came from the container's colour tags,
+through Mediabunny's `hasHighDynamicRange`, which is true for BT.2020 or Display P3 primaries whatever the transfer and
+bit depth. The pixel format came from the decoder, in the worker, and the two never met. An 8-bit video tagged HLG (a
+camera's 8-bit HLG mode, made here with ffmpeg) went into a 10-bit encoder, and its 8-bit frames were copied into
+16-bit planes. Against its source the result scored SSIM 0.009 and PSNR 7.8 dB, at 192% of the original's size. The
+app said "Good, SSIM 0.94", because the encoder compares its output with its own input, which was already scrambled.
+An SDR video in Display P3 went the same way inside Auto: AV1's test windows scored VMAF NEG 19, so Auto kept H.264
+and never showed the broken file, by luck.
+
+Now the probe decodes one frame and keeps its pixel format and visible size. One function decides whether frames go
+into the encoder as decoded (a planar 4:2:0 format at the output size) or through the RGB canvas, and the colour tags,
+the bit depth, the Auto HDR route and the note on the settings screen all follow it. HDR now means a PQ or HLG
+transfer. 10-bit needs a 10- or 12-bit decoded frame, the direct path and a device that decodes 10-bit AV1. Frames
+drawn on the canvas are tagged BT.709, since that's what they are, and the worker refuses a frame that decodes
+differently from the plan instead of writing it wrong.
+
+| Clip | Before | Now |
+| --- | --- | --- |
+| 8-bit HLG | 10-bit AV1 from 8-bit data: 192% of the size, SSIM 0.009 | 8-bit AV1 tagged HLG: 40.6%, SSIM 0.969, PSNR 42.2 dB |
+| Display P3 SDR | H.264 (AV1's test broken): 48.2%, 53.5 s | AV1 at VMAF NEG 95.8 against H.264's 92.6: 40.7%, 36.0 s |
+| 10-bit HLG and PQ | 10-bit AV1 | the same bytes, plus a `colr` box |
+
+The output also gets a `colr` box now, with the tags the encoder used, since some players read the container rather
+than the bitstream.
+
+## Rotated videos
+
+Phone videos are stored landscape with a rotation flag. Frames that go through the canvas (any resize, 4:2:2 and 4:4:4
+sources, formats WebCodecs doesn't name) were drawn with the rotation applied by Mediabunny's `transform`, then
+squeezed back into the stored frame's shape, and the output kept the rotation flag, so they came out turned twice and
+distorted. A portrait clip resized to 720p scored SSIM 0.36 against its source. None of the benchmark clips were
+rotated. Now samples are drawn as stored, the container carries the rotation, and the mirror flag too, which was
+dropped before: SSIM 0.95, the loss from resizing. A rotated video at its own size was never affected, and still comes
+out byte-identical.
+
+## One test window
+
+The size plan uses fewer test windows when there are few encoders or frames: one at 4K (2 encoders), on clips under
+80 frames, and on 2- or 3-core devices. H.264's estimate of AV1's two windows then covered no windows at all, an
+estimate of 0 bytes, and the scale between them became infinite. Auto printed "NaN VMAF" for both formats, and on the
+predicted path planned AV1 at CRF 44 ("Infinity MB"). On a 70-frame clip that pass came out at 0.54 MB against a goal
+of 2.1 MB and every chunk was encoded again. Now AV1's windows are the ones that exist, and the scale and scores stay
+finite: CRF 22.3, 46.8% of the original instead of 37.4%, SSIM 0.960 against 0.959. AV1's windows also sit where
+H.264's did now, even where the two encoders run different numbers of workers (at 1440p x264 runs 6 and SVT-AV1 5,
+which placed 3 windows against 2).
+
+## The container's share of the size
+
+The size check took a flat 64 KB off the limit for the MP4's own boxes. Measured on Pare's files, the boxes are about
+1.3 KB plus 4-5.5 bytes per AV1 frame and 13 per H.264 frame (B-frames add timing offsets), and about 4 per audio
+packet: 1.5 KB on a 150-frame clip, 15 KB on the 20-second phone clips with their audio. On a 3-5 MB source, 64 KB was
+1.3-1.9% of the limit, and every small AV1 encode landed just over it and went for a second pass. The allowance is now
+an upper bound from those numbers (4 KB plus 24 bytes a frame and 12 an audio packet), copied audio is counted
+exactly from the container's index instead of extrapolated from its first 500 packets, and the finished file is
+weighed after muxing, with another pass if it's still over. A second pass now aims at 98.5% of the real limit, not
+back at the first pass's 47%: across 11 logged refits they landed 9% under to 1.1% over their target. A second pass
+on AV1 also no longer restarts the encoders for threads SVT-AV1 doesn't use.
+
+Old build against new, one after the other (both measured with native libvmaf):
+
+| Video | Time | VMAF NEG (worst frame) | Size |
+| --- | --- | --- | --- |
+| Jellyfish, 10 s | 41.6 → 35.7 s | 82.9 (73.4) → 83.8 (76.1) | 47.1% → 49.1% |
+| HDR HLG, 5 s | 39.0 → 25.4 s | 91.2 (86.7) → 91.7 (88.8) | 47.1% → 48.8% |
+| HDR PQ, 5 s | 33.0 → 23.4 s | 89.7 (86.5) → 90.1 (87.6) | 47.5% → 49.4% |
+| Phone clip with PCM audio, 20 s | 36.6 → 36.1 s | 92.0 (83.0) → 92.3 (84.8) | 46.0% → 48.4% |
+
+The first three no longer need a second pass. The PCM clip still does, and aims closer to the limit. The phone clips
+(20 s, copied AAC) didn't change.
+
+## SVT-AV1's own keyframes
+
+SVT-AV1 starts a new GOP every ((fps + 16) / 16) × 16 × 5 frames at preset 8, 160 at 24-30 fps and 320 at 50-60. Every
+chunk already opens with a keyframe, but a chunk longer than 160 frames at 30 fps paid for a second one. That's any
+AV1 video from about 43 s at 30 fps on 8 encoders, sooner with fewer encoders or at 4K. As one 240-frame chunk
+(`research/av1_keyint.py`, native SVT-AV1, Pare's settings), a GOP longer than the chunk needed 8.4% fewer bits for
+the same VMAF NEG on Big Buck Bunny and 12.2% on the screen recording. The 50 fps clips never reach 320 in one chunk
+and didn't change. AV1 now uses 10-second GOPs (`keyint=10s`), longer than any normal chunk, so seeking stays quick on
+very long videos, whose chunks can grow past that.
+
+In the browser, a 60-second 30 fps clip (Big Buck Bunny looped) with AV1 chosen: 18 keyframes became 16, one per
+chunk; at the same rate factors the first pass came out 2.8% smaller (93.4 MB against 96.1), so 2 chunks went again
+instead of 5. 158 s instead of 289 s, VMAF NEG 94.43 → 94.56, worst frame 91.62 → 92.03. Chunks under 160 frames,
+which is every clip in the benchmark, encode byte-identically. The size plan's keyframe count stays as calibrated.
+
+## Checking what a player shows
+
+After the 8-bit HLG file scored "Good" while being noise, the quality check got a second opinion. It already decoded
+eight frames from each file, drawn as a player draws them, for the side-by-side view, and scored them. Those now get
+compared with the encoder's own SSIM on the same frames. When the side-by-side frames lose more than twice what the
+encoder measured, plus 0.02, as a median over the eight, they're what gets reported, with a note. Normal files lose a
+bit more side by side than the encoder saw, most on hard footage: noisy 0.241 against 0.208, Jellyfish 0.030 against
+0.019, town 0.067 against 0.053. A test build that dropped the mirror flag showed 0.805 against 0.024 and now reads
+"Visible loss" instead of "Visually identical".
+
+## Audio, decided up front
+
+Audio used to be dealt with after the whole video was encoded. Chrome on Linux has no AAC encoder and its Opus
+encoder takes at most 2 channels, so a camera's 5.1 PCM track failed with "This specific encoder configuration (opus,
+256000 bps, 6 channels) is not supported" after 37 s of encoding, and so did ALAC, which it can't decode. Now the probe
+plans the audio: copy it when an MP4 can carry it, else encode it as it is in AAC or Opus, else as stereo, else at 48
+kHz, and if nothing works (or the track doesn't decode) leave it out. The settings screen says which ("PCM audio is
+converted to Opus, mixed down to stereo"; "This browser can't decode this video's audio, so the copy will be silent"),
+the size budget counts the planned bitrate, and the browser's own encoder follows the same plan.
+
+| Source audio | Before | Now |
+| --- | --- | --- |
+| PCM 5.1, 48 kHz | failed at the end | Opus stereo |
+| ALAC | failed at the end | left out, with a note |
+| AAC 5.1 | copied | copied |
+| PCM 96 kHz, Vorbis in MKV, PCM mono 8 kHz | Opus | Opus |
+
+## Safari's engine
+
+The README said Safari 17 and later; nobody had tried. Playwright's WebKit 26.6 build has everything Pare needs
+(WebCodecs, cross-origin isolation, WebAssembly SIMD), and every compression failed:
+
+- WebKit's `VideoFrame.copyTo` won't write into a resizable buffer ("Resizable ArrayBuffer is not allowed"), and the
+  threaded encoder's memory is one. Once it refuses, frames go through a plain buffer first, plane by plane. That's
+  one more copy per frame, and only there.
+- It reports AV1 as decodable, 10-bit included, and then fails on every frame, even a 64×64 keyframe from libaom.
+  The probe now trusts a real first-frame decode ("This browser can't decode AV1 video"), and before Auto may pick
+  AV1, Pare decodes a 27-byte AV1 keyframe. Otherwise Auto would have written files the same browser can't play.
+- Locally, the preview server answered revalidations with a bare 304 without the isolation headers, and WebKit then
+  refused worker scripts it had loaded fine the first time. Vercel serves assets as immutable, so browsers there don't
+  ask again, and the local server no longer revalidates.
+
+Now town and a 3-second clip compress in WebKit, to H.264 (42% and 50% of the original, SSIM 0.96 and 0.98), live
+included. It's slow: the size plan took 34 s on town against 11 s in Chrome. Real Safari on a Mac decodes with
+VideoToolbox instead, and hasn't been tried.
+
 ## End to end in the browser
 
 Same headless Chrome, same files, production builds:
@@ -835,7 +970,8 @@ its spare room goes to speed ("Room to spare goes to speed").
   full compression in the browser against any deployment.
 - `research/benchmark.mjs`, `score.py` and `report.py` produce the tables in `research/BENCHMARKS.md`.
 - `research/speed_sweep.py` and `research/av1_sweep.py` are the x264 and SVT-AV1 speed sweeps;
-  `research/av1_chunks.py` and `research/x264_chunks.py` measure what chunk keyframes cost.
+  `research/av1_chunks.py` and `research/x264_chunks.py` measure what chunk keyframes cost, and `research/av1_keyint.py`
+  what SVT-AV1's own keyframe interval costs a long chunk.
 - `research/ffmpeg-wasm/` runs stock ffmpeg.wasm in Chrome for the comparison in `research/BENCHMARKS.md`.
 
 ## Licensing

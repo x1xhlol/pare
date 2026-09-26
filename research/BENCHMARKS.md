@@ -24,7 +24,7 @@ current encoder reaches 1:1 at half the size. "Before" is the build from 25 Sept
 | Camera footage, 1080p30, 10 s | 77.9 MB | 23.89 MB (-69%) | H.264 | 29.4 → 10.8 s | 97.9 → 97.8 | 95.6 |
 | Screen recording, 1080p30, 8 s | 10.8 MB | 3.49 MB (-68%) | H.264 | 12.4 → 8.7 s | 99.0 → 99.0 | 95.6 |
 | Big Buck Bunny, 1080p30, 10 s | 30.7 MB | 13.42 MB (-56%) | H.264 | 36.0 → 23.9 s | 93.0 → 93.1 | 88.9 |
-| Phone clip with PCM audio, 1080p50, 10 s | 49.8 MB | 22.89 MB (-54%) | H.264 | 42.6 → 30.7 s | 92.4 → 92.0 | 83.0 |
+| Phone clip with PCM audio, 1080p25, 20 s | 49.8 MB | 22.89 MB (-54%) | H.264 | 42.6 → 30.7 s | 92.4 → 92.0 | 83.0 |
 | Phone clips, 1080p50, 20 s | 65.5 MB | 30.23 MB (-54%) | H.264 | 57.2 → 42.3 s | 87.8 → 87.9 | 71.9 |
 | town, 25 Mbps re-encode, 1080p50, 5 s | 15.8 MB | 7.00 MB (-56%) | AV1 | 31.0 → 29.3 s | 90.3 → 93.9 | 90.0 |
 | tree, same, 5 s | 15.1 MB | 5.89 MB (-61%) | AV1 | 31.9 → 30.0 s | 88.2 → 92.1 | 88.5 |
@@ -80,6 +80,43 @@ is untested. Before, the HLG clip came out as 8-bit H.264 and
 the PQ clip as 8-bit AV1, both still tagged HDR; now both are 10-bit AV1. VMAF isn't made for HDR, so here is PSNR on
 the 10-bit luma as well: HLG 44.3 → 47.6 dB in the same size file, PQ 46.7 → 48.1 dB. They take 6 to 14 s longer,
 most of it AV1's 10-bit encode.
+
+## Since then: fewer second passes, and fixes
+
+Measured against the build before (commit `420e715`), one after the other on the same machine. Another job was
+using the CPU for part of this session, so times are within one row only. What each change is, and why, is in
+[RESEARCH.md](RESEARCH.md) from "Bit depth from the decoded frame" on.
+
+The container allowance (a per-sample estimate instead of a flat 64 KB), and second passes aimed at the real limit:
+
+| Video | Time, before → now | VMAF NEG, before → now | Worst frame, before → now | Size, before → now |
+| --- | --- | --- | --- | --- |
+| Jellyfish, already 4.2 Mbps, 1080p30, 10 s | 41.6 → 35.7 s | 82.9 → 83.8 | 73.4 → 76.1 | 47.1% → 49.1% |
+| HDR test clip (HLG), 10-bit, 1080p30, 5 s | 39.0 → 25.4 s | 91.2 → 91.7 | 86.7 → 88.8 | 47.1% → 48.8% |
+| HDR test clip (PQ), 10-bit, 1080p30, 5 s | 33.0 → 23.4 s | 89.7 → 90.1 | 86.5 → 87.6 | 47.5% → 49.4% |
+| Phone clip with PCM audio, 1080p25, 20 s | 36.6 → 36.1 s | 92.0 → 92.3 | 83.0 → 84.8 | 46.0% → 48.4% |
+| Phone clips, 1080p50, 20 s | 49.7 → 43.4 s | 88.0 → 87.9 | 71.9 → 71.9 | 46.6% → 46.2% |
+
+SVT-AV1's 10-second GOPs, on a 60-second 30 fps clip (Big Buck Bunny looped six times, 1,800 frames, AV1 chosen):
+
+| Build | Time | VMAF NEG (worst frame) | Size | Keyframes |
+| --- | --- | --- | --- | --- |
+| Before | 288.6 s (5 chunks encoded twice) | 94.43 (91.62) | 46.8% | 18 |
+| Now | 157.8 s (2 chunks encoded twice) | 94.56 (92.03) | 48.9% | 16 |
+
+Files that came out wrong or failed before, each made from 3 s of town with ffmpeg, compared with their source by
+ffmpeg with both turned for display:
+
+| Test file | Before | Now |
+| --- | --- | --- |
+| 8-bit H.264 tagged HLG, Auto | 10-bit AV1 from 8-bit data: 192% of the size, SSIM 0.009 | 8-bit AV1 tagged HLG: 40.6%, SSIM 0.969 |
+| Display P3 SDR, Auto | H.264 at 48.2% (AV1's test encoded noise and scored 19) | AV1 at 40.7%, SSIM 0.969 |
+| Rotated 90°, 720p | turned twice and squeezed: SSIM 0.364 | SSIM 0.952 (the loss from resizing) |
+| Rotated 90° and mirrored, 720p | SSIM 0.367, mirror flag lost | SSIM 0.952, mirror flag kept |
+| 70 frames (one test window), Auto | AV1 planned at CRF 44, every chunk encoded twice: 37.4%, 19.6 s | CRF 22.3: 46.8%, 17.0 s |
+| 5.1 PCM audio | failed after the encode | stereo Opus |
+| ALAC audio | failed after the encode | no audio, with a note before Compress |
+| 3 s clip in WebKit 26.6 | failed at once | H.264, 49.6%, SSIM 0.982 |
 
 ## Where the time goes
 

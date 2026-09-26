@@ -47,14 +47,17 @@ What Pare does instead:
   its quality setting from what the finished chunks actually cost, and the final file is weighed. If it isn't at
   least 50% smaller, the busiest chunks are encoded again.
 - **Every frame is scored.** x264 computes SSIM for each frame against its input as it encodes. The result screen
-  reports the average and the worst frame, and opens a side-by-side view on the weakest ones.
+  reports the average and the worst frame, and opens a side-by-side view on the weakest ones. Those side-by-side
+  frames, drawn as a player draws them, are checked against the encoder's scores, so a file that went wrong between
+  the source and the encoder (wrong bit depth, colours or orientation) can't pass as identical.
 - **AV1, with SIMD.** SVT-AV1 is compiled to WebAssembly with its x86 SIMD kernels translated automatically, the worst
   emulations replaced, and the motion-search kernels rewritten for WebAssembly (`av1-wasm/`). Its output is
   byte-identical to native SVT-AV1. At the same size it scores about a point higher than x264 on ordinary footage and
   3 to 7 points higher on noisy footage, and it encodes about half as fast.
 - **HDR stays HDR.** A 10-bit HDR video (HLG or PQ) is encoded as 10-bit AV1 with its colour tags, when the device
   decodes 10-bit AV1. Before, it was rounded to 8 bits: on a 5-second HLG clip the new file is the same size and 3.3 dB
-  closer to the source.
+  closer to the source. The bit depth comes from a decoded frame, not the file's tags: an 8-bit HLG video stays 8-bit
+  HLG.
 - **Auto picks the format by measuring.** Pare compiles Netflix's libvmaf to WebAssembly too (`vmaf-wasm/`). The size
   plan's test encodes are decoded and scored with VMAF NEG in the browser. AV1 is used when it looks at least a point
   better at the target size and the device can play it, or when it's the only way to halve the file. On the test
@@ -149,7 +152,11 @@ The script clones x264 at the commit in `x264-wasm/X264_COMMIT`, applies `x264-s
 - The head start uses the CPU while the settings are on screen; changing a setting stops it.
 - Threads need a cross-origin isolated page (the site sends COOP and COEP headers). Without them, or if the threaded
   build fails to start, each encoder runs on one thread.
-- Needs a browser with WebCodecs and WebAssembly SIMD: current Chrome, Edge, Firefox, or Safari 17 and later.
+- Audio an MP4 can't carry is converted to AAC or Opus, mixed down to stereo if the browser's encoder needs that. When
+  the browser can't decode or encode it at all, the settings say so before Compress and the copy has no audio.
+- Needs a browser with WebCodecs and WebAssembly SIMD. Tested in Chrome, and in WebKit 26.6 (Safari's engine) on
+  Linux, where it works but plans about three times slower and can't decode AV1. Firefox and Safari on a Mac haven't
+  been tried.
 
 ## License
 

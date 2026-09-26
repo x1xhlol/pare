@@ -11,7 +11,7 @@ NAMES = {
     'gopro.mp4': 'Camera footage, 1080p30, 10 s',
     'screen.mp4': 'Screen recording, 1080p30, 8 s',
     'bbb30.mp4': 'Big Buck Bunny, 1080p30, 10 s',
-    'phone_pcm.mov': 'Phone clip with PCM audio, 1080p50, 10 s',
+    'phone_pcm.mov': 'Phone clip with PCM audio, 1080p25, 20 s',
     'mix.mp4': 'Phone clips, 1080p50, 20 s',
     'town.mp4': 'town, 25 Mbps re-encode, 1080p50, 5 s',
     'tree.mp4': 'tree, same, 5 s',
