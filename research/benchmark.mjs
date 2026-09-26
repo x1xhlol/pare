@@ -3,10 +3,11 @@
 //
 //   URL=http://localhost:4173 OUT=/tmp/bench TAG=now node research/benchmark.mjs clip.mp4 ...
 //   CODEC=auto|avc|av1 (the Format setting; default Auto), ENGINE=fast (the browser's encoder), NOLIMIT=1 (no size
-//   target), CORES=n (pretend core count), CLICK_AFTER=seconds after the file loads (default 1), RES=720 (short side)
+//   target), CORES=n (pretend core count), CLICK_AFTER=seconds after the file loads (default 1), RES=720 (short side),
+//   BROWSER=webkit (Playwright's WebKit build instead of Chrome)
 //
 // Prints one JSON line per video: seconds, sizes, the app's quality line, and the encoder log.
-import { chromium } from 'playwright-core'
+import { chromium, webkit } from 'playwright-core'
 import fs from 'node:fs'
 import path from 'node:path'
 
@@ -17,7 +18,9 @@ const codec = process.env.CODEC ?? 'auto'
 const chrome = process.env.CHROME ?? `${process.env.HOME}/.cache/ms-playwright/chromium-1243/chrome-linux64/chrome`
 fs.mkdirSync(out, { recursive: true })
 
-const browser = await chromium.launch({ executablePath: chrome, headless: true })
+const browser = process.env.BROWSER === 'webkit'
+  ? await webkit.launch({ headless: true })
+  : await chromium.launch({ executablePath: chrome, headless: true })
 for (const file of process.argv.slice(2)) {
   const page = await browser.newPage({ viewport: { width: 1280, height: 900 } })
   if (process.env.CORES)
@@ -49,7 +52,15 @@ for (const file of process.argv.slice(2)) {
   const estimate = (await page.textContent('.estimate-value')).trim()
   const clicked = Date.now()
   await page.click('button[type=submit]')
-  await page.waitForSelector('.result', { timeout: 1800000 })
+  // A failed compression goes back to the settings with an error instead of showing a result.
+  await page.waitForSelector('.result, p.error[role=alert]', { timeout: 1800000 })
+  const failed = await page.$('p.error[role=alert]')
+  if (failed) {
+    console.log(JSON.stringify({ tag, source: file, failed: (await failed.textContent()).trim(),
+      seconds: (Date.now() - clicked) / 1000, log }))
+    await page.close()
+    continue
+  }
   const seconds = (Date.now() - clicked) / 1000
   const fromLoad = (Date.now() - loaded) / 1000
   const kicker = (await page.textContent('.result-kicker')).replace(/\s+/g, ' ').trim()

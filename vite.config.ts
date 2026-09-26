@@ -24,8 +24,23 @@ function preloadFonts(): Plugin {
 // Cross-origin isolation lets the encoder use SharedArrayBuffer, and with it x264's own threads.
 const isolation = { 'Cross-Origin-Opener-Policy': 'same-origin', 'Cross-Origin-Embedder-Policy': 'require-corp' }
 
+/**
+ * The preview server answers revalidations with a bare 304, without the isolation headers, and Safari (WebKit) then
+ * refuses the worker script it asked about. Vercel serves assets as immutable, so browsers there don't ask again.
+ */
+function noRevalidation(): Plugin {
+  const strip = (req: { headers: Record<string, unknown> }) => {
+    delete req.headers['if-none-match']
+    delete req.headers['if-modified-since']
+  }
+  return {
+    name: 'no-revalidation',
+    configurePreviewServer: (server) => void server.middlewares.use((req, _res, next) => (strip(req), next())),
+  }
+}
+
 export default defineConfig({
-  plugins: [react(), preloadFonts()],
+  plugins: [react(), preloadFonts(), noRevalidation()],
   worker: { format: 'es' },
   server: { headers: isolation },
   preview: { headers: isolation },

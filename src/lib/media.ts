@@ -20,10 +20,13 @@ import {
   type AudioCodec,
   type ConversionAudioOptions,
   type ConversionVideoOptions,
+  type InputAudioTrack,
   type InputVideoTrack,
 } from 'mediabunny'
 import { lumaOf, psnr, ssim } from './metrics'
-import { deepFormat, even, outputSize, playsAv1, type OutputCodec, type Preset, type Probe, type Settings } from './shared'
+import {
+  deepFormat, even, MP4_AUDIO, outputSize, playsAv1, type AudioPlan, type OutputCodec, type Preset, type Probe, type Settings,
+} from './shared'
 
 type EncodingPreset = Exclude<Preset, 'copy'>
 
@@ -56,7 +59,7 @@ export async function probeFile(file: File): Promise<Probe> {
     const video = await input.getPrimaryVideoTrack()
     if (!video) throw new Error('This file has no video track.')
 
-    const [format, duration, videoCodec, width, height, canDecode, tags, stats] = await Promise.all([
+    const [format, duration, videoCodec, width, height, decodable, tags, stats] = await Promise.all([
       input.getFormat(),
       input.computeDuration(),
       video.getCodec(),
@@ -67,7 +70,9 @@ export async function probeFile(file: File): Promise<Probe> {
       video.computePacketStats(),
     ])
     const firstTimestamp = Math.max(0, await video.getFirstTimestamp())
-    const frame = canDecode ? await firstFrame(video, firstTimestamp) : null
+    const frame = decodable ? await firstFrame(video, firstTimestamp) : null
+    // A browser can call a codec supported and still fail on every frame (WebKit on Linux with 10-bit AV1).
+    const canDecode = !!frame
     // TypeScript's DOM types lag the WebCodecs spec, which has 'pq' and 'hlg'.
     const isHdr = (c?: VideoColorSpaceInit) => ['pq', 'hlg'].includes(c?.transfer as string)
     const colorSpace = !tags.transfer && isHdr(frame?.colorSpace) ? frame!.colorSpace : tags
@@ -76,14 +81,7 @@ export async function probeFile(file: File): Promise<Probe> {
     const playsHdrAv1 = hdr && deepFormat(frame?.format) && (await playsAv1(width, height, fps, true))
 
     const audioTrack = await input.getPrimaryAudioTrack()
-    const audio = audioTrack
-      ? {
-          codec: await audioTrack.getCodec(),
-          bitrate: (await audioTrack.computePacketStats(500)).averageBitrate,
-          channels: await audioTrack.getNumberOfChannels(),
-          sampleRate: await audioTrack.getSampleRate(),
-        }
-      : null
+    const audio = audioTrack ? await describeAudio(audioTrack) : null
 
     const encodable = Object.fromEntries(
       await Promise.all(
@@ -118,6 +116,33 @@ export async function probeFile(file: File): Promise<Probe> {
   } finally {
     input.dispose()
   }
+}
+
+async function describeAudio(track: InputAudioTrack) {
+  const [codec, stats, channels, sampleRate] = await Promise.all([
+    track.getCodec(), track.computePacketStats(500), track.getNumberOfChannels(), track.getSampleRate(),
+  ])
+  return { codec, bitrate: stats.averageBitrate, channels, sampleRate, plan: await planAudio(track, codec, channels, sampleRate) }
+}
+
+/**
+ * Copy the audio when an MP4 can carry it. Otherwise encode it as the source has it, in AAC or else Opus, and failing
+ * that as stereo, then at 48 kHz: Chrome on Linux has no AAC encoder and its Opus encoder stops at 2 channels, so 5.1
+ * PCM from a camera used to fail after the whole video was encoded.
+ */
+async function planAudio(track: InputAudioTrack, codec: AudioCodec | null, channels: number, sampleRate: number):
+  Promise<AudioPlan> {
+  if (codec && MP4_AUDIO.includes(codec)) return { kind: 'copy' }
+  if (!(await track.canDecode().catch(() => false))) return { kind: 'drop', reason: 'decode' }
+  const stereo = Math.min(2, channels)
+  for (const [ch, rate] of [[channels, sampleRate], [stereo, sampleRate], [stereo, 48000]])
+    for (const out of ['aac', 'opus'] as const) {
+      // 96 kbps per channel is transparent for AAC and Opus alike.
+      const bitrate = Math.min(256_000, 96_000 * ch)
+      if (await canEncodeAudio(out, { numberOfChannels: ch, sampleRate: rate, bitrate }).catch(() => false))
+        return { kind: 'encode', codec: out, channels: ch, sampleRate: rate, bitrate }
+    }
+  return { kind: 'drop', reason: 'encode' }
 }
 
 /** The first frame's pixel format, visible size (turned to display orientation) and colour space. */
@@ -159,9 +184,11 @@ function videoOptions(probe: Probe, settings: Settings, bitrate: number): Conver
 
 async function audioOptions(probe: Probe, settings: Settings): Promise<ConversionAudioOptions> {
   if (!settings.keepAudio) return { discard: true }
-  if (settings.preset === 'copy' || !isPcm(probe.audio?.codec ?? null)) return {}
-  const codec: AudioCodec = (await canEncodeAudio('aac')) ? 'aac' : 'opus'
-  return { codec, quality: new Quality('high') }
+  const plan = probe.audio?.plan
+  if (settings.preset === 'copy' || !plan || plan.kind === 'copy') return {}
+  if (plan.kind === 'drop') return { discard: true }
+  return { codec: plan.codec, numberOfChannels: plan.channels, sampleRate: plan.sampleRate,
+    quality: new Quality({ bitrate: plan.bitrate }) }
 }
 
 function audioBytes(probe: Probe, settings: Settings) {

@@ -12,10 +12,9 @@ import {
   Mp4OutputFormat,
   Output,
   QTFF,
+  Quality,
   StreamTarget,
   WEBM,
-  canEncodeAudio,
-  type AudioCodec,
 } from 'mediabunny'
 import singleScript from './x264/x264.mjs?url'
 import singleWasm from './x264/x264.wasm?url'
@@ -308,14 +307,14 @@ async function audioPackets(file: Blob) {
 
 /**
  * Bytes of the output outside its video stream. Copied audio is counted exactly; a transcode by its bitrate plus 10%,
- * since encoders overshoot a little (the PCM clip's AAC came out 4% over). The container is an upper bound from Pare's
+ * since encoders overshoot a little (the PCM clip's Opus came out 4% over). The container is an upper bound from Pare's
  * own files: about 1.3 KB of boxes, then 4-5.5 bytes per AV1 frame and 13 per H.264 frame (sizes, and timing offsets
  * for B-frames), up to 20 with variable frame timing, and about 4 per audio packet. The flat 64 KB this replaces took
  * 1.3-1.9% off a 3-5 MB file's limit, which sent every small AV1 encode to a second pass.
  */
 function besidesVideo(probe: Probe, settings: Settings, frames: number, audio: { bytes: number; count: number }) {
-  const kept = settings.keepAudio && probe.audio
-  const copied = kept && !!probe.audio!.codec && MP4_AUDIO.includes(probe.audio!.codec)
+  const kept = settings.keepAudio && !!probe.audio && probe.audio.plan.kind !== 'drop'
+  const copied = kept && probe.audio!.plan.kind === 'copy'
   const audioOut = !kept ? 0 : copied ? audio.bytes : audioBytes(probe, settings) * 1.1
   // AAC and Opus both make about 50 packets a second.
   const packets = !kept ? 0 : copied ? audio.count : Math.ceil(probe.duration * 50)
@@ -642,8 +641,6 @@ function planAround({ times }: Timeline, workers: number, done: (Omit<Reusable, 
   return { chunks, reused }
 }
 
-const MP4_AUDIO: AudioCodec[] = ['aac', 'opus', 'mp3', 'ac3', 'eac3', 'flac']
-
 async function mux(probe: Probe, settings: Settings, chunks: EncodedChunk[], size: { width: number; height: number },
                    { rotation, flip }: Orientation) {
   const parts: Uint8Array<ArrayBuffer>[] = []
@@ -664,16 +661,15 @@ async function mux(probe: Probe, settings: Settings, chunks: EncodedChunk[], siz
 
   const input = new Input({ source: new BlobSource(probe.file), formats: [MP4, QTFF, WEBM, MATROSKA] })
   try {
-    const audioTrack = settings.keepAudio ? await input.getPrimaryAudioTrack() : null
+    const plan = settings.keepAudio ? probe.audio?.plan : undefined
+    const audioTrack = plan && plan.kind !== 'drop' ? await input.getPrimaryAudioTrack() : null
     const audioCodec = audioTrack ? await audioTrack.getCodec() : null
-    const copyAudio = !!audioCodec && MP4_AUDIO.includes(audioCodec)
-    const audioCopy = audioTrack && copyAudio ? new EncodedAudioPacketSource(audioCodec!) : null
-    // 96 kbps per channel is transparent for AAC and Opus alike.
-    const channels = audioTrack ? await audioTrack.getNumberOfChannels() : 2
-    const audioEncode = audioTrack && !copyAudio
+    const audioCopy = audioTrack && plan?.kind === 'copy' ? new EncodedAudioPacketSource(audioCodec!) : null
+    const audioEncode = audioTrack && plan?.kind === 'encode'
       ? new AudioSampleSource({
-          codec: (await canEncodeAudio('aac')) ? 'aac' : 'opus',
-          bitrate: Math.min(256_000, 96_000 * Math.max(1, channels)),
+          codec: plan.codec,
+          quality: new Quality({ bitrate: plan.bitrate }),
+          transform: { numberOfChannels: plan.channels, sampleRate: plan.sampleRate },
         })
       : null
     if (audioCopy) output.addAudioTrack(audioCopy)
@@ -868,10 +864,9 @@ function localSlope(points: { crf: number; bytes: number }[], crf: number, total
 }
 
 function audioBytes(probe: Probe, settings: Settings) {
-  if (!settings.keepAudio || !probe.audio) return 0
-  const bps = probe.audio.codec && MP4_AUDIO.includes(probe.audio.codec) ? probe.audio.bitrate
-    : Math.min(256_000, 96_000 * Math.max(1, probe.audio.channels ?? 2))
-  return (bps * probe.duration) / 8
+  const plan = probe.audio?.plan
+  if (!settings.keepAudio || !plan || plan.kind === 'drop') return 0
+  return ((plan.kind === 'copy' ? probe.audio!.bitrate : plan.bitrate) * probe.duration) / 8
 }
 
 /** The rate factor an encode starts from, and the lowest it may go: the quality ceiling or the preset's own. */

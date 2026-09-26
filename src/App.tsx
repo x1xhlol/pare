@@ -6,7 +6,7 @@ import * as fmt from './lib/format'
 import type { Calibration, Job, QualityReport } from './lib/media'
 import type { Progress, SizePlan } from './lib/x264'
 import {
-  CODEC_LABEL, copiesFrames, deepFormat, keepsHdr, outputSize, type Engine, type OutputCodec, type Preset, type Probe,
+  CODEC_LABEL, codecName, copiesFrames, deepFormat, keepsHdr, outputSize, type Engine, type OutputCodec, type Preset, type Probe,
   type Settings,
 } from './lib/shared'
 
@@ -712,7 +712,7 @@ function FileSummary({ probe, onReplace }: { probe: Probe; onReplace?: () => voi
           </div>
           <div>
             <dt>Audio</dt>
-            <dd>{probe.audio ? CODEC_LABEL[probe.audio.codec ?? ''] ?? probe.audio.codec ?? 'Unknown' : 'None'}</dd>
+            <dd>{probe.audio ? codecName(probe.audio.codec) : 'None'}</dd>
           </div>
         </dl>
         {onReplace && (
@@ -775,6 +775,23 @@ function Ready(props: {
     () => settings.engine !== 'thorough' || !settings.autoCodec || settings.shortSide !== null || !settings.keepAudio,
   )
   const thoroughName = (c: 'avc' | 'av1') => (c === 'av1' ? 'SVT-AV1' : 'x264')
+  const audioNote = () => {
+    const audio = probe.audio
+    if (!audio) return 'This video has no audio.'
+    const plan = audio.plan
+    if (copy || !settings.keepAudio || plan.kind === 'copy') return undefined
+    const name = audio.codec ? `${codecName(audio.codec)} audio` : 'this video’s audio'
+    if (plan.kind === 'drop')
+      return plan.reason === 'decode'
+        ? `This browser can’t decode ${name}, so the copy will be silent.`
+        : 'This browser can’t encode audio, so the copy will be silent.'
+    const changes = [
+      plan.channels < audio.channels && `mixed down to ${plan.channels === 1 ? 'mono' : 'stereo'}`,
+      plan.sampleRate !== audio.sampleRate && `at ${plan.sampleRate / 1000} kHz`,
+    ].filter(Boolean)
+    const converted = `is converted to ${CODEC_LABEL[plan.codec]}${changes.length ? `, ${changes.join(' and ')}` : ''}.`
+    return audio.codec ? `${name} ${converted}` : `This video’s audio ${converted}`
+  }
   const hdrNote = () => {
     // Resized frames, and frames in a format the encoders don't take as they are, go through an SDR canvas.
     if (settings.engine === 'fast' || !copiesFrames(probe, settings))
@@ -794,7 +811,7 @@ function Ready(props: {
           : thoroughName(thoroughCodec(settings))
         : `Browser ${CODEC_LABEL[settings.codec]}`,
     copy || !settings.shortSide ? 'Original resolution' : `${settings.shortSide}p`,
-    !probe.audio ? 'No audio' : settings.keepAudio ? 'Audio kept' : 'Audio removed',
+    !probe.audio ? 'No audio' : settings.keepAudio && probe.audio.plan.kind !== 'drop' ? 'Audio kept' : 'Audio removed',
   ].join(' · ')
 
   return (
@@ -879,7 +896,7 @@ function Ready(props: {
               ]}
               disabled={!probe.audio}
               onChange={(v) => setSettings((s) => ({ ...s, keepAudio: v === 'keep' }))}
-              hint={!probe.audio ? 'This video has no audio.' : undefined}
+              hint={audioNote()}
             />
           </div>
         </details>

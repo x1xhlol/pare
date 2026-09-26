@@ -42,10 +42,22 @@ export type Probe = {
   frame: { format: VideoSamplePixelFormat | null; width: number; height: number } | null
   /** Whether this device decodes 10-bit AV1 at the source's size smoothly (only asked for 10-bit HDR sources). */
   playsHdrAv1: boolean
-  audio: { codec: AudioCodec | null; bitrate: number; channels: number; sampleRate: number } | null
+  audio: { codec: AudioCodec | null; bitrate: number; channels: number; sampleRate: number; plan: AudioPlan } | null
   poster: string | null
   encodable: Record<OutputCodec, boolean>
 }
+
+/** Audio codecs an MP4 can carry as they are. */
+export const MP4_AUDIO: AudioCodec[] = ['aac', 'opus', 'mp3', 'ac3', 'eac3', 'flac']
+
+/**
+ * What Pare's own encoders do with the audio, decided when the file is opened so a compression can't fail at the end:
+ * copy it, encode it (mixed down or resampled where this browser's encoder needs that), or leave it out.
+ */
+export type AudioPlan =
+  | { kind: 'copy' }
+  | { kind: 'encode'; codec: 'aac' | 'opus'; channels: number; sampleRate: number; bitrate: number }
+  | { kind: 'drop'; reason: 'decode' | 'encode' }
 
 export const CODEC_LABEL: Record<string, string> = {
   avc: 'H.264',
@@ -62,6 +74,10 @@ export const CODEC_LABEL: Record<string, string> = {
   ac3: 'AC-3',
   eac3: 'E-AC-3',
 }
+
+/** A codec's name for people: every PCM variant is just PCM. */
+export const codecName = (codec: string | null | undefined) =>
+  !codec ? 'Unknown' : codec.startsWith('pcm-') ? 'PCM' : (CODEC_LABEL[codec] ?? codec)
 
 export const even = (n: number) => Math.max(2, Math.round(n / 2) * 2)
 
@@ -107,8 +123,32 @@ export async function playsAv1(width: number, height: number, fps: number, tenBi
       video: { contentType: `video/mp4; codecs="av01.0.08M.${tenBit ? 10 : '08'}"`, width, height, bitrate: 8e6,
         framerate: fps || 30 },
     })
-    return info.supported && info.smooth
+    return info.supported && info.smooth && (await decodesAv1(tenBit))
   } catch {
     return false
   }
+}
+
+/** A 64×64 grey AV1 keyframe from libaom, 27 bytes; byte 12 sets the bit depth (0x20: 8, 0x28: 10). */
+const tinyAv1 = (tenBit: boolean) =>
+  Uint8Array.from(`12000a0a00000002afff9b5f${tenBit ? 28 : 20}08320b1000f8000002c000000280`.match(/../g)!, (h) => parseInt(h, 16))
+
+const decodes: Record<'8' | '10', Promise<boolean> | undefined> = { 8: undefined, 10: undefined }
+
+/**
+ * Whether AV1 actually decodes here, tried on a tiny keyframe. WebKit on Linux reports AV1 supported, 10-bit included,
+ * and fails on every frame, which would make Auto write files this browser can't play.
+ */
+function decodesAv1(tenBit: boolean) {
+  return (decodes[tenBit ? 10 : 8] ??= new Promise<boolean>((resolve) => {
+    let frames = 0
+    const decoder = new VideoDecoder({ output: (f) => (frames++, f.close()), error: () => resolve(false) })
+    try {
+      decoder.configure({ codec: `av01.0.00M.${tenBit ? 10 : '08'}` })
+      decoder.decode(new EncodedVideoChunk({ type: 'key', timestamp: 0, data: tinyAv1(tenBit) }))
+      decoder.flush().then(() => resolve(frames > 0), () => resolve(false)).finally(() => decoder.state !== 'closed' && decoder.close())
+    } catch {
+      resolve(false)
+    }
+  }))
 }

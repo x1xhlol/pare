@@ -153,6 +153,44 @@ function scratch(size: number) {
 }
 
 type Loader = (sample: VideoSample) => Promise<void>
+type Plane = { offset: number; stride: number }
+
+/**
+ * Safari won't copy a frame into a resizable buffer, which the threaded encoder's memory is ("Resizable ArrayBuffer is
+ * not allowed"). Once it refuses, frames go through a plain buffer first: one more copy each.
+ */
+let bounce = false
+
+/**
+ * Copies a frame into the encoder's memory: planes at `layout` (offsets into the heap), or packed from `base` when
+ * there's no layout. Returns the planes' layout relative to where they were written.
+ */
+async function copyFrame(frame: VideoSample, planes: Plane[] | null, base = 0, size = 0): Promise<PlaneLayout[]> {
+  if (!bounce) {
+    try {
+      return planes
+        ? await frame.copyTo(new Uint8Array(x.HEAPU8.buffer), { layout: planes })
+        : await frame.copyTo(new Uint8Array(x.HEAPU8.buffer, base, size))
+    } catch (err) {
+      if (!(err instanceof TypeError)) throw err
+      bounce = true
+    }
+  }
+  if (!planes) {
+    const plain = new Uint8Array(size)
+    const layout = await frame.copyTo(plain)
+    x.HEAPU8.set(plain, base)
+    return layout
+  }
+  // Each plane is written on its own: the gaps between them belong to other allocations.
+  const start = Math.min(...planes.map((p) => p.offset))
+  const rows = planes.map((_, i) => (i === 0 || i === 3 ? init.height : (init.height + 1) >> 1))
+  const extent = Math.max(...planes.map((p, i) => p.offset - start + p.stride * rows[i]))
+  const plain = new Uint8Array(extent)
+  const layout = await frame.copyTo(plain, { layout: planes.map((p) => ({ offset: p.offset - start, stride: p.stride })) })
+  planes.forEach((p, i) => x.HEAPU8.set(plain.subarray(p.offset - start, p.offset - start + p.stride * rows[i]), p.offset))
+  return layout
+}
 
 /** Whether a sample is the size the encoder takes, as stored (before rotation). */
 const fits = (sample: VideoSample) => sample.visibleRect.width === init.width && sample.visibleRect.height === init.height
@@ -160,7 +198,6 @@ const fits = (sample: VideoSample) => sample.visibleRect.width === init.width &&
 /** Picks the cheapest way to get this sample's pixels into the encoder. */
 function planInput(sample: VideoSample, enc: number): Loader {
   const { width, height } = init
-  const heap = () => new Uint8Array(x.HEAPU8.buffer)
   const plane = (i: number) => ({ offset: x._enc_plane(enc, i), stride: x._enc_stride(enc, i) })
 
   if (init.direct) {
@@ -172,21 +209,21 @@ function planInput(sample: VideoSample, enc: number): Loader {
       throw new Error(`The video decoded as ${sample.format ?? 'an unnamed format'} at ${sample.visibleRect.width}×` +
         `${sample.visibleRect.height}, not as planned.`)
     if (sample.format === 'NV12')
-      return async (s) => void (await s.copyTo(heap(), { layout: [plane(0), plane(1)] }))
+      return async (s) => void (await copyFrame(s, [plane(0), plane(1)]))
     if (sample.format === 'I420' || sample.format === 'I420A')
       return async (s) => {
         const layout = [plane(0), plane(1), plane(2)]
         if (s.format === 'I420A') layout.push({ offset: scratch(width * height), stride: width })
-        await s.copyTo(heap(), { layout })
+        await copyFrame(s, layout)
       }
     // A 10-bit encoder (AV1 for HDR sources) takes 10-bit frames as they are: its planes hold 16-bit samples.
     if (sample.format === 'I420P10' && tenBit)
-      return async (s) => void (await s.copyTo(heap(), { layout: [plane(0), plane(1), plane(2)] }))
+      return async (s) => void (await copyFrame(s, [plane(0), plane(1), plane(2)]))
     const bits = sample.format === 'I420P10' ? 10 : 12
     return async (s) => {
       const size = s.allocationSize()
       const base = scratch(size)
-      const layout = await s.copyTo(new Uint8Array(x.HEAPU8.buffer, base, size))
+      const layout = await copyFrame(s, null, base, size)
       const [ly, lu, lv] = layout
       x._enc_import_p16(enc, base + ly.offset, base + lu.offset, base + lv.offset,
         ly.stride / 2, lu.stride / 2, lv.stride / 2, width, height, bits)
@@ -204,7 +241,7 @@ function planInput(sample: VideoSample, enc: number): Loader {
     try {
       const size = resized.allocationSize()
       const base = scratch(size)
-      const [layout] = await resized.copyTo(new Uint8Array(x.HEAPU8.buffer, base, size))
+      const [layout] = await copyFrame(resized, null, base, size)
       const bgr = resized.format === 'BGRA' || resized.format === 'BGRX' ? 1 : 0
       x._enc_import_rgba(enc, base + layout.offset, layout.stride, width, height, bgr)
     } finally {
