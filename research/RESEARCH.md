@@ -570,6 +570,57 @@ byte-identical. Big Buck Bunny's decoding went from 4.5 to 3.0 s per encoder and
 HEVC's non-reference types are only non-reference within their temporal sub-layer, so HEVC sources decode everything
 as before.
 
+## Cheaper keyframes for AV1's chunks
+
+Every chunk Pare encodes in parallel starts with a keyframe, so the decoder can start there. For x264 that costs a
+few percent. For SVT-AV1 it costs far more. `research/av1_chunks.py` encodes the first 192 frames of a clip as
+back-to-back chunks of L frames with native SVT-AV1 (preset 8, one thread, as in Pare), joins them, and scores the
+result against the source:
+
+| Chunk length | town | park | Big Buck Bunny |
+| --- | --- | --- | --- |
+| 24 | +31.2% | +3.8% | +53.2% |
+| 32 | +23.3% | +1.1% | +35.9% |
+| 33 | +23.5% | +5.7% | +36.9% |
+| 48 | +12.9% | +0.7% | +16.3% |
+| 64 | +9.1% | +0.4% | +9.4% |
+| 96 | +4.1% | +0.4% | −0.4% |
+| 192 (one chunk) | 0 | 0 | 0 |
+
+(BD-rate on VMAF NEG against one 192-frame encode, CRF 22-38.) A 5-second 1080p50 clip on 8 encoders gets
+31-frame chunks, so AV1 spends about a quarter more bits than it would in one piece on footage like town, and a
+third more on animation, which is most of its advantage over x264. Park barely notices: its inter frames are nearly
+as expensive as a keyframe. One frame past a whole 32-frame mini-GOP costs extra too (33 against 32, 49 against 48,
+65 against 64), a small effect next to the keyframes.
+
+SVT-AV1 sets keyframe quality for GOPs of about five seconds, where a keyframe is referenced for a long time. In a
+32-frame chunk it isn't, so a coarser keyframe should pay. SVT's `--key-frame-qindex-offset` does nothing on its own;
+with `--use-fixed-qindex-offsets 2` it adds to the rate control's own choice instead of replacing it:
+
+| Keyframe qindex offset | town | park | Big Buck Bunny | tree |
+| --- | --- | --- | --- | --- |
+| −8, 32-frame chunks | +5.1% | +0.9% | +5.1% | |
+| +8 | −3.0% | −0.6% | −2.4% | |
+| +16 | −5.1% | −1.4% | −3.1% | −5.0% |
+| **+24** | **−6.1%** | **−1.9%** | **−3.4%** | **−5.9%** |
+| +40 | −6.3% | −2.7% | −0.9% | |
+| +16, 96-frame chunks | −2.2% | −0.2% | −1.1% | −1.8% |
+| +24, 96-frame chunks | −2.6% | −0.4% | −0.8% | −2.4% |
+
++24 ships, for every AV1 encode and AV1's test windows alike. In the browser, town at CRF 18 in 8 chunks came out 6.3%
+smaller (13.14 → 12.32 MB) for 0.06 less VMAF NEG (95.31 → 95.25). Also tried on 32-frame chunks: keyframe temporal
+filtering off (+1.8% to +6.0%, worse), and a smaller first mini-GOP after the keyframe (`--startup-mg-size 3`: −2.9%
+on town, +0.2% on Big Buck Bunny, and no better on top of the keyframe offset).
+
+## Every encoder from the start
+
+The chunk planner looks for the smallest per-chunk cost that covers the video in as many chunks as there are
+encoders, and it bisected for it. But a limit can fail where a lower one works: a remainder under 15 frames joins
+the chunk before it, and that chunk then goes over. So 250 frames came out as 7 chunks for 8 encoders, and 240 frames
+as 6, leaving encoders idle until the end-of-encode cuts. The planner now steps up from the lower bound instead. Over
+2,848 simulated clip lengths and keyframe spacings it was never worse and gave a lower longest chunk in 38% of them
+(240 frames with a keyframe every 60: 41.7 → 31.0 frames' worth of work). AV1 on town went from 7 encoders to 8.
+
 ## End to end in the browser
 
 Same headless Chrome, same files, production builds:

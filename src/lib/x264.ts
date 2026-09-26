@@ -199,7 +199,11 @@ const AV1: Profile = {
   // 30 ms to decode, 430 ms to encode.
   decodeShare: 0.065,
   options: (crf, color) => {
-    const options = ['8', '', `crf=${crf.toFixed(2)}`, 'ssim=1']
+    // Each chunk starts with a keyframe, and SVT-AV1 prices keyframes for long GOPs: coded as 32-frame chunks, town
+    // took 23% more bits than as one encode for the same VMAF NEG, and Big Buck Bunny 36%. Keyframes 24 quantizer
+    // steps coarser (on top of SVT's own rate control) took 1.9-6.1% off at 32 frames and 0.4-2.6% at 96, on town,
+    // tree, park and Big Buck Bunny (research/RESEARCH.md, "Cheaper keyframes for AV1's chunks").
+    const options = ['8', '', `crf=${crf.toFixed(2)}`, 'ssim=1', 'use-fixed-qindex-offsets=2', 'key-frame-qindex-offset=24']
     if (color.primaries && SVT_PRIMARIES[color.primaries]) options.push(`color-primaries=${SVT_PRIMARIES[color.primaries]}`)
     if (color.transfer && SVT_TRANSFER[color.transfer]) options.push(`transfer-characteristics=${SVT_TRANSFER[color.transfer]}`)
     if (color.matrix && SVT_MATRIX[color.matrix]) options.push(`matrix-coefficients=${SVT_MATRIX[color.matrix]}`)
@@ -515,17 +519,18 @@ function planChunks({ times, keys }: Timeline, workers: number, decodeShare: num
     }
     return firsts
   }
-  // The smallest per-chunk cost that covers the video in n chunks.
-  let lo = total / n
-  let hi = total / n + decodeShare * lead.reduce((a, b) => Math.max(a, b), 0) + 16
-  while (hi - lo > 0.5) {
-    const mid = (lo + hi) / 2
-    const firsts = split(mid)
+  const covers = (limit: number) => {
+    const firsts = split(limit)
     const last = firsts[firsts.length - 1]
-    if (firsts.length <= n && total - last + decodeShare * lead[last] <= mid) hi = mid
-    else lo = mid
+    return firsts.length <= n && total - last + decodeShare * lead[last] <= limit
   }
-  const firsts = split(hi)
+  // The smallest per-chunk cost that covers the video in n chunks. It has to be stepped up to, not bisected: a short
+  // remainder joins the chunk before it, so a limit can fail where a lower one works. Bisecting left 250 frames in 7
+  // chunks for 8 encoders, and 240 frames in 6.
+  const most = total / n + decodeShare * lead.reduce((a, b) => Math.max(a, b), 0) + 16
+  let limit = total / n
+  while (limit < most && !covers(limit)) limit += 0.25
+  const firsts = split(Math.min(limit, most))
   return firsts.map((first, index) => ({
     type: 'chunk',
     index,
