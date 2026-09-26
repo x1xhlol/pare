@@ -793,7 +793,8 @@ function Ready(props: {
     return audio.codec ? `${name} ${converted}` : `This video’s audio ${converted}`
   }
   const hdrNote = () => {
-    // Resized frames, and frames in a format the encoders don't take as they are, go through an SDR canvas.
+    // Frames the encoders can't take as planes (Firefox's RGB, 4:2:2, 4:4:4) go through an SDR canvas, as does the
+    // browser's own encoder.
     if (settings.engine === 'fast' || !copiesFrames(probe))
       return 'This is an HDR video. The compressed copy is SDR, so highlights and colors may look flatter.'
     if (!deepFormat(probe.frame?.format)) return 'This is an HDR video in 8 bits. The copy stays HDR.'
