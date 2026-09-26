@@ -52,7 +52,8 @@ What Pare does instead:
   its quality setting from what the finished chunks actually cost, and the final file is weighed. If it isn't at
   least 50% smaller, the busiest chunks are encoded again.
 - **Every frame is scored.** x264 computes SSIM for each frame against its input as it encodes. The result screen
-  reports the average and the worst frame, and opens a side-by-side view on the weakest ones. Those side-by-side
+  reports the average and the worst frame, plots every frame's score across the video so the dips are easy to find,
+  and opens a side-by-side view on the weakest ones. Those side-by-side
   frames, drawn as a player draws them, are checked against the encoder's scores, so a file that went wrong between
   the source and the encoder (wrong bit depth, colours or orientation) can't pass as identical.
 - **AV1, with SIMD.** SVT-AV1 is compiled to WebAssembly with its x86 SIMD kernels translated automatically, the worst

@@ -15,7 +15,67 @@ function Bitmap({ bitmap, className, width }: { bitmap: ImageBitmap; className?:
   return <canvas ref={ref} className={className} />
 }
 
-export function Compare({ frames }: { frames: FramePair[] }) {
+type Point = { time: number; ssim: number }
+
+/**
+ * The encoder's SSIM for every frame across the video: a line along the top means identical, dips are where it
+ * compressed hardest. The sampled frames are marked, and picking a point opens the nearest one.
+ */
+function Timeline({ points, frames, index, onPick }: {
+  points: Point[]
+  frames: FramePair[]
+  index: number
+  onPick: (index: number) => void
+}) {
+  const end = Math.max(points[points.length - 1].time, ...frames.map((f) => f.time)) || 1
+  const lowest = points.reduce((a, b) => (b.ssim < a.ssim ? b : a))
+  // The deepest dip reaches the bottom, but a spread under 0.02 isn't blown up to look dramatic.
+  const range = Math.max(0.02, 1 - lowest.ssim)
+  const x = (t: number) => (t / end) * 1000
+  const y = (s: number) => 4 + ((1 - s) / range) * 56
+  const line = points.map((p) => `${x(p.time).toFixed(1)},${y(p.ssim).toFixed(1)}`).join(' ')
+  const pick = (e: PointerEvent<SVGSVGElement>) => {
+    const rect = e.currentTarget.getBoundingClientRect()
+    const time = ((e.clientX - rect.left) / rect.width) * end
+    onPick(frames.reduce((best, f, i) => (Math.abs(f.time - time) < Math.abs(frames[best].time - time) ? i : best), 0))
+  }
+  return (
+    <figure className="timeline">
+      <div className="timeline-plot">
+        <svg
+          viewBox="0 0 1000 64"
+          preserveAspectRatio="none"
+          role="img"
+          aria-label={`SSIM of every frame, from ${lowest.ssim.toFixed(3)} at ${duration(lowest.time)} to 1.000`}
+          onPointerDown={pick}
+        >
+          <polygon className="timeline-loss" points={`0,4 ${line} 1000,4`} />
+          <polyline className="timeline-line" points={line} vectorEffect="non-scaling-stroke" />
+          {frames.map((f, i) => (
+            <line
+              key={f.time}
+              className="timeline-mark"
+              data-current={i === index || undefined}
+              x1={x(f.time)}
+              x2={x(f.time)}
+              y1={0}
+              y2={64}
+              vectorEffect="non-scaling-stroke"
+            />
+          ))}
+        </svg>
+      </div>
+      <figcaption className="timeline-caption">
+        <span>SSIM of every frame</span>
+        <span>
+          lowest {lowest.ssim.toFixed(3)} at {duration(lowest.time)}
+        </span>
+      </figcaption>
+    </figure>
+  )
+}
+
+export function Compare({ frames, timeline }: { frames: FramePair[]; timeline?: Point[] }) {
   const [index, setIndex] = useState(() => frames.reduce((w, f, i) => (f.ssim < frames[w].ssim ? i : w), 0))
   const [split, setSplit] = useState(50)
   const [actual, setActual] = useState(false)
@@ -84,6 +144,8 @@ export function Compare({ frames }: { frames: FramePair[] }) {
           </div>
         </div>
       </div>
+
+      {timeline && timeline.length > 1 && <Timeline points={timeline} frames={frames} index={index} onPick={setIndex} />}
 
       <div className="strip" role="group" aria-label="Sampled frames">
         {frames.map((f, i) => (

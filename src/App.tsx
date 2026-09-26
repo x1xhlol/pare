@@ -1137,7 +1137,7 @@ function Done(props: {
           </button>
         </div>
       </div>
-      {typeof quality === 'object' && <Compare frames={quality.frames} />}
+      {typeof quality === 'object' && <Compare frames={quality.frames} timeline={quality.timeline} />}
     </section>
   )
 }

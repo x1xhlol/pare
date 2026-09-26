@@ -510,6 +510,8 @@ export type QualityReport = {
   scored: number
   psnr: number
   frames: FramePair[]
+  /** The encoder's SSIM across the video (seconds from its start), each point the lowest of its stretch. */
+  timeline?: { time: number; ssim: number }[]
   /**
    * The side-by-side frames scored well below what the encoder measured on the same frames, so the headline numbers
    * are theirs: something between the source and the encoder's input went wrong (bit depth, colours, orientation).
@@ -523,6 +525,19 @@ export type QualityReport = {
  * against the encoder's 0.2081 on noisy, 0.0300 against 0.0194 on Jellyfish. A mirrored file showed 0.81 against 0.02.
  */
 const MISMATCH = 0.02
+
+/** Per-frame scores in time order, at most `count` points, each the lowest of its stretch so that dips still show. */
+function timelineOf(scores: { times: number[]; ssim: number[] }, first: number, count = 400) {
+  const order = scores.times.map((_, i) => i).sort((a, b) => scores.times[a] - scores.times[b])
+  const size = Math.ceil(order.length / count)
+  const points: { time: number; ssim: number }[] = []
+  for (let i = 0; i < order.length; i += size) {
+    const stretch = order.slice(i, i + size)
+    const low = stretch.reduce((a, b) => (scores.ssim[b] < scores.ssim[a] ? b : a))
+    points.push({ time: scores.times[low] - first, ssim: scores.ssim[low] })
+  }
+  return points
+}
 
 /** Frames to show side by side: the worst-scoring ones (kept apart from each other) plus an even spread. */
 function pickFrames(probe: Probe, scores: { times: number[]; ssim: number[] } | undefined, count: number) {
@@ -605,7 +620,10 @@ export async function measureQuality(
       `same ${pairs.length} frames (median excess loss ${median.toFixed(4)})`)
     if (median > MISMATCH)
       return { ssim: mean(pairs), min: Math.min(...pairs), scored: pairs.length, psnr: psnrMean, frames, mismatch: true }
-    return { ssim: mean(scores.ssim), min: Math.min(...scores.ssim), scored: scores.ssim.length, psnr: psnrMean, frames }
+    // The two agree, so the frames show the encoder's scores too: one measure everywhere on the result screen.
+    const same = frames.map((f, i) => ({ ...f, ssim: encoder[i] }))
+    return { ssim: mean(scores.ssim), min: Math.min(...scores.ssim), scored: scores.ssim.length, psnr: psnrMean,
+      frames: same, timeline: timelineOf(scores, probe.firstTimestamp) }
   } finally {
     source.dispose()
     encoded.dispose()
