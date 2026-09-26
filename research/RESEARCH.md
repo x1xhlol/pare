@@ -496,6 +496,34 @@ landed within 2% and 6% with no second encode (31.3 → 27.0 s, 32.9 → 27.8 s)
 Auto's VMAF scoring used to hold the plan up by 3 to 4 s per round. Workers now hand each test encode over first and
 score it afterwards, from copies, so a compression can start on the sizes alone; scoring only gates Auto's decision.
 
+## Starting before Compress
+
+Most of a compression's wait used to come after the click, even though the plan usually settles while the settings
+are still on screen. Now, once the size plan and the format are settled, Pare starts compressing in the background,
+and Compress picks the job up wherever it got to. Changing any setting or opening another file drops it, and each
+combination of settings gets one head start per file, so going back to the settings from a result doesn't quietly
+compress the same thing twice. Clicking 15 s after the file loads (reading the settings, say):
+
+| Clip | Click to file, before | Now |
+| --- | --- | --- |
+| Camera footage, 10 s | 16.7 s | 5.6 s |
+| Phone clips, 20 s | 42.7 s | 33.0 s |
+| Big Buck Bunny, 10 s | 21.3 s | 15.9 s |
+
+Two smaller changes shorten the AV1 path. When H.264's first plan round already shows a steep curve, or a rate factor
+within 3 of its highest, AV1 will be tested anyway, so its test starts right then, alongside H.264's third round on the
+encoders that round leaves free. And at that edge H.264 has no headroom: park's plan put it at 28.3, the first pass
+came out over, and it finished at x264's highest rate factor with VMAF NEG 78.9, where AV1 made 82.8 at the same
+size. There AV1 is picked from a tie instead of a point ahead.
+
+AV1's test estimates size from two windows, scaled by how those two compare with all four in H.264's test, and that
+still lands 6-17% off (town and noisy over, then a second encode; tree 17% under, which leaves quality unused). A third
+round at the same two windows didn't help (town went from a landing to a miss): the error is in which frames are
+sampled, not in the curve. Encoding the other two windows once AV1 is chosen did help the landing (town and noisy
+within 2%, no second encode), but it cost 5-10 s on every AV1 clip for 0.0-0.3 VMAF NEG, so it isn't shipped. Part of
+the error isn't sampling either: the window estimate's 8% correction was calibrated on x264, and AV1's windows run high
+on some footage (tree) and low on other (park).
+
 ## End to end in the browser
 
 Same headless Chrome, same files, production builds:

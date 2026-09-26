@@ -29,6 +29,9 @@ Pare now runs its own build of x264:
   second build compiled with pthreads. The second thread keeps x264 working while the encoder waits for decoded frames,
   which makes encoding 13% faster on the same cores. Machines with more than 8 cores, and refits that redo only a
   few chunks, get more threads per encoder.
+- **A head start.** Once the size plan and the format are settled, Pare starts compressing while the settings are
+  still on screen, and Compress picks it up wherever it got to. Clicking 15 seconds after loading, camera footage was
+  ready 5.6 s after the click instead of 16.7 s.
 - **A size promise that gets checked.** Short test encodes estimate how size falls as quality drops. Each chunk gets
   its quality setting from what the finished chunks actually cost, and the final file is weighed. If it isn't at
   least 50% smaller, the busiest chunks are encoded again.
@@ -42,30 +45,38 @@ Pare now runs its own build of x264:
   plan's test encodes are decoded and scored with VMAF NEG in the browser, and AV1 is used when it looks at least a
   point better at the target size and the device can play it, or when it's the only way to half the size. On the test
   corpus that picked the better encoder in 28 of 30 cases, where SSIM would have agreed with VMAF in 21. The AV1 test
-  runs while you look at the settings; start sooner and Pare goes ahead with H.264 unless AV1 is likely to matter.
+  runs while you look at the settings; start sooner and Pare goes ahead with H.264 unless AV1 is likely to matter
+  (a steep size curve, the mark of fine noise, where AV1 added 4 to 6 points, or H.264 near its limit).
 
 The encoder settings came out of a quality lab. Every candidate was swept over rate factors on a test corpus and
-scored with VMAF, VMAF NEG, SSIM and PSNR. The winner (`faster` with a 40-frame lookahead, 3 references and weighted
-prediction) needs about 30% fewer bits than `veryfast` for the same VMAF NEG, and costs no speed. The details, and the
-ideas that didn't make it, are in [research/RESEARCH.md](research/RESEARCH.md).
+scored with VMAF, VMAF NEG, SSIM and PSNR. `faster` with a 40-frame lookahead and weighted prediction needs about 30%
+fewer bits than `veryfast` for the same VMAF NEG; a second sweep, for speed, found that diamond motion search and no
+8×8-and-smaller inter partitions keep that quality per byte (−0.4% BD-rate) with two thirds of the CPU time. The
+details, and the ideas that didn't make it, are in [research/RESEARCH.md](research/RESEARCH.md), and every benchmark
+with its method in [research/BENCHMARKS.md](research/BENCHMARKS.md).
 
 ## Numbers
 
-Visually lossless with the 50% target, in Chrome on a 4-core, 8-thread cloud machine with no GPU. Time runs from
-clicking Compress to the finished file.
+Visually lossless with the 50% target and format Auto, in Chrome on a 4-core, 8-thread cloud machine with no GPU.
+Time runs from clicking Compress, a second after the file loads, to the finished file. VMAF NEG is measured afterwards
+with native libvmaf over every frame; around 93 to 95 a re-encode stops looking different from its source.
 
-| Video | Original | Pare | Time | SSIM, every frame |
+| Video | Original | Pare | Time | VMAF NEG (worst frame) |
 | --- | --- | --- | --- | --- |
-| Camera footage, 1080p30, 10 s | 77.9 MB | 15.3 MB (−80%) | 26 s | 0.9942 |
-| Phone clips, 1080p50, 20 s | 65.5 MB | 29.4 MB (−55%) | 53 s | 0.9505 |
-| Big Buck Bunny, 1080p30, 10 s | 30.7 MB | 13.9 MB (−55%) | 33 s | 0.9825 |
-| Screen recording, 1080p30, 8 s | 10.8 MB | 3.33 MB (−69%) | 10 s | 0.9996 |
-| Phone clips, 1080p50, 2 min | 392 MB | 193 MB (−51%) | 4 min 20 s | 0.9535 |
+| Camera footage, 1080p30, 10 s | 77.9 MB | 16.3 MB (−79%) | 19 s | 97.7 (93.9) |
+| Screen recording, 1080p30, 8 s | 10.8 MB | 4.1 MB (−62%) | 8 s | 99.0 (95.6) |
+| Big Buck Bunny, 1080p30, 10 s | 30.7 MB | 14.0 MB (−54%) | 29 s | 92.8 (89.4) |
+| Phone clips, 1080p50, 20 s | 65.5 MB | 30.1 MB (−54%) | 42 s | 87.9 (71.9) |
+| Phone clips, 1080p50, 2 min | 392 MB | 188 MB (−52%) | 3 min 16 s | 88.4 (67.1) |
+
+Twelve videos, their before and after, and the noisy clips where AV1 takes over are in
+[research/BENCHMARKS.md](research/BENCHMARKS.md).
 
 Footage that compresses well keeps x264's CRF 15, where extra bits stop being visible, and lands well past half.
-Noisy footage gets exactly as much quality as fits in half the size. The phone clips are the hard case. They're
-already noisy 25 Mbps re-encodes, and at half the size they score "Excellent" rather than "Visually identical". I
-haven't found a setting that closes that gap without a bigger file or about 50% more encoding time.
+Noisy footage gets exactly as much quality as fits in half the size. The phone clips are the hard case: they're built
+from noisy 25 Mbps re-encodes, and for some of that footage VMAF NEG 93 would take 84% to 171% of the original size
+with either encoder, so at half the size they score "Excellent" rather than "Visually identical". Where AV1 can get
+closer, Auto uses it: on the individual clips it lifted town from 90.3 to 93.9 and noisy from 80.9 to 87.3.
 
 ## Settings
 
@@ -113,6 +124,10 @@ The script clones x264 at the commit in `x264-wasm/X264_COMMIT`, applies `x264-s
   the encoder count.
 - A refit, when the first pass misses the target, encodes the biggest chunks again on every core. It still adds time,
   about 7 s on a 20-second clip.
+- Noisy footage that's already tightly compressed can't be halved at about 1:1 by x264 or SVT-AV1: two of the test
+  clips would need 84–204% of their original size for VMAF NEG 93–95. Pare still halves them and picks the encoder that
+  looks best, and says "Good" or "Excellent" instead of "Visually identical".
+- The head start uses the CPU while the settings are on screen; changing a setting stops it.
 - Threads need a cross-origin isolated page (the site sends COOP and COEP headers). Without them, or if the threaded
   build fails to start, each encoder runs on one thread.
 - Needs a browser with WebCodecs and WebAssembly SIMD: current Chrome, Edge, Firefox, or Safari 17 and later.

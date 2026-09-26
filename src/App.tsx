@@ -627,7 +627,7 @@ const STEPS = [
   },
   {
     title: 'One encoder per core',
-    body: 'The video is split into chunks of equal work and each core encodes its own. A chunk that turns out slow hands its last frames to whichever core will be free first, and the chunks are joined at the original frame timestamps.',
+    body: 'The video is split into chunks of equal work and each core encodes its own, starting while you’re still looking at the settings. A chunk that turns out slow hands its last frames to whichever core will be free first.',
   },
   {
     title: 'Held to half the size',
