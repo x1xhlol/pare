@@ -109,7 +109,13 @@ it took town from 90.3 to 93.9 and noisy from 80.9 to 87.5.
 - Size: at least 50% smaller (the default), under a size you choose (10, 25, 50 or 100 MB, or any other), or no
   limit. The same plan, per-chunk budget and final weigh hold either target.
 - More options: the encoder (Pare's own, or the browser's WebCodecs encoder, which is faster but less efficient), the
-  format (Auto, H.264 or AV1, and HEVC with the browser's encoder), resolution, and audio.
+  format (Auto, H.264 or AV1, and HEVC with the browser's encoder), resolution, audio, and the place a phone
+  recorded the video at. That one is left out unless you keep it, since a compressed copy is often for sharing.
+
+The recording date always carries over. Photo libraries sort videos by the creation time in the MP4's movie header,
+and a converter that writes its own clock there files the copy under the day it was made. Pare reads the date from
+the iPhone's QuickTime key or the source's movie header, and the place from the iPhone key or Android's `©xyz` box
+(`src/lib/origin.ts`).
 
 ## Running it
 
@@ -138,6 +144,7 @@ runs `checkasm` to check every SIMD kernel against the C reference, and links th
 | `src/lib/x264.ts` | Size plan, Auto's format choice, chunking and cuts, per-chunk budget, refit, joining, audio |
 | `src/lib/encode-worker.ts` | One encoder per worker, fed by WebCodecs through Mediabunny; scores test encodes with VMAF |
 | `src/lib/media.ts` | Probing, the WebCodecs encoder path, the frame-by-frame quality check |
+| `src/lib/origin.ts` | The recording date and place: read from the source, written to the copy |
 | `x264-wasm/` | The SIMD patch, the pinned x264 commit, the C binding, and the build script |
 | `av1-wasm/` | The SVT-AV1 patch, dispatch-fallback generator, replacement intrinsic header, C binding, build script |
 | `vmaf-wasm/` | The libvmaf patch (AVX2 kernels under Emscripten), the scoring binding, and the build script |

@@ -15,7 +15,7 @@ function probe(size: number, bitrate: number, plan: AudioPlan, extra: Partial<Pr
     videoCodec: 'avc', videoBitrate: 8e6, canDecode: true, hdr: false, colorSpace: {},
     frame: { format: 'I420', width: 1920, height: 1080 }, playsHdrAv1: false,
     audio: { codec: 'flac', bitrate, channels: 2, sampleRate: 48000, plan }, poster: null,
-    encodable: { avc: true, hevc: false, av1: true }, ...extra,
+    encodable: { avc: true, hevc: false, av1: true }, origin: { date: null, place: null }, ...extra,
   }
 }
 const opus = { codec: 'opus' as const, channels: 2, sampleRate: 48000, bitrate: 192_000 }

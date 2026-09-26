@@ -23,6 +23,7 @@ import {
   type InputVideoTrack,
 } from 'mediabunny'
 import { ownDownmix, stereoDownmix } from './downmix'
+import { originTags, readOrigin, stampDate } from './origin'
 import { lumaOf, psnr, ssim } from './metrics'
 import {
   audioBytes as plannedAudioBytes, audioFor, deepFormat, even, MP4_AUDIO, outputSize, playsAv1, targetBytes, type AudioEncode,
@@ -93,6 +94,7 @@ export async function probeFile(file: File): Promise<Probe> {
     ) as Record<OutputCodec, boolean>
 
     const poster = canDecode ? await renderPoster(video, firstTimestamp + Math.min(1, duration * 0.1)) : null
+    const origin = await readOrigin(file, await input.getMetadataTags().catch(() => ({})))
 
     return {
       file,
@@ -112,6 +114,7 @@ export async function probeFile(file: File): Promise<Probe> {
       audio,
       poster,
       encodable,
+      origin,
     }
   } finally {
     input.dispose()
@@ -215,7 +218,7 @@ function audioBytes(probe: Probe, settings: Settings) {
 }
 
 function outputFormat(probe: Probe, settings: Settings) {
-  const mp4 = new Mp4OutputFormat({ fastStart: 'in-memory' })
+  const mp4 = new Mp4OutputFormat({ fastStart: 'in-memory', metadataFormat: 'udta' })
   if (settings.preset !== 'copy') return mp4
   const fits = probe.videoCodec && mp4.getSupportedCodecs().includes(probe.videoCodec)
   return fits ? mp4 : new MkvOutputFormat()
@@ -462,6 +465,8 @@ export function compress(probe: Probe, settings: Settings, bitrate: number, onPr
       },
     })
     const output = new Output({ format, target: new StreamTarget(writable, { chunked: true, chunkSize: 8 * 2 ** 20 }) })
+    const mp4 = format instanceof Mp4OutputFormat
+    if (mp4) stampDate(output, probe.origin)
 
     try {
       conversion = await Conversion.init({
@@ -470,6 +475,8 @@ export function compress(probe: Probe, settings: Settings, bitrate: number, onPr
         tracks: 'primary',
         video: videoOptions(probe, settings, bitrate),
         audio: await audioOptions(probe, settings),
+        // Only the recording date and place carry over, as from Pare's own encoders.
+        tags: mp4 ? originTags(probe.origin) : undefined,
         showWarnings: false,
       })
       if (canceled) await conversion.cancel()

@@ -3,6 +3,7 @@ import { Choice, type Option } from './components/Choice'
 import { Compare } from './components/Compare'
 import { BENCHMARKS, BENCHMARK_SETUP } from './benchmarks'
 import * as fmt from './lib/format'
+import { dropPlace, placeLabel } from './lib/origin'
 import type { Calibration, Job, QualityReport } from './lib/media'
 import type { Progress, SizePlan } from './lib/x264'
 import {
@@ -97,6 +98,14 @@ const FIT_PRESETS = [10, 25, 50, 100]
 /** Where "Fit under" starts: 10 MB, or a quarter of a smaller file. */
 const defaultFit = (size: number) => (size > 20e6 ? 10e6 : Math.max(1e6, Math.round(size / 4 / 1e5) * 1e5))
 
+/** Phones record where a video was taken. Left out by default, since a compressed copy is often one to share. */
+const placeHint = (place: string, keep: boolean) => {
+  const where = placeLabel(place)
+  return keep
+    ? `The copy says it was recorded at ${where ?? 'the same place'}, as the original does.`
+    : `The original says where it was recorded${where ? ` (${where})` : ''}. The copy leaves that out and keeps the recording date.`
+}
+
 const ENGINES: Option<Engine>[] = [
   { value: 'thorough', label: 'Thorough' },
   { value: 'fast', label: 'Fast' },
@@ -142,6 +151,7 @@ export default function App() {
     shortSide: null,
     keepAudio: true,
     sizeTarget: true,
+    keepPlace: false,
   })
   const [tuning, setTuning] = useState<(Tuning & { key: string }) | null>(null)
   const calibrations = useRef(new Map<string, CalibrationEntry>())
@@ -403,7 +413,8 @@ export default function App() {
         run.job = (await media()).compress(probe, engine, bitrate, onProgress)
       }
       const { measureQuality } = await media()
-      const { blob, scores } = await run.job.promise
+      const { blob: made, scores } = await run.job.promise
+      const blob = settings.keepPlace ? made : await dropPlace(made)
       const url = URL.createObjectURL(blob)
       const missed = engine.sizeTarget && settings.preset !== 'copy' && blob.size > targetBytes(probe, settings)
         ? { target: settings.targetBytes ?? null } : undefined
@@ -788,7 +799,8 @@ function Ready(props: {
   const better = (['hevc', 'av1'] as const).filter((c) => c !== settings.codec && probe.encodable[c])
   // Open by default only when something in it has been changed.
   const [more, setMore] = useState(
-    () => settings.engine !== 'thorough' || !settings.autoCodec || settings.shortSide !== null || !settings.keepAudio,
+    () => settings.engine !== 'thorough' || !settings.autoCodec || settings.shortSide !== null || !settings.keepAudio ||
+      !!settings.keepPlace,
   )
   const thoroughName = (c: 'avc' | 'av1') => (c === 'av1' ? 'SVT-AV1' : 'x264')
   const sizeMode: SizeMode = !settings.sizeTarget ? 'any' : settings.targetBytes ? 'fit' : 'half'
@@ -834,7 +846,8 @@ function Ready(props: {
     copy || !settings.shortSide ? 'Original resolution' : `${settings.shortSide}p`,
     // Repackaging copies the audio whatever the plan says Pare's own encoders could do with it.
     !probe.audio ? 'No audio' : settings.keepAudio && (copy || audioFor(probe, settings)?.kind !== 'drop') ? 'Audio kept' : 'Audio removed',
-  ].join(' · ')
+    probe.origin.place && (settings.keepPlace ? 'Location kept' : 'Location removed'),
+  ].filter(Boolean).join(' · ')
 
   return (
     <form
@@ -929,6 +942,18 @@ function Ready(props: {
               onChange={(v) => setSettings((s) => ({ ...s, keepAudio: v === 'keep' }))}
               hint={audioNote()}
             />
+            {probe.origin.place && (
+              <Choice
+                legend="Location"
+                value={settings.keepPlace ? 'keep' : 'remove'}
+                options={[
+                  { value: 'keep', label: 'Keep' },
+                  { value: 'remove', label: 'Remove' },
+                ]}
+                onChange={(v) => setSettings((s) => ({ ...s, keepPlace: v === 'keep' }))}
+                hint={placeHint(probe.origin.place, !!settings.keepPlace)}
+              />
+            )}
           </div>
         </details>
         {probe.hdr && !copy && <p className="note">{hdrNote()}</p>}

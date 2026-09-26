@@ -27,6 +27,7 @@ import vmafWasm from './vmaf/vmaf.wasm?url'
 import type { EncodedChunk, FrameStat, WorkerChunk, WorkerInit, WorkerMessage, WorkerSplit } from './encode-worker'
 import { av1Config, avcConfig } from './codec-config'
 import { ownDownmix, stereoDownmix } from './downmix'
+import { originTags, stampDate } from './origin'
 import {
   aimBytes, audioBytes, audioFor, copiesFrames, keepsHdr, outputSize, playsAv1, targetBytes, VIDEO_FLOOR, type Preset, type Probe,
   type Settings,
@@ -687,8 +688,10 @@ async function mux(probe: Probe, settings: Settings, chunks: EncodedChunk[], siz
       written += chunk.data.byteLength
     },
   })
-  const format = new Mp4OutputFormat({ fastStart: 'in-memory' })
+  const format = new Mp4OutputFormat({ fastStart: 'in-memory', metadataFormat: 'udta' })
   const output = new Output({ format, target: new StreamTarget(writable, { chunked: true, chunkSize: 8 * 2 ** 20 }) })
+  stampDate(output, probe.origin)
+  output.setMetadataTags(originTags(probe.origin))
   const profile = profileFor(settings)
   const video = new EncodedVideoPacketSource(profile.codec)
   // The frames went in as stored, so the container turns them, as the source's did.

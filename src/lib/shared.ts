@@ -1,4 +1,5 @@
 import type { AudioCodec, VideoCodec, VideoSamplePixelFormat } from 'mediabunny'
+import type { Origin } from './origin'
 
 export type Preset = 'visually-lossless' | 'high' | 'compact' | 'copy'
 export type OutputCodec = 'avc' | 'hevc' | 'av1'
@@ -19,6 +20,8 @@ export type Settings = {
   sizeTarget: boolean
   /** With the size target: the most the file may weigh, in bytes, or null for half the original. */
   targetBytes?: number | null
+  /** Keep where the video was recorded, when its file says. The recording date is kept either way. */
+  keepPlace?: boolean
 }
 
 export type Probe = {
@@ -47,6 +50,7 @@ export type Probe = {
   audio: { codec: AudioCodec | null; bitrate: number; channels: number; sampleRate: number; plan: AudioPlan } | null
   poster: string | null
   encodable: Record<OutputCodec, boolean>
+  origin: Origin
 }
 
 /** Audio codecs an MP4 can carry as they are. */
