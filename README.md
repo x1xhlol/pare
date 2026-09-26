@@ -10,7 +10,9 @@ file never leaves your computer and there's nothing to install.
 ## Why it's different
 
 Most in-browser video compressors run ffmpeg.wasm. That's x264 with its assembly stripped out, on one thread, and it
-works, slowly. Pare started there too, and it took 105 seconds to compress a 20-second phone clip.
+works, slowly. Pare started there too, and it took 105 seconds to compress a 20-second phone clip. On a 10-second
+clip at the same quality, stock ffmpeg.wasm now takes 159 s on one thread and 42 s multithreaded; Pare takes 25 s,
+including the test encodes that find the setting for half the size. Native x264 on the same machine takes 6 s.
 
 Pare now runs its own build of x264:
 

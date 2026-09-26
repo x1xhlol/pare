@@ -102,11 +102,27 @@ quality per byte.)
 
 ## Speed in context
 
-The first version of Pare ran ffmpeg.wasm: 105 s for the 20-second phone clips without any size target, and 27 s for
-the camera footage. Now the phone clips take 42 s and the camera footage 10 s, halved and checked, and with a head
-start the camera footage is ready when Compress is clicked. A browser's own encoder is faster still (1.1 to 2.7 times
-real time on this machine), but in software here it scored 93.4 VMAF NEG on the camera footage at the same budget,
-against Pare's 97.7, and couldn't halve the phone clips at all.
+Big Buck Bunny (10 s, 30.7 MB) on the same machine and browser, each file scored the same way:
+
+| Tool | Time | File | VMAF NEG (worst frame) |
+| --- | --- | --- | --- |
+| Pare: size plan, Auto, encode, from the click | 24.9 s | 13.4 MB (−56%) | 93.1 (88.9) |
+| ffmpeg.wasm 0.12, one thread, `faster` CRF 19 | 158.9 s | 12.2 MB (−60%) | 93.0 (89.8) |
+| ffmpeg.wasm 0.12, multithreaded core, `faster` CRF 19 | 42.4 s | 12.2 MB (−60%) | 93.0 (89.8) |
+| ffmpeg.wasm 0.12, one thread, `veryfast` CRF 23 (a common default) | 80.7 s | 5.1 MB (−83%) | 86.5 (82.8) |
+| Native ffmpeg, as a desktop app would run it, Pare's x264 settings at CRF 19.1 | 6.4 s | 13.5 MB (−56%) | 93.3 (89.5) |
+
+The ffmpeg.wasm runs were handed a rate factor; Pare finds its own for the size target, and that's in its time.
+At the same quality it's 6.4 times as fast as the single-threaded ffmpeg.wasm most in-browser compressors use, and
+1.7 times as fast as the multithreaded one (whose `veryfast` crashed). Its encode alone took 12.9 s, twice native x264
+on the same cores. One continuous encode is also about 9% smaller than Pare's four chunks at the same VMAF NEG: that
+is what splitting the video for speed costs on a clip this short.
+
+The first version of Pare ran ffmpeg.wasm too: 105 s for the 20-second phone clips without any size target, and 27 s
+for the camera footage. Now they take 42 s and 10 s, halved and checked, and with a head start the camera footage is
+ready when Compress is clicked. A browser's own encoder is faster still (1.1 to 2.7 times real time on this machine),
+but in software here it scored 93.4 VMAF NEG on the camera footage at the same budget, against Pare's 97.7, and
+couldn't halve the phone clips at all.
 
 ## Reproducing
 
@@ -116,3 +132,6 @@ OUT=/tmp/bench TAG=now node research/benchmark.mjs clip.mp4 ... > runs.jsonl
 python3 research/score.py runs.jsonl > scored.jsonl               # native libvmaf, every frame
 python3 research/report.py scored.jsonl old-tag new-tag           # the table above
 ```
+
+The ffmpeg.wasm rows come from `research/ffmpeg-wasm/` (`bun install`, `INPUT=clip.mp4 bun serve.ts`, then
+`node run.mjs st|mt <ffmpeg arguments>`), and the native row from the same ffmpeg build `research/score.py` uses.

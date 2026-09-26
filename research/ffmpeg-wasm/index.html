@@ -1,0 +1,20 @@
+<!doctype html><meta charset="utf-8"><title>ffmpeg.wasm bench</title>
+<script type="module">
+import { FFmpeg } from '/node_modules/@ffmpeg/ffmpeg/dist/esm/index.js'
+window.run = async (mt, args) => {
+  const ff = new FFmpeg()
+  const base = mt ? '/node_modules/@ffmpeg/core-mt/dist/esm' : '/node_modules/@ffmpeg/core/dist/esm'
+  await ff.load({ coreURL: `${base}/ffmpeg-core.js`, wasmURL: `${base}/ffmpeg-core.wasm`,
+    ...(mt ? { workerURL: `${base}/ffmpeg-core.worker.js` } : {}) })
+  const data = new Uint8Array(await (await fetch('/input.mp4')).arrayBuffer())
+  await ff.writeFile('in.mp4', data)
+  const t = performance.now()
+  await ff.exec(['-i', 'in.mp4', ...args, 'out.mp4'])
+  const secs = (performance.now() - t) / 1000
+  const out = await ff.readFile('out.mp4')
+  const blob = new Blob([out], { type: 'video/mp4' })
+  window.lastUrl = URL.createObjectURL(blob)
+  return { secs, bytes: out.length }
+}
+window.ready = true
+</script>
