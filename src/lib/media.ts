@@ -185,7 +185,7 @@ export type Calibration = {
   codec?: 'avc' | 'av1'
   choice?: {
     /** testing: H.264's plan so far, while AV1's test runs. */
-    reason: 'unlimited' | 'fits' | 'high' | 'device' | 'size' | 'better' | 'even' | 'predicted' | 'testing'
+    reason: 'unlimited' | 'fits' | 'high' | 'device' | 'size' | 'better' | 'even' | 'predicted' | 'hdr' | 'testing'
     vmaf?: { avc: number; av1?: number }
   }
 }

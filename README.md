@@ -52,6 +52,9 @@ What Pare does instead:
   emulations replaced, and the motion-search kernels rewritten for WebAssembly (`av1-wasm/`). Its output is
   byte-identical to native SVT-AV1. At the same size it scores about a point higher than x264 on ordinary footage and
   3 to 7 points higher on noisy footage, and it encodes about half as fast.
+- **HDR stays HDR.** A 10-bit HDR video (HLG or PQ) is encoded as 10-bit AV1 with its colour tags, when the device
+  decodes 10-bit AV1. Before, it was rounded to 8 bits: on a 5-second HLG clip the new file is the same size and 3.3 dB
+  closer to the source.
 - **Auto picks the format by measuring.** Pare compiles Netflix's libvmaf to WebAssembly too (`vmaf-wasm/`). The size
   plan's test encodes are decoded and scored with VMAF NEG in the browser. AV1 is used when it looks at least a point
   better at the target size and the device can play it, or when it's the only way to halve the file. On the test
@@ -131,7 +134,9 @@ The script clones x264 at the commit in `x264-wasm/X264_COMMIT`, applies `x264-s
 
 ## Limits
 
-- The x264 path writes H.264 in MP4. HDR sources come out as SDR.
+- The x264 build is 8-bit: HDR sources encoded as H.264 keep their HDR tags but lose two bits, so smooth gradients can
+  band. With AV1 they stay 10-bit. Resizing an HDR video makes it SDR. Phone HDR is HEVC, which the test machine can't
+  decode, so that path is untested.
 - Each 1080p encoder needs about 400 MB, and Pare uses at most 40% of the memory the device reports, so memory caps
   the encoder count. At 4K that's 2 encoders.
 - A refit, when the first pass misses the target, encodes the biggest chunks again on every core. It still adds time,

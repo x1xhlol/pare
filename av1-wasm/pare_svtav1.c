@@ -7,6 +7,8 @@
 // - Output packets start with a temporal delimiter OBU, which MP4 samples must not contain; it's dropped.
 // - Per-frame SSIM comes from SVT-AV1's stat report (enable-stat-report=1 in the options).
 // - SVT-AV1 may hold several finished frames; enc_encode returns at most one and enc_flush drains the rest.
+// - With input-depth=10 in the options, the input planes hold 16-bit samples (10-bit values) and must be I420; strides
+//   are reported in bytes either way.
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -23,6 +25,7 @@ typedef struct {
   EbSvtIOFormat io;
   uint8_t *y, *u, *v, *uv; // uv: interleaved chroma for NV12 input
   int width, height, csp;
+  int bytes; // per sample: 2 when encoding 10-bit
   int64_t frames_in;
   int eos_sent, done;
   EbBufferHeaderType *out;
@@ -79,9 +82,11 @@ Encoder *enc_open(int width, int height, int fps_num, int fps_den, int csp, cons
   }
 
   const int cw = (width + 1) / 2, ch = (height + 1) / 2;
-  e->y = malloc((size_t)width * height);
-  e->u = malloc((size_t)cw * ch);
-  e->v = malloc((size_t)cw * ch);
+  e->bytes = e->cfg.encoder_bit_depth > 8 ? 2 : 1;
+  if (e->bytes == 2 && csp == CSP_NV12) goto fail_init;
+  e->y = malloc((size_t)width * height * e->bytes);
+  e->u = malloc((size_t)cw * ch * e->bytes);
+  e->v = malloc((size_t)cw * ch * e->bytes);
   if (csp == CSP_NV12) e->uv = malloc((size_t)cw * 2 * ch);
   e->io.luma = e->y;
   e->io.cb = e->u;
@@ -91,11 +96,13 @@ Encoder *enc_open(int width, int height, int fps_num, int fps_den, int csp, cons
   e->io.cr_stride = cw;
   e->in.size = sizeof(EbBufferHeaderType);
   e->in.p_buffer = (uint8_t *)&e->io;
-  e->in.n_filled_len = (uint32_t)(width * height + 2 * cw * ch);
+  e->in.n_filled_len = (uint32_t)(width * height + 2 * cw * ch) * e->bytes;
   e->in.n_alloc_len = e->in.n_filled_len;
   e->in.pic_type = EB_AV1_INVALID_PICTURE;
   return e;
 
+fail_init:
+  svt_av1_enc_deinit(e->h);
 fail:
   if (e->h) svt_av1_enc_deinit_handle(e->h);
   free(e);
@@ -108,7 +115,7 @@ EMSCRIPTEN_KEEPALIVE uint8_t *enc_plane(Encoder *e, int i) {
 }
 EMSCRIPTEN_KEEPALIVE int enc_stride(Encoder *e, int i) {
   const int cw = (e->width + 1) / 2;
-  return i == 0 ? e->width : e->csp == CSP_NV12 ? 2 * cw : cw;
+  return (i == 0 ? e->width : e->csp == CSP_NV12 ? 2 * cw : cw) * e->bytes;
 }
 
 // The sequence header OBU (Pare reads the level and tier from it for the MP4 codec string).
@@ -193,6 +200,8 @@ EMSCRIPTEN_KEEPALIVE void enc_close(Encoder *e) {
 }
 
 // RGBA/RGBX (or BGRA/BGRX when bgr != 0) to the input planes, BT.709 limited range, as in pare_x264.c.
+static void widen(Encoder *e);
+
 EMSCRIPTEN_KEEPALIVE void enc_import_rgba(Encoder *e, const uint8_t *rgba, int stride, int width, int height, int bgr) {
   const int ri = bgr ? 2 : 0, bi = bgr ? 0 : 2;
   for (int y = 0; y < height; y++) {
@@ -214,11 +223,38 @@ EMSCRIPTEN_KEEPALIVE void enc_import_rgba(Encoder *e, const uint8_t *rgba, int s
       else e->u[y * cw + x] = cb, e->v[y * cw + x] = cr;
     }
   }
+  if (e->bytes == 2) widen(e);
 }
 
-// 16-bit planar 4:2:0 (10- or 12-bit samples) to the input planes, rounding to 8 bits.
+// A 10-bit encoder's planes after an 8-bit import: each sample moved to 16 bits and scaled to 10, from the end so the
+// 8-bit samples aren't overwritten before they're read.
+static void widen(Encoder *e) {
+  const int cw = (e->width + 1) / 2, ch = (e->height + 1) / 2;
+  uint8_t *planes[3] = {e->y, e->u, e->v};
+  const size_t counts[3] = {(size_t)e->width * e->height, (size_t)cw * ch, (size_t)cw * ch};
+  for (int p = 0; p < 3; p++)
+    for (size_t i = counts[p]; i-- > 0;) ((uint16_t *)planes[p])[i] = (uint16_t)(planes[p][i] << 2);
+}
+
+// 16-bit planar 4:2:0 (10- or 12-bit samples) to the input planes: as 10-bit samples for a 10-bit encoder, otherwise
+// rounded to 8 bits.
 EMSCRIPTEN_KEEPALIVE void enc_import_p16(Encoder *e, const uint16_t *py, const uint16_t *pu, const uint16_t *pv,
                                          int sy, int su, int sv, int width, int height, int bits) {
+  if (e->bytes == 2) {
+    const int s10 = bits - 10, r10 = s10 > 0 ? 1 << (s10 - 1) : 0, cw = (e->width + 1) / 2;
+    uint16_t *dy = (uint16_t *)e->y, *du = (uint16_t *)e->u, *dv = (uint16_t *)e->v;
+    for (int y = 0; y < height; y++)
+      for (int x = 0; x < width; x++) {
+        int v = (py[y * sy + x] + r10) >> s10;
+        dy[y * e->width + x] = (uint16_t)(v > 1023 ? 1023 : v);
+      }
+    for (int y = 0; y < height / 2; y++)
+      for (int x = 0; x < width / 2; x++) {
+        int u = (pu[y * su + x] + r10) >> s10, v = (pv[y * sv + x] + r10) >> s10;
+        du[y * cw + x] = (uint16_t)(u > 1023 ? 1023 : u), dv[y * cw + x] = (uint16_t)(v > 1023 ? 1023 : v);
+      }
+    return;
+  }
   const int shift = bits - 8, round = 1 << (shift - 1), cw = (e->width + 1) / 2;
   for (int y = 0; y < height; y++)
     for (int x = 0; x < width; x++) {

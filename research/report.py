@@ -20,6 +20,8 @@ NAMES = {
     'park.mp4': 'park, 25 Mbps re-encode, 5 s',
     'ducks.mp4': 'ducks (rippling water), same, 5 s',
     'long.mp4': 'Phone clips, 1080p50, 2 min',
+    'hdr-hlg.mp4': 'HDR test clip (HLG), 10-bit, 1080p30, 5 s',
+    'hdr-pq.mp4': 'HDR test clip (PQ), 10-bit, 1080p30, 5 s',
 }
 
 
@@ -43,8 +45,9 @@ def main():
             totals['new'] += new['seconds']
             totals['duration'] += new['duration']
     if totals['old']:
+        change = 100 * (1 - totals['new'] / totals['old'])
         print(f"\nAll videos together: {totals['old']:.0f} s before, {totals['new']:.0f} s now "
-              f"({100 * (1 - totals['new'] / totals['old']):.0f}% less), for {totals['duration']:.0f} s of video.")
+              f"({abs(change):.0f}% {'less' if change >= 0 else 'more'}), for {totals['duration']:.0f} s of video.")
 
 
 if __name__ == '__main__':

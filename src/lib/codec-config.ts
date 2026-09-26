@@ -22,9 +22,9 @@ export function avcConfig(headers: Uint8Array, width: number, height: number): V
 }
 
 /**
- * The codec string for AV1 in MP4 ("av01.P.LLT.08"), from the sequence header OBU SVT-AV1 returns as its headers.
- * Mediabunny builds the av1C box from it; the sequence header itself travels in every keyframe. Reads profile, and
- * level and tier of operating point 0 (AV1 spec 5.5).
+ * The codec string for AV1 in MP4 ("av01.P.LLT.DD"), from the sequence header OBU SVT-AV1 returns as its headers.
+ * Mediabunny builds the av1C box from it; the sequence header itself travels in every keyframe. Reads profile, level
+ * and tier of operating point 0, and the bit depth from the colour config (AV1 spec 5.5).
  */
 export function av1Config(headers: Uint8Array, width: number, height: number): VideoDecoderConfig {
   let bit = 0
@@ -59,28 +59,55 @@ export function av1Config(headers: Uint8Array, width: number, height: number): V
   read(1) // still_picture
   let level = 0
   let tier = 0
-  if (read(1)) {
-    level = read(5) // reduced_still_picture_header
+  const reduced = read(1)
+  if (reduced) {
+    level = read(5)
   } else {
+    let decoderModel = 0
+    let delayLength = 0
     if (read(1)) {
       // timing_info, then decoder_model_info if present
       read(32)
       read(32)
       if (read(1)) uvlc()
-      if (read(1)) {
-        read(5)
+      decoderModel = read(1)
+      if (decoderModel) {
+        delayLength = read(5) + 1
         read(32)
         read(5)
         read(5)
       }
     }
-    read(1) // initial_display_delay_present_flag
-    read(5) // operating_points_cnt_minus_1
-    read(12) // operating_point_idc[0]
-    level = read(5)
-    if (level > 7) tier = read(1)
+    const displayDelay = read(1)
+    const points = read(5) + 1
+    for (let i = 0; i < points; i++) {
+      read(12) // operating_point_idc
+      const pointLevel = read(5)
+      const pointTier = pointLevel > 7 ? read(1) : 0
+      if (i === 0) (level = pointLevel), (tier = pointTier)
+      if (decoderModel && read(1)) read(2 * delayLength + 1)
+      if (displayDelay && read(1)) read(4)
+    }
   }
-  const codec = `av01.${profile}.${String(level).padStart(2, '0')}${tier ? 'H' : 'M'}.08`
+  // Up to color_config, for the bit depth.
+  const widthBits = read(4) + 1
+  const heightBits = read(4) + 1
+  read(widthBits)
+  read(heightBits)
+  if (!reduced && read(1)) read(7) // frame ids
+  read(3) // 128x128 superblocks, filter intra, intra edge filter
+  if (!reduced) {
+    read(4) // interintra, masked compound, warped motion, dual filter
+    const orderHint = read(1)
+    if (orderHint) read(2)
+    const screenContent = read(1) ? 2 : read(1)
+    if (screenContent > 0 && !read(1)) read(1)
+    if (orderHint) read(3)
+  }
+  read(3) // superres, cdef, restoration
+  const high = read(1)
+  const depth = profile === 2 && high ? (read(1) ? 12 : 10) : high ? 10 : 8
+  const codec = `av01.${profile}.${String(level).padStart(2, '0')}${tier ? 'H' : 'M'}.${String(depth).padStart(2, '0')}`
   return { codec, codedWidth: width, codedHeight: height }
 }
 

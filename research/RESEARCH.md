@@ -703,6 +703,106 @@ has work, but pieces had to be at least 30 frames, so its two 41- and 44-frame c
 encoders. With a 20-frame minimum the second pass takes 1.5 s less. (An earlier test had found shorter pieces slower,
 on a phone clip where the extra keyframes pulled another chunk into the refit; here there was nothing to pull in.)
 
+## Settings that trade one metric for another (not shipped)
+
+`research/tuning_sweep.py` tries x264 switches that cost no time, against the shipped setting (BD-rate, CRF 16-24,
+mean over the corpus):
+
+| Switch | VMAF NEG | VMAF | SSIM | PSNR-Y |
+| --- | --- | --- | --- | --- |
+| `--aq-strength 0.8` | −6.8% | −6.4% | +2.3% | −3.5% |
+| `--aq-strength 1.2` | +7.8% | +7.6% | −2.3% | +4.1% |
+| `--qcomp 0.5` | −5.1% | −4.8% | +2.0% | −1.7% |
+| `--psy-rd 1.0:0.15` | −0.6% | −5.7% | +2.4% | +2.9% |
+| `--deblock -1:-1` or `1:1` | −0.1%, +0.5% | | | |
+| `--direct auto` | +9.3% | | | |
+| `--no-fast-pskip` | +2.5% (screen +15%) | | | |
+
+Weaker adaptive quantization and a flatter `qcomp` look like big wins on VMAF NEG (town −19.6% and −25.9%), but they
+work by moving bits out of flat areas, which is exactly what SSIM says got worse and where banding shows. VMAF is known
+to undercount banding, so shipping them would mean tuning Pare to its own measuring stick. Psychovisual trellis only
+helps plain VMAF, the metric that rewards sharpening. `--psy-rd` strength changes nothing at `faster`, which doesn't run
+psychovisual RD. The shipped setting stays.
+
+## Quantization matrices for AV1
+
+The same question for SVT-AV1's switches that aren't about speed (`research/av1_sweep.py`, preset 8, CRF 22-40,
+BD-rate against plain preset 8):
+
+| Switch | VMAF NEG | VMAF | SSIM | PSNR-Y | CPU |
+| --- | --- | --- | --- | --- | --- |
+| **`--enable-qm 1`** (flatness 8-15) | **−3.0%** | **−2.6%** | **−3.5%** | **−0.6%** | **0.92×** |
+| `--enable-qm 1 --qm-min 0` | −6.3% | −5.6% | −10.1% | +14.4% | 0.91× |
+| `--sharpness 1` / `-1` | +0.2% / +0.1% | | | | |
+| `--ac-bias 1` | −0.7% | | | | 1.05× |
+| `--qp-scale-compress-strength 1` | −0.8% (Big Buck Bunny +2.7%) | | | | |
+| `--tune 2` (SSIM) | +12.8% | | | | |
+
+Quantization matrices at SVT-AV1's default flatness are the rare switch every metric agrees on, on every clip except
+PSNR on park (+0.2%) and Big Buck Bunny (+2.2%), and they take 8% off the CPU time too, so AV1 now uses them. The steeper matrices score better
+still on the two perceptual metrics, but PSNR loses 14% and the screen recording gets worse on all of them, and text is
+where a softer high end shows. Not shipped.
+
+## HDR stays HDR
+
+Phones record HDR by default, and the benchmark had no HDR video at all. Testing one showed what Pare did with it: the
+10-bit frames were rounded to 8 bits and encoded with the source's HDR tags (BT.2020 with HLG or PQ) still on, so the
+file claimed HDR with 8-bit precision, which bands in smooth gradients, worst with PQ. The settings screen said the copy
+was SDR, which wasn't true either. Resized videos really are SDR: they go through a canvas.
+
+x264's build here is 8-bit, but SVT-AV1 encodes 10-bit natively, and WebCodecs hands 10-bit frames over as 16-bit
+planes (`I420P10`) that can be copied into its input as they are. So at the video's own size, an HDR source now goes to
+AV1 in 10 bits: Auto sends it there without testing H.264 when the device decodes 10-bit AV1, and choosing AV1 does
+the same. The size plan runs in 10 bits too. One trap on the way: asked about AV1 with a PQ or HLG transfer function,
+Chrome says it can't play it on a screen without HDR, and then plays the file anyway, tone-mapped. What matters for
+keeping HDR in the file is whether 10-bit AV1 decodes, so that's the question Pare asks.
+
+Two 5-second test clips, the camera footage converted to HLG and to PQ in 10-bit AV1, in the browser, measured on the
+10-bit signal:
+
+| Clip | Before | Now |
+| --- | --- | --- |
+| HLG | 8-bit H.264, 1.90 MB, PSNR-Y 44.3 dB, 21.6 s | 10-bit AV1, 1.89 MB, 47.6 dB, 35.5 s |
+| PQ | 8-bit AV1, 1.40 MB, 46.7 dB, 25.7 s | 10-bit AV1, 1.61 MB, 48.1 dB, 32.1 s |
+
+The AV1 sequence header now tells the MP4 codec string its bit depth (`av01.0.08M.10`), read from the header's colour
+config rather than assumed. What isn't tested: phone HDR is HEVC, which headless Chrome on Linux can't decode. If a
+Mac's hardware decoder hands frames over in another format, they take the RGB path and come out 8-bit, as before.
+
+## Threaded AV1 instead of chunks (not shipped)
+
+Chunk keyframes cost AV1 the most, and x264 answered that with fewer, longer chunks and more threads each. SVT-AV1
+has threads too, and the research build of its command-line encoder has had them all along. The notes above say its
+threading ran at 11.8 fps; that was before the WebAssembly SAD kernels. In Node now, on town's 250 frames at CRF 30:
+
+| Layout | Time | Size |
+| --- | --- | --- |
+| 8 chunks, one thread each | 22.0 s | 3.80 MB |
+| 4 chunks, `--lp 2` | 18.7 s | 3.59 MB |
+| 2 chunks, `--lp 4` | 14.5 s | 3.48 MB |
+| one encode, `--lp 8` | 13.7 s | 3.45 MB |
+
+(`--lp` is a level, not a thread count: SVT-AV1 starts about 48 threads at level 2 and 74 at level 4, most of them
+idle pipeline stages, and anything from `--lp 4` up is the same at 1080p. Output is byte-identical at every level.)
+
+That looked like the fix, so I built a threaded browser module (80 workers pre-started per encoder, since a thread
+started while the encoder blocks never runs) and tried it in Chrome. The browser told a different story. The 8-chunk
+Node figure had paid for 8 processes starting 64 threads each; Pare's 8 one-thread chunks don't. At the same rate
+factor, against the shipped 8 chunks:
+
+| CRF | Clip | 8 chunks, one thread | One encoder, 8 threads | Two encoders, 4 threads |
+| --- | --- | --- | --- | --- |
+| 36 | town | 2.63 MB, VMAF NEG 90.14, 13.4 s | 2.20 MB, 90.39, 14.8 s | 2.26 MB, 90.34, 15.3 s |
+| 36 | tree | 3.46 MB, 89.60, 15.8 s | 3.15 MB, 89.73, 19.6 s | 3.19 MB, 89.73, 17.5 s |
+| 18 | town | 12.32 MB, 95.25, 16.7 s | 13.88 MB, 95.60, 18.5 s | |
+| 18 | tree | 19.00 MB, 95.36, 17.8 s | 20.78 MB, 95.68, 19.7 s | |
+
+At Auto's usual rate factors for AV1 the threaded layouts save 9-16% of the bits at equal or better quality; at CRF
+18 they don't save anything. Either way they're 10-24% slower, since one worker decodes and feeds every frame, and
+each encoder needs about 1.5 GB and 80 workers. The size plan also needs recalibrating: counted for two keyframes
+instead of eight, its estimate came out 14% low on town, the first pass went over, and a second pass took the time to
+39.6 s against 29.3. About 0.8 VMAF NEG isn't worth that, so AV1 stays at one thread per chunk.
+
 ## End to end in the browser
 
 Same headless Chrome, same files, production builds:

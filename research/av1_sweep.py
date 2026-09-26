@@ -24,6 +24,14 @@ CONFIGS = {
     '4 hierarchy levels': ['--hierarchical-levels', '4'],
     'fast-decode 2': ['--fast-decode', '2'],
     'fast-decode 1, no mfmv': ['--fast-decode', '1', '--enable-mfmv', '0'],
+    # Switches that change quality per byte rather than speed.
+    'quant matrices': ['--enable-qm', '1'],
+    'quant matrices 0-15': ['--enable-qm', '1', '--qm-min', '0'],
+    'sharpness 1': ['--sharpness', '1'],
+    'sharpness -1': ['--sharpness', '-1'],
+    'ac-bias 1': ['--ac-bias', '1.0'],
+    'qp-scale compress 1': ['--qp-scale-compress-strength', '1'],
+    'tune SSIM': ['--tune', '2'],
 }
 
 

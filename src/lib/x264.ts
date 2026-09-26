@@ -81,7 +81,7 @@ export function loadEncoder(build: Build) {
 }
 
 /** Colour description for the encoder: the source's, or BT.709 limited range for resized frames. */
-type Color = { primaries?: string; transfer?: string; matrix?: string; fullRange: boolean }
+type Color = { primaries?: string; transfer?: string; matrix?: string; fullRange: boolean; depth?: 10 }
 
 /**
  * What differs between the encoders. Everything else (the size plan, chunks, budget, refit and quality check) is
@@ -203,7 +203,11 @@ const AV1: Profile = {
     // took 23% more bits than as one encode for the same VMAF NEG, and Big Buck Bunny 36%. Keyframes 24 quantizer
     // steps coarser (on top of SVT's own rate control) took 1.9-6.1% off at 32 frames and 0.4-2.6% at 96, on town,
     // tree, park and Big Buck Bunny (research/RESEARCH.md, "Cheaper keyframes for AV1's chunks").
-    const options = ['8', '', `crf=${crf.toFixed(2)}`, 'ssim=1', 'use-fixed-qindex-offsets=2', 'key-frame-qindex-offset=24']
+    // Quantization matrices (SVT-AV1's default flatness range) took 3.0% off at the same VMAF NEG, 3.5% at the same
+    // SSIM, with PSNR even, and 8% of the CPU time (research/av1_sweep.py).
+    const options = ['8', '', `crf=${crf.toFixed(2)}`, 'ssim=1', 'use-fixed-qindex-offsets=2', 'key-frame-qindex-offset=24',
+      'enable-qm=1']
+    if (color.depth === 10) options.push('input-depth=10')
     if (color.primaries && SVT_PRIMARIES[color.primaries]) options.push(`color-primaries=${SVT_PRIMARIES[color.primaries]}`)
     if (color.transfer && SVT_TRANSFER[color.transfer]) options.push(`transfer-characteristics=${SVT_TRANSFER[color.transfer]}`)
     if (color.matrix && SVT_MATRIX[color.matrix]) options.push(`matrix-coefficients=${SVT_MATRIX[color.matrix]}`)
@@ -297,6 +301,9 @@ async function encoderOptions(probe: Probe, settings: Settings, crf: number) {
       const c = await track.getColorSpace()
       color = { primaries: c.primaries ?? undefined, transfer: c.transfer ?? undefined, matrix: c.matrix ?? undefined,
         fullRange: !!c.fullRange }
+      // HDR stays HDR in AV1: 10-bit frames go in as they are. x264's build here is 8-bit, so H.264 gets the frames
+      // rounded to 8 bits with the same colour tags.
+      if (probe.hdr && settings.codec === 'av1') color.depth = 10
     } finally {
       input.dispose()
     }
@@ -1146,6 +1153,8 @@ export type SizePlan = {
   av1Test?: Promise<SizePlan | null>
   /** Auto: AV1's size plan, when H.264's first round already made AV1 the choice (see predictsAv1). */
   av1Plan?: Promise<SizePlan | null>
+  /** Auto: an HDR source's own plan, for 10-bit AV1 (planAvc). */
+  hdr?: boolean
   stopAv1Test?: () => void
 }
 
@@ -1402,9 +1411,10 @@ export type Choice = {
   /**
    * unlimited: no size target to compare at. fits: H.264 already fits at its best quality. high: H.264 already scores
    * AUTO_HIGH. device: this device can't play AV1. size: only AV1 reaches the target. better: AV1 looks better by the
-   * margin. even: it doesn't. predicted: H.264's plan alone made AV1 the choice (predictsAv1).
+   * margin. even: it doesn't. predicted: H.264's plan alone made AV1 the choice (predictsAv1). hdr: an HDR source,
+   * kept in 10 bits.
    */
-  reason: 'unlimited' | 'fits' | 'high' | 'device' | 'size' | 'better' | 'even' | 'predicted'
+  reason: 'unlimited' | 'fits' | 'high' | 'device' | 'size' | 'better' | 'even' | 'predicted' | 'hdr'
 }
 
 /** Predicted bytes at rate factor `crf`, log size straight through the plan's two tests. */
@@ -1425,15 +1435,34 @@ function vmafAt(points: SizePlan['points'], bytes: number) {
   return lo.vmaf + ((Math.log(bytes) - Math.log(lo.bytes)) / (Math.log(hi.bytes) - Math.log(lo.bytes))) * (hi.vmaf - lo.vmaf)
 }
 
-async function playsAv1(width: number, height: number, fps: number) {
+/**
+ * Whether this device decodes AV1 at this size smoothly, in 10 bits for an HDR source. Not whether it shows HDR: Chrome
+ * reports HDR transfer functions unsupported on a screen without HDR, and still plays the file, tone-mapped.
+ */
+async function playsAv1(width: number, height: number, fps: number, tenBit = false) {
   try {
     const info = await navigator.mediaCapabilities.decodingInfo({
       type: 'file',
-      video: { contentType: 'video/mp4; codecs="av01.0.08M.08"', width, height, bitrate: 8e6, framerate: fps || 30 },
+      video: { contentType: `video/mp4; codecs="av01.0.08M.${tenBit ? 10 : '08'}"`, width, height, bitrate: 8e6,
+        framerate: fps || 30 },
     })
     return info.supported && info.smooth
   } catch {
     return false
+  }
+}
+
+/** The source's HDR transfer when it's encoded at its own size (resizing goes through an SDR canvas), or null. */
+async function hdrTransfer(probe: Probe, settings: Settings): Promise<TransferFunction | null> {
+  const { width, height } = outputSize(probe, settings.shortSide)
+  if (!probe.hdr || width !== probe.width || height !== probe.height) return null
+  const { input, track } = await openTrack(probe.file)
+  try {
+    // TypeScript's DOM types lag the WebCodecs spec, which has 'pq' and 'hlg'.
+    const transfer: string | null | undefined = (await track.getColorSpace()).transfer
+    return transfer === 'pq' || transfer === 'hlg' ? transfer : null
+  } finally {
+    input.dispose()
   }
 }
 
@@ -1444,6 +1473,11 @@ async function playsAv1(width: number, height: number, fps: number) {
  * encoders that round leaves free.
  */
 export async function planAvc(probe: Probe, settings: Settings, signal: AbortSignal): Promise<SizePlan> {
+  // An HDR video keeps its 10 bits in AV1 where this device plays that; H.264 here would round it to 8.
+  if ((await hdrTransfer(probe, settings)) && (await playsAv1(probe.width, probe.height, probe.fps, true))) {
+    const av1 = await plan(probe, { ...settings, codec: 'av1' }, signal, false)
+    return { ...av1, av1Plan: Promise.resolve(av1), hdr: true }
+  }
   let early: Promise<SizePlan | null> | undefined
   let predicted: Promise<SizePlan | null> | undefined
   const stop = new AbortController()
@@ -1548,6 +1582,7 @@ export function testsAv1(probe: Probe, settings: Settings, avc: SizePlan) {
  * 27 of 30 cases, and the three it missed were within a point of the margin.
  */
 export async function settle(probe: Probe, settings: Settings, avc: SizePlan, signal: AbortSignal): Promise<Choice> {
+  if (avc.hdr) return { codec: 'av1', plan: avc, reason: 'hdr' }
   if (!settings.sizeTarget) return { codec: 'avc', plan: avc, reason: 'unlimited' }
   if (!avc.bound) return { codec: 'avc', plan: avc, reason: 'fits' }
   // H.264's first round already chose AV1, or its third one does (noisy's curve only showed its steepness there).

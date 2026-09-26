@@ -730,6 +730,7 @@ function choiceDetail({ reason, vmaf }: NonNullable<Calibration['choice']>) {
   if (reason === 'device') return "H.264: this device can't play AV1"
   if (reason === 'size') return "AV1: H.264 can't reach half the size"
   if (reason === 'predicted') return 'AV1: H.264 is near its limit at this size'
+  if (reason === 'hdr') return 'AV1: keeps this HDR video in 10 bits'
   if (reason === 'better') return `AV1: ${gain.toFixed(1)} VMAF above H.264 here`
   return gain > 0 ? `H.264: AV1 only ${gain.toFixed(1)} VMAF better` : `H.264: ${(-gain).toFixed(1)} VMAF above AV1 here`
 }
@@ -770,6 +771,16 @@ function Ready(props: {
     () => settings.engine !== 'thorough' || !settings.autoCodec || settings.shortSide !== null || !settings.keepAudio,
   )
   const thoroughName = (c: 'avc' | 'av1') => (c === 'av1' ? 'SVT-AV1' : 'x264')
+  const hdrNote = () => {
+    if (settings.engine === 'fast' || target.width !== probe.width || target.height !== probe.height)
+      return 'This is an HDR video. The compressed copy is SDR, so highlights and colors may look flatter.'
+    const codec = settings.autoCodec ? result?.codec : thoroughCodec(settings)
+    if (codec === 'av1') return 'This is an HDR video. It stays HDR, as 10-bit AV1.'
+    if (codec === 'avc' && settings.autoCodec)
+      return 'This is an HDR video. This device can’t play HDR in AV1, so the copy is 8-bit H.264 and smooth gradients may band.'
+    if (codec === 'avc') return 'This is an HDR video. H.264 here is 8-bit, so smooth gradients may band; AV1 keeps it in 10 bits.'
+    return 'This is an HDR video. Checking whether this device plays it in 10-bit AV1…'
+  }
   const summary = [
     copy
       ? 'Original streams'
@@ -868,9 +879,7 @@ function Ready(props: {
             />
           </div>
         </details>
-        {probe.hdr && !copy && (
-          <p className="note">This is an HDR video. The compressed copy is SDR, so highlights and colors may look flatter.</p>
-        )}
+        {probe.hdr && !copy && <p className="note">{hdrNote()}</p>}
       </div>
 
       <div className="action-bar">

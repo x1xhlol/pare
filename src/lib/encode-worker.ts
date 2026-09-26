@@ -77,6 +77,8 @@ let sink: SkippingSink
 let staging = 0
 let stagingSize = 0
 let enc = 0
+/** The open encoder takes 10-bit samples (AV1 for an HDR source): its planes hold 16 bits per sample. */
+let tenBit = false
 /** The chunk being encoded: where it ends now, and the last frame that went into the encoder. */
 let running: { index: number; end: number; fed: number } | null = null
 
@@ -162,6 +164,9 @@ function planInput(sample: VideoSample, enc: number): Loader {
       if (s.format === 'I420A') layout.push({ offset: scratch(width * height), stride: width })
       await s.copyTo(heap(), { layout })
     }
+  // A 10-bit encoder (AV1 for HDR sources) takes 10-bit frames as they are: its planes hold 16-bit samples.
+  if (direct && sample.format === 'I420P10' && tenBit)
+    return async (s) => void (await s.copyTo(heap(), { layout: [plane(0), plane(1), plane(2)] }))
   if (direct && (sample.format === 'I420P10' || sample.format === 'I420P12')) {
     const bits = sample.format === 'I420P10' ? 10 : 12
     return async (s) => {
@@ -190,9 +195,10 @@ function planInput(sample: VideoSample, enc: number): Loader {
   }
 }
 
-function cspFor(sample: VideoSample) {
+function cspFor(sample: VideoSample, tenBit: boolean) {
   const direct = sample.visibleRect.width === init.width && sample.visibleRect.height === init.height
-  return direct && (sample.format === 'I420' || sample.format === 'I420A') ? CSP_I420 : CSP_NV12
+  // A 10-bit encoder only takes planar input; x264's 10-to-8-bit import writes interleaved chroma.
+  return tenBit || (direct && (sample.format === 'I420' || sample.format === 'I420A')) ? CSP_I420 : CSP_NV12
 }
 
 /** The luma plane the encoder is about to read, copied out tightly packed. */
@@ -201,7 +207,16 @@ function luma() {
   const offset = x._enc_plane(enc, 0)
   const stride = x._enc_stride(enc, 0)
   const out = new Uint8Array(width * height)
+  if (tenBit) return to8(new Uint16Array(x.HEAPU8.buffer, offset, (stride / 2) * height), width, height, stride / 2)
   for (let y = 0; y < height; y++) out.set(x.HEAPU8.subarray(offset + y * stride, offset + y * stride + width), y * width)
+  return out
+}
+
+/** 10-bit luma samples as 8-bit, for VMAF, which Pare runs on 8-bit frames. */
+function to8(samples: Uint16Array, width: number, height: number, stride: number) {
+  const out = new Uint8Array(width * height)
+  for (let y = 0; y < height; y++)
+    for (let x = 0; x < width; x++) out[y * width + x] = Math.min(255, (samples[y * stride + x] + 2) >> 2)
   return out
 }
 
@@ -228,6 +243,11 @@ async function decodeLuma(chunk: EncodedChunk, wanted: Set<number>) {
     try {
       const data = new Uint8Array(frame.allocationSize())
       const [plane] = await frame.copyTo(data)
+      if (frame.format?.endsWith('P10')) {
+        out.set(Math.round(frame.timestamp),
+          to8(new Uint16Array(data.buffer, plane.offset, (data.byteLength - plane.offset) >> 1), width, height, plane.stride / 2))
+        continue
+      }
       const y = new Uint8Array(width * height)
       for (let row = 0; row < height; row++)
         y.set(data.subarray(plane.offset + row * plane.stride, plane.offset + row * plane.stride + width), row * width)
@@ -298,7 +318,8 @@ async function encodeChunk({ index, start, end, options: override, score }: Work
         chunk.fed = sample.timestamp
         if (!enc) {
           const options = x.stringToNewUTF8(text)
-          enc = x._enc_open(init.width, init.height, init.fpsNum, init.fpsDen, cspFor(sample), options)
+          tenBit = /input-depth=10/.test(text)
+          enc = x._enc_open(init.width, init.height, init.fpsNum, init.fpsDen, cspFor(sample, tenBit), options)
           x._free(options)
           if (!enc) throw new Error(`x264 rejected the options "${text}".`)
           load = planInput(sample, enc)

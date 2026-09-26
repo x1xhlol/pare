@@ -54,6 +54,33 @@ points better, helped by cheaper keyframes for AV1's short chunks.
 Two videos lost a little. Ducks lost 1.6 points because its first pass landed at 87% of the size goal and Pare left
 the room unused. The PCM clip lost 0.4, from being split into 8 chunks instead of 7.
 
+## Since then: quantization matrices and 10-bit HDR
+
+Two later changes, measured against the build before them (commit `43001d5`), alternating on the same machine: AV1
+now uses quantization matrices, and HDR sources stay HDR, as 10-bit AV1. The six AV1 rows in the table above predate
+both. The same build ran 7 s apart on Jellyfish between sessions, so compare within this table, not across tables.
+
+| Video | Original | Now: size | Format | Time, before → now | VMAF NEG, before → now | Worst frame, now |
+| --- | --- | --- | --- | --- | --- | --- |
+| town, 25 Mbps re-encode, 1080p50, 5 s | 15.8 MB | 7.12 MB (-55%) | AV1 | 29.9 → 30.0 s | 93.9 → 94.1 | 89.9 |
+| tree, same, 5 s | 15.1 MB | 5.87 MB (-61%) | AV1 | 30.9 → 31.9 s | 92.1 → 92.2 | 88.6 |
+| noisy, same, 5 s | 15.8 MB | 6.92 MB (-56%) | AV1 | 35.9 → 37.3 s | 87.5 → 87.7 | 79.2 |
+| Jellyfish, already 4.2 Mbps, 1080p30, 10 s | 5.2 MB | 2.47 MB (-53%) | AV1 | 44.6 → 47.2 s | 82.9 → 82.9 | 73.4 |
+| park, 25 Mbps re-encode, 5 s | 16.2 MB | 7.69 MB (-53%) | AV1 | 45.5 → 41.1 s | 84.0 → 84.3 | 72.1 |
+| ducks (rippling water), same, 5 s | 17.2 MB | 7.14 MB (-58%) | AV1 | 40.3 → 41.5 s | 70.7 → 71.1 | 58.1 |
+| HDR test clip (HLG), 10-bit, 1080p30, 5 s | 4.0 MB | 1.89 MB (-53%) | AV1 | 21.6 → 35.5 s | 83.3 → 91.2 | 86.7 |
+| HDR test clip (PQ), 10-bit, 1080p30, 5 s | 3.4 MB | 1.61 MB (-53%) | AV1 | 25.7 → 32.1 s | 87.5 → 89.7 | 86.5 |
+
+All videos together: 274 s before, 297 s now (8% more), for 45 s of video.
+
+On the AV1 clips quality rose by 0.0 to 0.4 points at about the same sizes, with times inside the noise. The two HDR
+clips are the camera footage converted to HLG and to PQ in 10-bit AV1. Headless Chrome on Linux can't decode HEVC, so
+they stand in for a phone's HDR video; whether a Mac's HEVC decoder hands its frames over as 10-bit planes the same way
+is untested. Before, the HLG clip came out as 8-bit H.264 and
+the PQ clip as 8-bit AV1, both still tagged HDR; now both are 10-bit AV1. VMAF isn't made for HDR, so here is PSNR on
+the 10-bit luma as well: HLG 44.3 → 47.6 dB in the same size file, PQ 46.7 → 48.1 dB. They take 6 to 14 s longer,
+most of it AV1's 10-bit encode.
+
 ## Where the time goes
 
 What happens between the click (a second after the file loads) and the file, from timestamps logged in earlier runs.
