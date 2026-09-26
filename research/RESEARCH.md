@@ -459,7 +459,9 @@ almost free: `--fast-decode 1` took 12% off the CPU time for +0.2% BD-rate, and 
 vectors 12% for +0.7%; loop restoration off saved 12% for +6.1%. In the WebAssembly build none of them moved the CPU
 time beyond noise (40 frames of park: 26.4-27.7 s against 27.0-28.1 s), and two produced byte-identical files, since
 preset 8 already sets them that way at 1080p. The native savings come from paths that are cheap in AVX-512 and not in
-WebAssembly, so AV1 stays at plain preset 8. Faster presets were ruled out earlier (preset 10: +74% bits).
+WebAssembly, so AV1 stays at plain preset 8. Faster presets cost too much quality: preset 9 takes 0.67× the CPU time
+for 19% more bits at the same VMAF NEG (town +16%, tree +17%, Big Buck Bunny +18%, screen +60%), and preset 10 0.43×
+for 74% more. Auto picks AV1 for 1 to 6 points of VMAF NEG, and preset 9 would give back about half of that.
 
 ## How close to 1:1 half the size can get
 
@@ -507,9 +509,11 @@ compress the same thing twice. Clicking 15 s after the file loads (reading the s
 
 | Clip | Click to file, before | Now |
 | --- | --- | --- |
-| Camera footage, 10 s | 16.7 s | 5.6 s |
-| Phone clips, 20 s | 42.7 s | 33.0 s |
-| Big Buck Bunny, 10 s | 21.3 s | 15.9 s |
+| Camera footage, 10 s | 16.9 s | 0.1 s |
+| Phone clips, 20 s | 43.2 s | 33.0 s |
+| Big Buck Bunny, 10 s | 21.9 s | 14.8 s |
+
+(Measured again after the next two sections; the camera footage had finished before the click.)
 
 Two smaller changes shorten the AV1 path. When H.264's first plan round already shows a steep curve, or a rate factor
 within 3 of its highest, AV1 will be tested anyway, so its test starts right then, alongside H.264's third round on the
@@ -524,6 +528,47 @@ sampled, not in the curve. Encoding the other two windows once AV1 is chosen did
 within 2%, no second encode), but it cost 5-10 s on every AV1 clip for 0.0-0.3 VMAF NEG, so it isn't shipped. Part of
 the error isn't sampling either: the window estimate's 8% correction was calibrated on x264, and AV1's windows run high
 on some footage (tree) and low on other (park).
+
+## Room to spare goes to speed
+
+Camera footage at 62 Mbps fits in half its size at x264's quality ceiling (CRF 15) with a lot left over: Pare's
+file was 21% of the original. Nothing was using that room, and x264's `superfast` preset does about half the work.
+At CRF 15 on the corpus, `superfast` against Pare's settings (native x264, one thread):
+
+| Clip | CPU time | VMAF NEG, Pare's settings → superfast | Size, superfast / Pare's |
+| --- | --- | --- | --- |
+| Big Buck Bunny | 21.2 vs. 35.3 s | 95.34 → 95.24 | 1.36× |
+| town | 16.4 vs. 37.5 s | 96.12 → 95.23 | 1.46× |
+| tree | 20.4 vs. 38.2 s | 96.42 → 95.71 | 1.44× |
+| park | 14.6 vs. 42.6 s | about the same | 1.03× |
+| ducks (rippling water) | 17.3 vs. 39.1 s | 98.99 → 93.32 | 1.21× |
+| screen recording | 6.9 vs. 8.0 s | about the same | 1.53× |
+
+So when `superfast` still fits, it costs little quality, except on footage like the water. The plan now tries it
+first: the four test windows at CRF 15 with `superfast`, kept if their estimate is within 90% of the size goal and
+their VMAF NEG is at least 95 (the water would fail that). The encode keeps those windows as finished chunks.
+The camera footage went from 28.7 s to 10.0 s, at VMAF NEG 97.9 → 97.8 (worst frame 93.9 → 95.6), in a file 69%
+smaller instead of 79%.
+
+The extra test is wasted when `superfast` doesn't fit, and it isn't cheap: it runs before the usual round, and its
+windows are scored before the workers move on. Big Buck Bunny's plan went from 12 s to 20 s, and the phone clips' and
+town's by 4 to 5 s. `superfast` at CRF 15 took 0.3 to 0.8 bits per pixel on the natural footage in the corpus (0.06
+on the screen recording), and fitting it with room takes about twice that, so the test only runs on sources above 0.6
+bits per pixel. The camera footage has 1.0; everything else in the benchmark has 0.4 or less.
+
+Starting the encode while the test windows were still being scored, and starting over with the full settings if they
+came in low, finished no sooner (10.2-10.5 s against 10.0 s): the scoring took the cores from the encode. Not shipped.
+
+## Decoding only the frames that matter
+
+Every chunk and test window starts its own decoder at the source keyframe before its first frame. Big Buck Bunny's
+source has keyframes at frames 0 and 250 only, so a chunk starting at frame 200 decodes 200 frames it throws away,
+and its plan windows spent up to 4.1 s decoding against 5 to 6.5 s encoding. Many of those frames are B-frames no other
+frame refers to (`nal_ref_idc` 0 in H.264), and a decoder doesn't need them to decode what comes after. The worker
+now drops them before its range starts, by filtering the packets Mediabunny's range decoding reads. The output is
+byte-identical. Big Buck Bunny's decoding went from 4.5 to 3.0 s per encoder and its compression from 29.7 to 26.1 s.
+HEVC's non-reference types are only non-reference within their temporal sub-layer, so HEVC sources decode everything
+as before.
 
 ## End to end in the browser
 

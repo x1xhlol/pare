@@ -210,8 +210,8 @@ export default function App() {
     const onRound = (round: number) => {
       if (currentKey.current === key) setTuning({ key, round })
     }
-    const fromPlan = ({ size, crf, raised, fitted, slope, points, reuse }: SizePlan): Calibration =>
-      ({ bitrate: 0, size, ssim: 0, target: 0, reached: true, crf, raised, fitted, slope, points, reuse })
+    const fromPlan = ({ size, crf, raised, fitted, slope, points, reuse, fast }: SizePlan): Calibration =>
+      ({ bitrate: 0, size, ssim: 0, target: 0, reached: true, crf, raised, fitted, slope, points, reuse, fast })
     // Auto tests AV1 while the settings are on screen. Starting before the test ends goes ahead with H.264 when it
     // meets the size target, so a quick start doesn't wait for a test that rarely changes the answer.
     const test = new AbortController()
@@ -296,7 +296,8 @@ export default function App() {
     void x264().then((engine) => {
       if (dropped) return
       const codec = settings.autoCodec ? settled.codec ?? 'avc' : thoroughCodec(settings)
-      const start = { crf: settled.crf, slope: settled.slope, points: settled.points, reuse: codec === 'avc' ? settled.reuse : undefined }
+      const start = { crf: settled.crf, slope: settled.slope, points: settled.points,
+        reuse: codec === 'avc' ? settled.reuse : undefined, fast: codec === 'avc' && settled.fast }
       const spec: HeadStart = { key, codec, progress: null, job: null as unknown as Job }
       spec.job = engine.encode(probe, { ...settings, codec }, start, (p) => {
         spec.progress = p
@@ -374,7 +375,8 @@ export default function App() {
         setPhase((p) => (p.kind === 'running' ? { ...p, status: 'Starting encoders…' } : p))
         codec = settings.autoCodec ? plan?.codec ?? 'avc' : thoroughCodec(settings)
         run.job = engine.encode(probe, { ...settings, codec },
-          { crf: plan?.crf, slope: plan?.slope, points: plan?.points, reuse: codec === 'avc' ? plan?.reuse : undefined }, onProgress)
+          { crf: plan?.crf, slope: plan?.slope, points: plan?.points, reuse: codec === 'avc' ? plan?.reuse : undefined,
+            fast: codec === 'avc' && plan?.fast }, onProgress)
       } else {
         const { bitrate } = await ensureCalibration(probe, settings).promise
         if (run.canceled) return
@@ -631,7 +633,7 @@ const STEPS = [
   },
   {
     title: 'Held to half the size',
-    body: 'Short test encodes measure how size falls as quality drops, and each chunk gets its setting from what the finished ones really cost. The file is weighed at the end, and if it isn’t at least 50% smaller, the busiest chunks are encoded again.',
+    body: 'Short test encodes measure how size falls as quality drops, and each chunk gets its setting from what the finished ones really cost. The file is weighed at the end, and if it isn’t at least 50% smaller, the busiest chunks are encoded again. Room to spare goes to speed: an x264 preset with half the work, kept only if VMAF still scores it visually identical.',
   },
   {
     title: 'H.264 or AV1, by measuring',
@@ -888,6 +890,8 @@ function Ready(props: {
               ? choiceDetail(result.choice)
               : !result && usesX264(settings) && settings.autoCodec && settings.sizeTarget && !(tuning && 'error' in tuning)
               ? 'Test-encoding to pick the format'
+              : result?.fast
+              ? 'Fits easily, so it encodes at top speed'
               : result?.fitted === false
               ? 'Highest quality already fits in half the size'
               : result?.fitted

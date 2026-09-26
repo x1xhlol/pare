@@ -539,7 +539,7 @@ function planChunks({ times, keys }: Timeline, workers: number, decodeShare: num
  * are split for the workers in proportion to each gap's length. Returns every chunk in time order, and the finished
  * ones by their new index.
  */
-function planAround({ times }: Timeline, workers: number, done: Reusable[]) {
+function planAround({ times }: Timeline, workers: number, done: (Omit<Reusable, 'chunk'> & { chunk?: EncodedChunk })[]) {
   const total = times.length
   const fixed = done
     .map((r) => ({ ...r, first: times.indexOf(r.start), last: r.end === Infinity ? total : times.indexOf(r.end) }))
@@ -812,6 +812,8 @@ export type EncodeStart = {
   points?: { crf: number; bytes: number }[]
   /** Test windows the plan encoded with exactly the settings this encode starts with, to keep as finished chunks. */
   reuse?: Reusable[]
+  /** Encode at x264's superfast preset (the plan found room to spare). */
+  fast?: boolean
 }
 
 /** A finished stretch of the video: one of the plan's test windows. */
@@ -839,7 +841,8 @@ export function encode(probe: Probe, settings: Settings, start: EncodeStart, onP
       const floor = floorCrf(settings)
       const crf = Math.min(profile.max, Math.max(floor, start.crf ?? floor))
       const slope = start.slope && start.slope < -0.03 ? start.slope : profile.slope
-      const [line, options] = await Promise.all([timeline(probe.file), encoderOptions(probe, settings, crf)])
+      const [line, tuned] = await Promise.all([timeline(probe.file), encoderOptions(probe, settings, crf)])
+      const options = start.fast && profile === X264 ? fastest(tuned) : tuned
       const { times } = line
       const { encoders, threads } = workerCount(probe, settings)
       // The plan's test windows are finished chunks when they were encoded with exactly these settings: x264 at the
@@ -1020,6 +1023,28 @@ const SIZE_AIM = 0.47
 const WINDOW_FRAMES = 24
 /** Test-window estimates came in 3-11% under the finished files (median ~7%); scale them to match. */
 const ESTIMATE_BIAS = 1.08
+/**
+ * x264's superfast preset at the same rate factor takes about half the CPU time for about the same VMAF NEG (-0.1 to
+ * -0.9 on the corpus at CRF 15) in a file 1.0-1.5x as big; rippling water lost 5.7. So when the quality ceiling fits
+ * with that much room, the plan tries it first, and keeps it if its test windows fit within FAST_FIT of the goal and
+ * score at least FAST_FLOOR.
+ */
+const FAST_FIT = 0.9
+const FAST_FLOOR = 95
+/**
+ * Superfast at the quality ceiling took 0.3-0.8 bits per pixel on natural footage (0.06 on a screen recording), so a
+ * source needs about twice that to fit it with room. Below this many bits per pixel the extra test is almost always
+ * wasted, and it costs 3-8 s: Big Buck Bunny's plan went from 12 to 20 s.
+ */
+const FAST_BPP = 0.6
+
+/** The same encode at x264's superfast preset: Pare's own additions off, rate factor, colour and SSIM kept. */
+function fastest(options: string) {
+  const [, tune, ...rest] = options.split(';')
+  const dropped = ['weightp', 'me', 'partitions', 'rc-lookahead']
+  return ['superfast', tune, ...rest.filter((kv) => !dropped.includes(kv.split('=')[0]))].join(';')
+}
+
 /** How far from both of the plan's tests its answer has to fall before a third test near it... */
 const MID_TEST = 1.5
 /** ...where size falls at least this steeply between them (log bytes per rate factor step). */
@@ -1084,6 +1109,8 @@ export type SizePlan = {
   scored?: Promise<void>
   /** Test windows encoded exactly as the encode will be, when it starts from the plan's lowest test. */
   reuse?: Reusable[]
+  /** x264 at its superfast preset: the quality ceiling fits with room to spare and still scores FAST_FLOOR. */
+  fast?: boolean
   /** Auto: AV1's test, when H.264's plan started it early, and how to stop it. */
   av1Test?: Promise<SizePlan | null>
   stopAv1Test?: () => void
@@ -1157,6 +1184,10 @@ export async function plan(probe: Probe, settings: Settings, signal: AbortSignal
   const profile = profileFor(settings)
   // Quality measurements need the real preset: a faster one changes how AV1 looks more on some footage than others.
   const options = profile.planPreset && !measure ? full.replace(/^[^;]*/, profile.planPreset) : full
+  // Room to spare goes to speed: an x264 plan under the size target first tries the superfast preset at its lowest
+  // rate factor (see FAST_FIT).
+  const bpp = probe.videoBitrate / (size.width * size.height * (probe.fps || 30))
+  const fastFirst = profile === X264 && settings.sizeTarget && !tests && !only && bpp >= FAST_BPP
   // One round of tests: half the cores encode short windows at the preset's rate factor, the other half the same
   // windows at a rate factor about half the size, so the curve between them is known without a second round. Each
   // window starts on a source keyframe when one is close, so its decoder doesn't work through frames it won't use.
@@ -1180,11 +1211,11 @@ export async function plan(probe: Probe, settings: Settings, signal: AbortSignal
   const fps = probe.fps || 30
   const pool = await createPool(profile, count, threads, {
     file: probe.file, options, width: size.width, height: size.height, fpsNum: Math.round(fps * 1000), fpsDen: 1000,
-    scoring: measure,
+    scoring: measure || fastFirst,
   })
   // A short run from a third of the way into each window: the first frame primes VMAF's motion feature, and a run
   // covers every layer of the encoders' hierarchical frame structures. Every 8th frame would land on their best ones.
-  const score = measure && per >= 12 ? { from: Math.floor(per / 3), count: SCORED_FRAMES + 1 } : undefined
+  const score = per >= 12 ? { from: Math.floor(per / 3), count: SCORED_FRAMES + 1 } : undefined
   const stop = () => pool.terminate()
   // Settings can change while the encoders start, and a listener added after the abort would never run.
   if (signal.aborted) {
@@ -1202,7 +1233,7 @@ export async function plan(probe: Probe, settings: Settings, signal: AbortSignal
   /** VMAF NEG of each point, filled in as the workers score their windows after handing them over. */
   const scoring: Promise<void>[] = []
   /** Predicted video bytes for the whole file at each rate factor, all encoded in one round. */
-  const videoAt = async (crfs: number[]) => {
+  const videoAt = async (crfs: number[], preset = options, scored = measure, fixed = fixedKeyframes) => {
     const base = issued
     issued += crfs.length * windows.length
     const chunks: WorkerChunk[] = crfs.flatMap((crf, c) =>
@@ -1210,8 +1241,8 @@ export async function plan(probe: Probe, settings: Settings, signal: AbortSignal
         type: 'chunk' as const,
         index: base + c * windows.length + i,
         ...w,
-        options: options.replace(/crf=[\d.]+/, `crf=${crf.toFixed(1)}`),
-        score,
+        options: preset.replace(/crf=[\d.]+/, `crf=${crf.toFixed(1)}`),
+        score: scored ? score : undefined,
       })),
     )
     const encoded = await pool.run(chunks, () => {})
@@ -1228,7 +1259,7 @@ export async function plan(probe: Probe, settings: Settings, signal: AbortSignal
           if (p.key && p.pts > 0) sceneCuts++
         }
       }
-      const keyframes = fixedKeyframes + (sceneCuts / Math.max(1, frames)) * times.length
+      const keyframes = fixed + (sceneCuts / Math.max(1, frames)) * times.length
       const perKey = keyCount ? keyBytes / keyCount : 0
       const perFrame = restCount ? restBytes / restCount : perKey
       // Short windows see less of the lookahead's bit redistribution and ran 3-11% low against full encodes.
@@ -1247,7 +1278,7 @@ export async function plan(probe: Probe, settings: Settings, signal: AbortSignal
         bytes: estimate(tests),
         subset: measure && !picked ? { bytes: estimate(some) } : undefined,
       }
-      if (score)
+      if (scored && score)
         scoring.push(Promise.all(tests.map((t) => pool.score(t.index))).then((all) => {
           point.vmaf = mean(all)
           if (point.subset) point.subset.vmaf = mean(all.filter((_, i) => AV1_TEST_WINDOWS.includes(i)))
@@ -1268,6 +1299,23 @@ export async function plan(probe: Probe, settings: Settings, signal: AbortSignal
       Math.min(profile.max, (settings.preset === 'visually-lossless' ? profile.ceiling : baseCrf) +
         (settings.preset === 'visually-lossless' ? profile.span.lossless : profile.span.other)),
     ]
+    if (fastFirst && score) {
+      // The encode keeps these windows and splits the rest around them, which takes more keyframes.
+      const around = planAround(line, encoders, windows).chunks.length + Math.floor(times.length / 250)
+      const [quick] = await videoAt([lo], fastest(options), true, around)
+      // Waiting for the scores costs about a second. Starting the encode without them (and starting over with the
+      // full settings if they came in low) finished no sooner: the scoring took the cores from the encode.
+      if (quick.bytes <= videoGoal(probe, settings) * FAST_FIT) {
+        await Promise.all(scoring)
+        console.info(`[pare] plan: superfast at crf ${lo} → ${(quick.bytes / 1e6).toFixed(1)} MB, VMAF NEG ${quick.vmaf?.toFixed(2)}`)
+        if ((quick.vmaf ?? 0) >= FAST_FLOOR) {
+          succeeded = true
+          const done = tested.get(lo)!
+          return { crf: lo, size: quick.bytes + audio, raised: false, fitted: false, slope: profile.slope,
+            points: [quick], bound: false, fast: true, reuse: windows.map((w, i) => ({ ...w, chunk: done[i] })) }
+        }
+      }
+    }
     const points = await videoAt([lo, hi])
     let planned = fit(probe, settings, points)
     onFirst?.(planned)

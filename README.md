@@ -20,7 +20,9 @@ Pare now runs its own build of x264:
   and whole encodes come out byte-identical to the plain C build. Encoding is 2.0–2.3× faster per core, and the
   result runs at 54% of native x264 with the same settings.
 - **The browser decodes.** WebCodecs decodes the source, in hardware when there's a GPU, and frames are copied
-  straight into x264's input planes. The encoder module is 830 KB; ffmpeg.wasm is 32 MB.
+  straight into x264's input planes. The encoder module is 830 KB; ffmpeg.wasm is 32 MB. Each chunk's decoder has
+  to start at the source keyframe before it, which in a file with a keyframe every 250 frames can be hundreds of
+  frames early; H.264 frames that nothing refers to are skipped on the way, about half of them with B-frames.
 - **Every core, busy to the end.** The video is split into chunks of equal cost, counting the frames each decoder
   has to work through from the source keyframe before its chunk starts. Each core encodes its own, and the chunks
   are joined at the original frame timestamps. Busy footage still encodes up to 1.5× slower than calm footage, so
@@ -31,7 +33,10 @@ Pare now runs its own build of x264:
   few chunks, get more threads per encoder.
 - **A head start.** Once the size plan and the format are settled, Pare starts compressing while the settings are
   still on screen, and Compress picks it up wherever it got to. Clicking 15 seconds after loading, camera footage was
-  ready 5.6 s after the click instead of 16.7 s.
+  ready 0.1 s after the click instead of 16.9 s: it had finished while the settings were on screen.
+- **Room to spare goes to speed.** When a high-bitrate source would fit in half its size even at x264's `superfast`
+  preset, which does about half the work, Pare test-encodes that first and uses it if its VMAF NEG is still 95 or
+  more. Camera footage went from 28.7 s to 10.0 s at the same VMAF NEG (97.8), in a file 69% smaller instead of 79%.
 - **A size promise that gets checked.** Short test encodes estimate how size falls as quality drops. Each chunk gets
   its quality setting from what the finished chunks actually cost, and the final file is weighed. If it isn't at
   least 50% smaller, the busiest chunks are encoded again.
@@ -63,16 +68,17 @@ with native libvmaf over every frame; around 93 to 95 a re-encode stops looking 
 
 | Video | Original | Pare | Time | VMAF NEG (worst frame) |
 | --- | --- | --- | --- | --- |
-| Camera footage, 1080p30, 10 s | 77.9 MB | 16.3 MB (−79%) | 19 s | 97.7 (93.9) |
-| Screen recording, 1080p30, 8 s | 10.8 MB | 4.1 MB (−62%) | 8 s | 99.0 (95.6) |
-| Big Buck Bunny, 1080p30, 10 s | 30.7 MB | 14.0 MB (−54%) | 29 s | 92.8 (89.4) |
+| Camera footage, 1080p30, 10 s | 77.9 MB | 24.4 MB (−69%) | 10 s | 97.8 (95.6) |
+| Screen recording, 1080p30, 8 s | 10.8 MB | 4.1 MB (−62%) | 9 s | 99.0 (95.6) |
+| Big Buck Bunny, 1080p30, 10 s | 30.7 MB | 14.0 MB (−54%) | 27 s | 92.8 (89.4) |
 | Phone clips, 1080p50, 20 s | 65.5 MB | 30.1 MB (−54%) | 42 s | 87.9 (71.9) |
 | Phone clips, 1080p50, 2 min | 392 MB | 188 MB (−52%) | 3 min 16 s | 88.4 (67.1) |
 
 Twelve videos, their before and after, and the noisy clips where AV1 takes over are in
 [research/BENCHMARKS.md](research/BENCHMARKS.md).
 
-Footage that compresses well keeps x264's CRF 15, where extra bits stop being visible, and lands well past half.
+Footage that compresses well keeps x264's CRF 15, where extra bits stop being visible, and lands well past half; when
+there's room even at the `superfast` preset, the room goes to speed instead.
 Noisy footage gets exactly as much quality as fits in half the size. The phone clips are the hard case: they're built
 from noisy 25 Mbps re-encodes, and for some of that footage VMAF NEG 93 would take 84% to 171% of the original size
 with either encoder, so at half the size they score "Excellent" rather than "Visually identical". Where AV1 can get

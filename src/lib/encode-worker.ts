@@ -1,7 +1,10 @@
 /// <reference lib="webworker" />
 // Encodes chunks of one video with x264 (WebAssembly SIMD). Frames come from the browser's decoder via
 // Mediabunny and are copied straight into x264's input planes whenever the pixel format allows it.
-import { BlobSource, Input, MATROSKA, MP4, QTFF, VideoSampleSink, WEBM, type VideoSample } from 'mediabunny'
+import {
+  BlobSource, EncodedPacketSink, Input, MATROSKA, MP4, QTFF, VideoSampleSink, WEBM, type EncodedPacket, type InputVideoTrack,
+  type VideoSample,
+} from 'mediabunny'
 import { decoderConfig } from './codec-config'
 import type createVmaf from './vmaf/vmaf.mjs'
 import type { VmafModule } from './vmaf/vmaf.mjs'
@@ -70,7 +73,7 @@ const CSP_NV12 = 0x0004
 let x: X264Module
 let vmaf: Promise<VmafModule> | null = null
 let init: WorkerInit
-let sink: VideoSampleSink
+let sink: SkippingSink
 let staging = 0
 let stagingSize = 0
 let enc = 0
@@ -78,6 +81,60 @@ let enc = 0
 let running: { index: number; end: number; fed: number } | null = null
 
 const post = (message: WorkerMessage, transfer: Transferable[] = []) => self.postMessage(message, transfer)
+
+/** Bytes in each NAL unit's length prefix, from an H.264 decoder configuration record (avcC). */
+function lengthSize(description: AllowSharedBufferSource) {
+  const bytes = ArrayBuffer.isView(description)
+    ? new Uint8Array(description.buffer, description.byteOffset, description.byteLength)
+    : new Uint8Array(description)
+  return (bytes[4] & 3) + 1
+}
+
+/** Whether an H.264 frame is one no other frame refers to: its slices have nal_ref_idc 0. */
+function disposable(data: Uint8Array, size: number) {
+  for (let i = 0; i + size < data.length; ) {
+    let length = 0
+    for (let k = 0; k < size; k++) length = length * 256 + data[i + k]
+    const header = data[i + size]
+    const type = header & 0x1f
+    if (type === 1 || type === 5) return (header & 0x60) === 0
+    i += size + length
+  }
+  return false
+}
+
+/**
+ * Decodes a range without the frames before it that nothing refers to. Each chunk's decoder starts at the source
+ * keyframe before its first frame, which in an H.264 file with a keyframe every 250 frames (x264's default) can be
+ * hundreds of frames earlier, and with B-frames about half of those are never referenced.
+ */
+class SkippingSink extends VideoSampleSink {
+  skipBefore = -Infinity
+  private readonly track: InputVideoTrack
+  private readonly size: number
+
+  /** `size`: the source's NAL length prefix size, or 0 when it isn't H.264 in that form (nothing is skipped). */
+  constructor(track: InputVideoTrack, size: number) {
+    super(track)
+    this.track = track
+    this.size = size
+  }
+
+  // Mediabunny's range decoding reads packets through this (internal) method; filtering them here keeps its
+  // decoder handling, timestamps and rotation as they are.
+  _createPacketSink() {
+    const packets = new EncodedPacketSink(this.track)
+    if (!this.size) return packets
+    const { size } = this
+    const before = this.skipBefore - 1e-6
+    const all = packets.packets.bind(packets)
+    packets.packets = async function* (...args: Parameters<EncodedPacketSink['packets']>) {
+      for await (const packet of all(...args) as AsyncGenerator<EncodedPacket>)
+        if (!(packet.type === 'delta' && packet.timestamp < before && disposable(packet.data, size))) yield packet
+    }
+    return packets
+  }
+}
 
 function scratch(size: number) {
   if (size > stagingSize) {
@@ -232,6 +289,7 @@ async function encodeChunk({ index, start, end, options: override, score }: Work
   let mark = performance.now()
   try {
     // A small tolerance keeps float rounding from pulling in a neighbouring frame.
+    sink.skipBefore = start
     for await (const sample of sink.samples(start, end)) {
       timing.decode += performance.now() - mark
       try {
@@ -308,7 +366,9 @@ self.onmessage = async (event: MessageEvent<WorkerInit | WorkerChunk | WorkerSpl
       const input = new Input({ source: new BlobSource(message.file), formats: [MP4, QTFF, WEBM, MATROSKA] })
       const track = await input.getPrimaryVideoTrack()
       if (!track) throw new Error('The file has no video track.')
-      sink = new VideoSampleSink(track)
+      const config = await track.getDecoderConfig()
+      const avcC = (await track.getCodec()) === 'avc' && config?.description
+      sink = new SkippingSink(track, avcC ? lengthSize(avcC) : 0)
       post({ type: 'ready' })
     } else {
       const { chunk, scoring } = await encodeChunk(message)
