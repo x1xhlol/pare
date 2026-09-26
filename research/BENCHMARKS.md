@@ -118,6 +118,16 @@ ffmpeg with both turned for display:
 | ALAC audio | failed after the encode | no audio, with a note before Compress |
 | 3 s clip in WebKit 26.6 | failed at once | H.264, 49.6%, SSIM 0.982 |
 
+Resizing in WebAssembly instead of on a canvas, at 720p, against commit `37eff99` (scored against the full-size
+source):
+
+| Video | Time, before → now | VMAF NEG, before → now | Worst frame, before → now | Size, before → now |
+| --- | --- | --- | --- | --- |
+| 4K phone clip, 2160p30, 10 s | 35.8 → 15.8 s | 81.1 → 85.9 | 76.9 → 81.3 | 23.1% → 22.8% |
+| Phone clips, 1080p50, 20 s | 52.2 → 35.6 s | 80.6 → 84.3 | 67.7 → 70.8 | 45.9% → 47.3% |
+| Big Buck Bunny, 1080p30, 10 s | 32.8 → 24.5 s | 73.1 → 83.7 | 71.1 → 80.9 | 45.8% → 40.4% |
+| Rotated clip, 1080p50, 3 s | 17.3 → 14.1 s | 83.7 → 87.0 | 80.9 → 84.0 | 24.0% → 22.6% |
+
 ## Where the time goes
 
 What happens between the click (a second after the file loads) and the file, from timestamps logged in earlier runs.

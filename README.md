@@ -37,6 +37,10 @@ What Pare does instead:
   6%). Short videos now get fewer, longer x264 chunks with more threads each, and that turned out faster too: Big Buck
   Bunny encodes sooner and scores 93.1 instead of 92.8, in a smaller file. AV1 can't take more threads, so its chunk
   keyframes are made coarser instead, which saves 1.9–6.1% of the bits.
+- **Resizing without a canvas.** Taking a video down to 720p used to mean drawing every frame on an RGB canvas, about
+  170 ms a frame from 4K on the test machine. Pare now scales the decoded planes itself, with a bicubic filter in
+  WebAssembly SIMD, straight into the encoder: a 4K phone clip went from 35.8 s to 15.8 s and from 81.1 to 85.9 VMAF
+  NEG, and resized videos keep their colours, HDR included.
 - **A head start.** Once the size plan and the format are settled, Pare starts compressing while the settings are
   still on screen, and Compress picks it up wherever it got to. Clicked 15 seconds after loading, camera footage was
   ready 0.1 s after the click instead of 16.9 s, because it had finished while the settings were still open.
@@ -138,8 +142,8 @@ The script clones x264 at the commit in `x264-wasm/X264_COMMIT`, applies `x264-s
 ## Limits
 
 - The x264 build is 8-bit: HDR sources encoded as H.264 keep their HDR tags but lose two bits, so smooth gradients can
-  band. With AV1 they stay 10-bit. Resizing an HDR video makes it SDR. Phone HDR is HEVC, which the test machine can't
-  decode, so that path is untested.
+  band. With AV1 they stay 10-bit, resized or not. Phone HDR is HEVC, which the test machine can't decode, so that
+  path is untested.
 - Each 1080p encoder needs about 400 MB, and Pare uses at most 40% of the memory the device reports, so memory caps
   the encoder count. At 4K that's 2 encoders.
 - A refit, when the first pass misses the target, encodes the biggest chunks again on every core. It still adds time,
@@ -154,9 +158,9 @@ The script clones x264 at the commit in `x264-wasm/X264_COMMIT`, applies `x264-s
   build fails to start, each encoder runs on one thread.
 - Audio an MP4 can't carry is converted to AAC or Opus, mixed down to stereo if the browser's encoder needs that. When
   the browser can't decode or encode it at all, the settings say so before Compress and the copy has no audio.
-- Needs a browser with WebCodecs and WebAssembly SIMD. Tested in Chrome, and in WebKit 26.6 (Safari's engine) on
-  Linux, where it works but plans about three times slower and can't decode AV1. Firefox and Safari on a Mac haven't
-  been tried.
+- Needs a browser with WebCodecs and WebAssembly SIMD. Tested in Chrome, in Firefox 155, and in WebKit 26.6 (Safari's
+  engine) on Linux, where it works but plans about three times slower and can't decode AV1. Safari on a Mac hasn't
+  been tried. Firefox decodes to RGB frames, so there an HDR video becomes SDR and frames take longer to bring in.
 
 ## License
 

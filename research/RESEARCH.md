@@ -938,7 +938,43 @@ Now town and a 3-second clip compress in WebKit, to H.264 (42% and 50% of the or
 included. It's slow: the size plan took 34 s on town against 11 s in Chrome. Real Safari on a Mac decodes with
 VideoToolbox instead, and hasn't been tried.
 
-## End to end in the browser
+## Resizing without a canvas
+
+Resizing used to draw every frame on an RGB canvas at the output size (Mediabunny's `transform`) and convert it back
+to YUV. Timing the worker showed where a 4K phone clip taken to 720p spent its time: 25.6 s per worker getting frames
+in against 0.8 s encoding them, about 170 ms a frame. The round trip also costs quality: 8-bit RGB in the middle,
+BT.709 whatever the source was, and a canvas downscale that aliases.
+
+Now the decoded planes are scaled in WebAssembly, straight into the encoder's (`x264-wasm/pare_scale.h`, linked into
+both encoders): a separable bicubic filter (Catmull-Rom), widened by the ratio when shrinking, as ffmpeg's swscale
+does, in fixed point. It matches ffmpeg's bicubic to 55.6-56.4 dB PSNR. The SIMD version runs the vertical pass 16
+samples at a time and the horizontal pass on four output rows at once, and is bit-exact with the plain C version it
+replaced. 1080p to 720p takes about 12 ms a frame for luma on this machine, 4K about 29 ms. Resized videos now keep
+their colour tags, and an HDR video resized stays HDR: 10-bit AV1 tagged HLG at 720p. Frames the encoders can't take
+as planes (Firefox decodes to RGB, and 4:2:2 or 4:4:4 sources) still go through the canvas.
+
+In Chrome at 720p, old build against new, one after the other, scored with native libvmaf against the full-size
+source:
+
+| Video | Time | VMAF NEG (worst frame) | PSNR-Y | Size |
+| --- | --- | --- | --- | --- |
+| 4K phone clip, 10 s | 35.8 → 15.8 s | 81.1 (76.9) → 85.9 (81.3) | 42.2 → 46.6 dB | 23.1% → 22.8% |
+| Phone clips, 1080p50, 20 s | 52.2 → 35.6 s | 80.6 (67.7) → 84.3 (70.8) | 34.0 → 35.0 dB | 45.9% → 47.3% |
+| Big Buck Bunny, 10 s | 32.8 → 24.5 s | 73.1 (71.1) → 83.7 (80.9) | 32.2 → 34.2 dB | 45.8% → 40.4% |
+| Rotated clip, 3 s | 17.3 → 14.1 s | 83.7 (80.9) → 87.0 (84.0) | 37.3 → 38.1 dB | 24.0% → 22.6% |
+
+The files are also smaller at the same rate factor: canvas aliasing is detail x264 had to spend bits on. Scaling is
+still most of the work at 4K (about 7 ms to copy a frame out and, with four encoders' threads competing for the cores,
+85-92 ms to scale it); a dot-product layout for the horizontal pass could about halve that part.
+
+## Firefox
+
+Firefox 155 (Playwright's build) runs Pare as it is, with one difference: its decoder hands frames over as BGRX, even
+from 10-bit AV1. Frames going into the encoder take the RGB path, which was fine, but the test encodes decoded back
+for VMAF were read as if their first plane were luma, and Auto scored both formats 0.00. They're converted back to
+luma now. After that, Firefox made the same choices as Chrome: town and a 3-second clip to AV1 (VMAF NEG 95.6 against
+H.264's 92.5), the camera footage to the superfast tier. Its RGB frames cost 3.4-5.5 s per worker to bring in, against
+0.1-0.4 s for Chrome's YUV frames; that's `enc_import_rgba`, still plain C.
 
 Same headless Chrome, same files, production builds:
 
@@ -969,6 +1005,7 @@ its spare room goes to speed ("Room to spare goes to speed").
 - `research/wasm-bench.mjs` times the WebAssembly encoder on raw frames in Node; `research/browser-ab.mjs` times a
   full compression in the browser against any deployment.
 - `research/benchmark.mjs`, `score.py` and `report.py` produce the tables in `research/BENCHMARKS.md`.
+- `research/benchmark.mjs` takes `BROWSER=webkit|firefox` and `RES=720`.
 - `research/speed_sweep.py` and `research/av1_sweep.py` are the x264 and SVT-AV1 speed sweeps;
   `research/av1_chunks.py` and `research/x264_chunks.py` measure what chunk keyframes cost, and `research/av1_keyint.py`
   what SVT-AV1's own keyframe interval costs a long chunk.
