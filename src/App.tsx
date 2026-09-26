@@ -6,7 +6,7 @@ import * as fmt from './lib/format'
 import type { Calibration, Job, QualityReport } from './lib/media'
 import type { Progress, SizePlan } from './lib/x264'
 import {
-  audioFor, CODEC_LABEL, codecName, copiesFrames, deepFormat, forEngine, halvable, keepsHdr, outputSize, type Engine, type OutputCodec, type Preset, type Probe,
+  audioFor, CODEC_LABEL, codecName, copiesFrames, deepFormat, forEngine, halvable, keepsHdr, SIZE_TARGET, outputSize, type Engine, type OutputCodec, type Preset, type Probe,
   type Settings,
 } from './lib/shared'
 
@@ -26,6 +26,8 @@ type Phase =
       quality: QualityReport | 'pending' | 'failed'
       /** The format Pare's own encoders wrote, when they ran. */
       codec?: 'avc' | 'av1'
+      /** The size target was on and the file still came out over half the original. */
+      missed?: boolean
     }
 
 type Tuning = { round: number } | { result: Calibration } | { error: string }
@@ -393,7 +395,8 @@ export default function App() {
       const { measureQuality } = await media()
       const { blob, scores } = await run.job.promise
       const url = URL.createObjectURL(blob)
-      setPhase({ kind: 'done', probe, blob, url, quality: settings.preset === 'copy' ? 'failed' : 'pending', codec })
+      const missed = engine.sizeTarget && settings.preset !== 'copy' && blob.size > probe.file.size * SIZE_TARGET
+      setPhase({ kind: 'done', probe, blob, url, quality: settings.preset === 'copy' ? 'failed' : 'pending', codec, missed })
       if (settings.preset === 'copy') return
       const quality = await measureQuality(probe, blob, scores).catch(() => 'failed' as const)
       setPhase((p) => (p.kind === 'done' && p.blob === blob ? { ...p, quality } : p))
@@ -933,7 +936,9 @@ function Ready(props: {
           )}
           <span className="estimate-detail">
             {result?.choice && result.choice.reason !== 'unlimited' && result.choice.reason !== 'fits'
-              ? choiceDetail(result.choice)
+              ? result.choice.reason === 'device' && result.size > probe.file.size * SIZE_TARGET
+                ? 'H.264 can’t halve this one, and this device can’t play AV1'
+                : choiceDetail(result.choice)
               : !result && usesX264(settings) && settings.autoCodec && settings.sizeTarget && !(tuning && 'error' in tuning)
               ? 'Test-encoding to pick the format'
               : result?.fast
@@ -1113,6 +1118,12 @@ function Done(props: {
         )}
         {!smaller && (
           <p className="note">This video was already efficiently compressed. Keep the original, or try a lower quality.</p>
+        )}
+        {smaller && props.phase.missed && (
+          <p className="note">
+            This video was already efficiently compressed, and this is as small as{' '}
+            {props.phase.codec === 'av1' ? 'AV1' : 'H.264'} could make it: short of half the size.
+          </p>
         )}
         <div className="result-actions">
           <a className={smaller ? 'button primary' : 'button'} href={url} download={name}>

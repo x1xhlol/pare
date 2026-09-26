@@ -1317,7 +1317,10 @@ function fit(probe: Probe, settings: Settings, points: PlanPoint[]): SizePlan {
   if (crf > top) crf = top + (crf - top) / 2
   const video = a.bytes * Math.exp(slope * (crf - a.crf))
   console.info(`[pare] plan: crf ${crf.toFixed(1)} → ${(video / 1e6).toFixed(2)} MB video, slope ${slope.toFixed(3)}`)
-  return { crf: Math.round(crf * 10) / 10, size: Math.min(video, goal) + audio, raised: crf > baseCrf,
+  // The encode steers to the goal, so that's the size to expect, unless even the highest rate factor misses it.
+  const atMax = a.bytes * Math.exp(slope * (profile.max - a.crf))
+  const expected = atMax > goal ? atMax : Math.min(video, goal)
+  return { crf: Math.round(crf * 10) / 10, size: expected + audio, raised: crf > baseCrf,
     fitted: settings.preset === 'visually-lossless', slope, points: sorted, bound: true }
 }
 
