@@ -26,6 +26,7 @@ type Phase =
     }
 
 type Tuning = { round: number } | { result: Calibration } | { error: string }
+type HeadStart = { key: string; job: Job; codec: 'avc' | 'av1'; progress: Progress | null; watch?: (p: Progress) => void }
 type CalibrationEntry = {
   promise: Promise<Calibration>
   controller: AbortController
@@ -131,6 +132,12 @@ export default function App() {
   const calibrations = useRef(new Map<string, CalibrationEntry>())
   const currentKey = useRef('')
   const cancelRun = useRef<(() => void) | null>(null)
+  /**
+   * A compression started in the background as soon as the plan settled, for the settings on screen: Compress picks
+   * it up where it got to. Any change of settings or file drops it, and each settings key gets one per file.
+   */
+  const headStart = useRef<HeadStart | null>(null)
+  const headStarted = useRef(new Set<string>())
   const [dragging, setDragging] = useState(false)
   const picker = useRef<HTMLInputElement>(null)
 
@@ -144,6 +151,9 @@ export default function App() {
 
   const open = useCallback(async (file: File) => {
     setPhase({ kind: 'probing', name: file.name })
+    headStart.current?.job.cancel()
+    headStart.current = null
+    headStarted.current.clear()
     for (const entry of calibrations.current.values()) entry.controller.abort()
     calibrations.current.clear()
     setTuning(null)
@@ -271,6 +281,37 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [probe, key, choosing])
 
+  // Start compressing once the plan has settled, while the settings are still on screen.
+  const settled = tuning && tuning.key === key && 'result' in tuning && tuning.result.choice?.reason !== 'testing'
+    ? tuning.result
+    : null
+  useEffect(() => {
+    if (headStart.current && headStart.current.key !== key) {
+      headStart.current.job.cancel()
+      headStart.current = null
+    }
+    if (phase.kind !== 'ready' || !probe || !usesX264(settings) || !settled || headStarted.current.has(key)) return
+    headStarted.current.add(key)
+    let dropped = false
+    void x264().then((engine) => {
+      if (dropped) return
+      const codec = settings.autoCodec ? settled.codec ?? 'avc' : thoroughCodec(settings)
+      const start = { crf: settled.crf, slope: settled.slope, points: settled.points, reuse: codec === 'avc' ? settled.reuse : undefined }
+      const spec: HeadStart = { key, codec, progress: null, job: null as unknown as Job }
+      spec.job = engine.encode(probe, { ...settings, codec }, start, (p) => {
+        spec.progress = p
+        spec.watch?.(p)
+      })
+      spec.job.promise.catch(() => {})
+      headStart.current = spec
+    })
+    return () => {
+      dropped = true
+    }
+    // `key` captures every setting that matters.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [phase.kind, probe, key, settled])
+
   useEffect(() => {
     if (phase.kind !== 'running') return
     const warn = (e: BeforeUnloadEvent) => e.preventDefault()
@@ -282,6 +323,9 @@ export default function App() {
     if (phase.kind !== 'ready') return
     const { probe } = phase
     const run: { canceled: boolean; job: Job | null } = { canceled: false, job: null }
+    const adopted = headStart.current?.key === settingsKey(settings) ? headStart.current : null
+    headStart.current = null
+    headStarted.current.add(settingsKey(settings))
     cancelRun.current = () => {
       run.canceled = true
       if (run.job) run.job.cancel()
@@ -289,14 +333,16 @@ export default function App() {
     }
     // With the size target, x264 starts from the size plan's rate factor and steers from there while it encodes.
     // Without it there is nothing to plan, and the browser's encoders need their tuned bitrate up front.
-    const planned = usesX264(settings) && settings.sizeTarget
-    const waitFor = !usesX264(settings) || planned ? ensureCalibration(probe, settings) : null
+    const planned = usesX264(settings) && settings.sizeTarget && !adopted
+    const waitFor = !adopted && (!usesX264(settings) || planned) ? ensureCalibration(probe, settings) : null
     if (waitFor) waitFor.needed = true
     setPhase({
       kind: 'running',
       probe,
-      progress: null,
-      status: !usesX264(settings)
+      progress: adopted?.progress ?? null,
+      status: adopted
+        ? 'Encoding…'
+        : !usesX264(settings)
         ? 'Finishing tuning…'
         : waitFor && !waitFor.result
           ? 'Finishing size tests…'
@@ -305,7 +351,11 @@ export default function App() {
     const onProgress = (progress: Progress) => setPhase((p) => (p.kind === 'running' ? { ...p, progress } : p))
     let codec: 'avc' | 'av1' | undefined
     try {
-      if (usesX264(settings)) {
+      if (adopted) {
+        adopted.watch = onProgress
+        run.job = adopted.job
+        codec = adopted.codec
+      } else if (usesX264(settings)) {
         const engine = await x264()
         let plan: Calibration | undefined
         if (waitFor?.first && !waitFor.result) {

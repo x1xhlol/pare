@@ -3,7 +3,7 @@
 //
 //   URL=http://localhost:4173 OUT=/tmp/bench TAG=now node research/benchmark.mjs clip.mp4 ...
 //   CODEC=auto|avc|av1 (the Format setting; default Auto), ENGINE=fast (the browser's encoder), NOLIMIT=1 (no size
-//   target), CORES=n (pretend core count)
+//   target), CORES=n (pretend core count), CLICK_AFTER=seconds after the file loads (default 1)
 //
 // Prints one JSON line per video: seconds, sizes, the app's quality line, and the encoder log.
 import { chromium } from 'playwright-core'
@@ -41,12 +41,13 @@ for (const file of process.argv.slice(2)) {
   if (process.env.WAIT === '1')
     await page.waitForFunction(() => !document.querySelector('.estimate-value.pending') &&
       !/testing AV1/.test(document.querySelector('.estimate-detail')?.textContent ?? ''), null, { timeout: 600000 })
-  else await page.waitForTimeout(Math.max(0, 1000 - (Date.now() - loaded)))
+  else await page.waitForTimeout(Math.max(0, 1000 * +(process.env.CLICK_AFTER ?? 1) - (Date.now() - loaded)))
   const estimate = (await page.textContent('.estimate-value')).trim()
   const clicked = Date.now()
   await page.click('button[type=submit]')
   await page.waitForSelector('.result', { timeout: 1800000 })
   const seconds = (Date.now() - clicked) / 1000
+  const fromLoad = (Date.now() - loaded) / 1000
   const kicker = (await page.textContent('.result-kicker')).replace(/\s+/g, ' ').trim()
   await page.waitForFunction(() => !document.querySelector('.result-quality .pending'), null, { timeout: 600000 })
   const quality = (await page.textContent('.result-quality')).replace(/\s+/g, ' ').trim()
@@ -59,7 +60,7 @@ for (const file of process.argv.slice(2)) {
   const saved = path.join(out, `${tag}-${path.basename(file)}.mp4`)
   fs.writeFileSync(saved, Buffer.from(data, 'base64'))
   console.log(JSON.stringify({
-    tag, source: file, output: saved, seconds, estimate, kicker, quality,
+    tag, source: file, output: saved, seconds, fromLoad, estimate, kicker, quality,
     bytes: fs.statSync(saved).size, original: fs.statSync(file).size, log,
   }))
   await page.close()

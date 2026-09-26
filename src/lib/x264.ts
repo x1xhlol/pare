@@ -1048,6 +1048,11 @@ const AUTO_QUICK = 93
  */
 const AUTO_STEEP = -0.18
 /**
+ * ...or where H.264 would be within this many steps of its highest rate factor: it's at the edge there (park planned at
+ * 28.3, came out over, and ended at 30 with VMAF NEG 78.9; AV1 had made 82.8 at the same size).
+ */
+const AUTO_EDGE = 3
+/**
  * How much better AV1 has to look before Auto picks it: it encodes slower and some older devices can't play it. Half a
  * point was tried: it put Big Buck Bunny on AV1 for +0.85 VMAF NEG (93.0 -> 93.8, 1:1 either way) at 1.9x the time.
  */
@@ -1079,6 +1084,9 @@ export type SizePlan = {
   scored?: Promise<void>
   /** Test windows encoded exactly as the encode will be, when it starts from the plan's lowest test. */
   reuse?: Reusable[]
+  /** Auto: AV1's test, when H.264's plan started it early, and how to stop it. */
+  av1Test?: Promise<SizePlan | null>
+  stopAv1Test?: () => void
 }
 
 /**
@@ -1136,7 +1144,8 @@ function around<T extends { crf: number; bytes: number }>(points: T[], bytes: nu
 }
 
 export async function plan(probe: Probe, settings: Settings, signal: AbortSignal, measure = false,
-                           only?: number[], tests?: [number, number]): Promise<SizePlan> {
+                           only?: number[], tests?: [number, number],
+                           onFirst?: (first: SizePlan) => void): Promise<SizePlan> {
   const began = performance.now()
   const { input, track } = await openTrack(probe.file)
   const rotation = await track.getRotation()
@@ -1261,6 +1270,7 @@ export async function plan(probe: Probe, settings: Settings, signal: AbortSignal
     ]
     const points = await videoAt([lo, hi])
     let planned = fit(probe, settings, points)
+    onFirst?.(planned)
     // Past the higher test, or far from both where size falls steeply, the straight line can be badly off: noisy
     // footage sheds bits once the noise stops being coded, and 5-second clips missed by 46-52%, which cost a second
     // encode. One more round of the same windows near the answer is much cheaper. Where size falls gently (Big Buck
@@ -1333,20 +1343,48 @@ async function playsAv1(width: number, height: number, fps: number) {
 }
 
 /** Auto, first step: H.264's size plan, with VMAF measured on its test windows. */
-export const planAvc = (probe: Probe, settings: Settings, signal: AbortSignal) =>
-  plan(probe, { ...settings, codec: 'avc' }, signal, settings.sizeTarget)
+/**
+ * Auto, first step: H.264's size plan, with VMAF measured on its test windows. Where its first round already shows the
+ * target binding on a steep curve, AV1's test (which will run anyway) starts alongside the plan's third round, on the
+ * encoders that round leaves free.
+ */
+export async function planAvc(probe: Probe, settings: Settings, signal: AbortSignal): Promise<SizePlan> {
+  let early: Promise<SizePlan | null> | undefined
+  const stop = new AbortController()
+  const cancel = () => stop.abort()
+  signal.addEventListener('abort', cancel)
+  const avc = await plan(probe, { ...settings, codec: 'avc' }, signal, settings.sizeTarget, undefined, undefined,
+    (first) => {
+      const edge = first.crf >= X264.max - AUTO_EDGE
+      if (settings.sizeTarget && first.bound && ((first.slope ?? 0) <= AUTO_STEEP || edge))
+        early = testAv1(probe, settings, first, stop.signal)
+    })
+  return { ...avc, av1Test: early, stopAv1Test: cancel }
+}
+
+/** AV1's test for Auto, bracketing where H.264's rate factor usually maps to, or null if this device can't play AV1. */
+function testAv1(probe: Probe, settings: Settings, avc: SizePlan, signal: AbortSignal) {
+  const { width, height } = outputSize(probe, settings.shortSide)
+  const guess = 1.88 * avc.crf - 10.7
+  const low = Math.round(Math.min(AV1.max - AV1_BRACKET * 2, Math.max(AV1.ceiling, guess - AV1_BRACKET)))
+  const test = playsAv1(width, height, probe.fps).then((ok) => ok
+    ? plan(probe, { ...settings, codec: 'av1' }, signal, true, AV1_TEST_WINDOWS, [low, low + AV1_BRACKET * 2])
+    : null)
+  test.catch(() => {})
+  return test
+}
 
 /** Whether H.264 can meet the size target at all, going by its plan. Otherwise Auto has to wait for AV1's test. */
 export const avcReaches = (probe: Probe, settings: Settings, avc: SizePlan) =>
   !settings.sizeTarget || !avc.bound || bytesAt(avc.points, X264.max) <= videoGoal(probe, settings)
 
 /**
- * Whether a compression started now may skip AV1's test, given H.264's plan: once its sizes are in when they fall
- * gently near the target, otherwise once its windows are scored.
+ * Whether a compression started now may skip AV1's test, given H.264's plan: at once when its size falls gently near
+ * the target and it's clear of its highest rate factor, otherwise once its windows are scored.
  */
 export async function quickStart(probe: Probe, settings: Settings, avc: SizePlan) {
   if (!avcReaches(probe, settings, avc)) return false
-  if ((avc.slope ?? 0) > AUTO_STEEP) return true
+  if ((avc.slope ?? 0) > AUTO_STEEP && avc.crf < X264.max - AUTO_EDGE) return true
   await avc.scored
   return !testsAv1(probe, settings, avc) || (vmafAt(avc.points, videoGoal(probe, settings)) ?? 0) >= AUTO_QUICK
 }
@@ -1367,21 +1405,13 @@ export function testsAv1(probe: Probe, settings: Settings, avc: SizePlan) {
 export async function settle(probe: Probe, settings: Settings, avc: SizePlan, signal: AbortSignal): Promise<Choice> {
   if (!settings.sizeTarget) return { codec: 'avc', plan: avc, reason: 'unlimited' }
   if (!avc.bound) return { codec: 'avc', plan: avc, reason: 'fits' }
-  const { width, height } = outputSize(probe, settings.shortSide)
-  const plays = playsAv1(width, height, probe.fps)
-  // AV1's test starts while H.264's windows are still being scored, and is dropped if the scores make it unneeded.
-  // Two windows choose as well as four (research/codec_choice.py), and four test encodes on four cores take about half
-  // as long as eight sharing them. It brackets where H.264's answer usually maps to (1.88 x H.264's - 10.7, give or
-  // take 5.6), which is quicker to encode than AV1's quality ceiling.
+  // AV1's test starts while H.264's windows are still being scored (or earlier, from H.264's plan), and is dropped if
+  // the scores make it unneeded. Two windows choose as well as four (research/codec_choice.py), and four test encodes
+  // on four cores take about half as long as eight sharing them.
   const early = new AbortController()
   const cancel = () => early.abort()
   signal.addEventListener('abort', cancel)
-  const guess = 1.88 * avc.crf - 10.7
-  const low = Math.round(Math.min(AV1.max - AV1_BRACKET * 2, Math.max(AV1.ceiling, guess - AV1_BRACKET)))
-  const testing = plays.then((ok) => ok
-    ? plan(probe, { ...settings, codec: 'av1' }, early.signal, true, AV1_TEST_WINDOWS, [low, low + AV1_BRACKET * 2])
-    : null)
-  testing.catch(() => {})
+  const testing = avc.av1Test ?? testAv1(probe, settings, avc, early.signal)
   try {
     await avc.scored
     const goal = videoGoal(probe, settings)
@@ -1404,11 +1434,15 @@ export async function settle(probe: Probe, settings: Settings, avc: SizePlan, si
       `rate factors ${avc.crf} / ${av1.crf}`)
     // x264 at its highest rate factor still over the target: only AV1 can keep the size promise.
     if (!reaches && bytesAt(av1.points, AV1.max) <= goal) return { codec: 'av1', plan: av1, vmaf, reason: 'size' }
-    if (vmaf.av1 !== undefined && vmaf.av1 - vmaf.avc >= AUTO_MARGIN) return { codec: 'av1', plan: av1, vmaf, reason: 'better' }
+    // At the edge of its range H.264 has no headroom, and a first pass over the size ends at its highest rate factor
+    // (park: planned 28.3, finished at 30 with 78.9 against a predicted 82.8), so there AV1 wins ties.
+    const margin = avc.crf >= X264.max - AUTO_EDGE ? 0 : AUTO_MARGIN
+    if (vmaf.av1 !== undefined && vmaf.av1 - vmaf.avc >= margin) return { codec: 'av1', plan: av1, vmaf, reason: 'better' }
     return { codec: 'avc', plan: avc, vmaf, reason: 'even' }
   } finally {
     // A decision without AV1's test stops it.
     cancel()
+    avc.stopAv1Test?.()
     signal.removeEventListener('abort', cancel)
   }
 }
