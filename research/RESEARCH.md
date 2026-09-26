@@ -621,6 +621,39 @@ as 6, leaving encoders idle until the end-of-encode cuts. The planner now steps 
 2,848 simulated clip lengths and keyframe spacings it was never worse and gave a lower longest chunk in 38% of them
 (240 frames with a keyframe every 60: 41.7 → 31.0 frames' worth of work). AV1 on town went from 7 encoders to 8.
 
+## Fewer, longer x264 chunks for short videos
+
+x264 pays for chunk keyframes too. `research/x264_chunks.py` does for Pare's x264 settings what `av1_chunks.py` does
+for AV1 (192 frames, CRF 18-26, BD-rate on VMAF NEG against one encode):
+
+| Chunk length | town | tree | park | Big Buck Bunny |
+| --- | --- | --- | --- | --- |
+| 32 | +41.8% | +24.9% | +5.7% | +34.4% |
+| 96 | +7.9% | +4.8% | +1.0% | +6.4% |
+
+x264's `--ipratio` (how much better keyframes are than P-frames) changed nothing at any setting: with the
+macroblock tree on, keyframe quality comes from how much the following frames use it. So the lever is the number of
+chunks. On a 10-second clip, 8 encoders get 37-frame chunks; x264's own frame threads can use the cores instead.
+Each layout at the same rate factor, no size target (encode time, file, VMAF NEG):
+
+| Layout | Big Buck Bunny, 300 frames | town, 250 | tree, 250 |
+| --- | --- | --- | --- |
+| 8 encoders × 2 threads | 14.3 s, 22.75 MB, 94.63 | 11.6 s, 21.51 MB, 95.14 | 11.2 s, 23.63 MB, 95.55 |
+| 4 × 4 | 12.6 s, 22.07 MB, 94.78 | 10.8 s, 21.34 MB, 95.37 | 10.9 s, 23.27 MB, 95.71 |
+| 3 × 5 | 12.1 s, 21.90 MB, 94.82 | 10.8 s, 21.24 MB, 95.37 | 12.0 s, 23.14 MB, 95.69 |
+| 2 × 8 | 12.2 s, 22.00 MB, 94.80 | 11.0 s, 21.23 MB, 95.46 | 10.5 s, 23.08 MB, 95.78 |
+
+Fewer encoders were faster as well as better: fewer chunks means fewer decoders working through frames before their
+start (Big Buck Bunny's keyframes are 250 frames apart), and fewer lookaheads filling up. From 500 frames up, 8 × 2
+was a little faster (the phone clips, 20 s: 30.9 against 31.9 s). So x264 now halves its encoders, doubling their
+threads, until chunks are at least 60 frames long. In the app, Big Buck Bunny went from 25.6 to 24.6 s and from
+VMAF NEG 92.8 to 93.1, in a file 56% smaller instead of 54%, and the screen recording came out at 3.49 MB instead of
+4.10 at the same VMAF NEG.
+
+The size plan still counts keyframes as if there were 8 chunks. Counting 4 made Big Buck Bunny's plan 11% smaller
+(a test window's keyframe is pricier than what one fewer keyframe saves in a real chunk: 3% at the same rate
+factor), it chose CRF 18.1 instead of 19.1, came out 9% over, and needed a second pass.
+
 ## End to end in the browser
 
 Same headless Chrome, same files, production builds:

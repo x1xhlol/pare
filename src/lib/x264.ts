@@ -227,7 +227,18 @@ export type Layout = {
  * tight, each running x264 with its own frame threads. Threads add a frame in flight rather than a whole encoder's
  * worth of memory, so cores beyond what memory allows go to them too.
  */
-export function workerCount(probe: Probe, settings: Settings): Layout {
+/**
+ * Every chunk starts with a keyframe, and on short chunks that costs: coded as 32-frame chunks, town took 42% more bits
+ * than as one encode for the same VMAF NEG, at 96 frames 8% (research/x264_chunks.py). So a short video gets fewer,
+ * longer x264 chunks, each with the threads the others would have had. Big Buck Bunny (300 frames) at one rate factor:
+ * 8 encoders x 2 threads took 14.3 s for 22.75 MB at VMAF NEG 94.63; 4 x 4 took 12.6 s for 22.07 MB at 94.78, with
+ * less decoding before each chunk as well. From 500 frames up, 8 x 2 was a little faster (phone clips, 20 s: 30.9
+ * against 31.9 s).
+ */
+const MIN_CHUNK_FRAMES = 60
+
+/** The encoders and threads for the whole encode; for x264, fewer and longer chunks when `frames` is short. */
+export function workerCount(probe: Probe, settings: Settings, frames?: number): Layout {
   const { width, height } = outputSize(probe, settings.shortSide)
   const profile = profileFor(settings)
   const cores = navigator.hardwareConcurrency || 4
@@ -238,7 +249,10 @@ export function workerCount(probe: Probe, settings: Settings): Layout {
   // and copies them in, its other thread keeps x264 busy. Measured 13% faster on a 4-core, 8-thread machine.
   // SVT-AV1's own threading starts dozens of threads per encoder, so AV1 runs one thread per encoder.
   const threads = canThread && profile.threaded ? Math.max(2, Math.min(4, Math.floor(cores / encoders))) : 1
-  return { encoders, threads }
+  if (!frames || threads === 1) return { encoders, threads }
+  let fewer = encoders
+  while (fewer > 1 && frames / fewer < MIN_CHUNK_FRAMES) fewer = Math.ceil(fewer / 2)
+  return { encoders: fewer, threads: Math.min(8, Math.floor((encoders * threads) / fewer)) }
 }
 
 async function openTrack(file: Blob) {
@@ -849,7 +863,7 @@ export function encode(probe: Probe, settings: Settings, start: EncodeStart, onP
       const [line, tuned] = await Promise.all([timeline(probe.file), encoderOptions(probe, settings, crf)])
       const options = start.fast && profile === X264 ? fastest(tuned) : tuned
       const { times } = line
-      const { encoders, threads } = workerCount(probe, settings)
+      const { encoders, threads } = workerCount(probe, settings, times.length)
       // The plan's test windows are finished chunks when they were encoded with exactly these settings: x264 at the
       // rate factor this encode starts from.
       const reuse = profile === X264 && start.reuse?.length && crf === floor ? start.reuse : []
@@ -1211,6 +1225,9 @@ export async function plan(probe: Probe, settings: Settings, signal: AbortSignal
   const windows = picked?.length ? picked.map((i) => all[i]) : all
   const count = Math.min(encoders, windows.length * 2)
   // The real encode starts a keyframe per chunk and roughly every 250 frames, plus one per scene cut.
+  // Counted for 8 chunks even when a short video is encoded in fewer: ESTIMATE_BIAS was calibrated there, and a test
+  // window's keyframe overstates what one saves (4 chunks instead of 8 made Big Buck Bunny 3% smaller, not 12%).
+  const encodeWith = workerCount(probe, settings, times.length).encoders
   const fixedKeyframes = planChunks(line, encoders, profile.decodeShare).length + Math.floor(times.length / 250)
   if (signal.aborted) throw new Canceled()
   const fps = probe.fps || 30
@@ -1306,7 +1323,7 @@ export async function plan(probe: Probe, settings: Settings, signal: AbortSignal
     ]
     if (fastFirst && score) {
       // The encode keeps these windows and splits the rest around them, which takes more keyframes.
-      const around = planAround(line, encoders, windows).chunks.length + Math.floor(times.length / 250)
+      const around = planAround(line, encodeWith, windows).chunks.length + Math.floor(times.length / 250)
       const [quick] = await videoAt([lo], fastest(options), true, around)
       // Waiting for the scores costs about a second. Starting the encode without them (and starting over with the
       // full settings if they came in low) finished no sooner: the scoring took the cores from the encode.

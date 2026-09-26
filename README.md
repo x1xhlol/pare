@@ -31,6 +31,10 @@ Pare now runs its own build of x264:
   second build compiled with pthreads. The second thread keeps x264 working while the encoder waits for decoded frames,
   which makes encoding 13% faster on the same cores. Machines with more than 8 cores, and refits that redo only a
   few chunks, get more threads per encoder.
+- **Few keyframes on short videos.** Every chunk starts with a keyframe, and on a 10-second clip 8 chunks cost up to
+  a third more bits than one encode at the same quality. Short videos get fewer, longer x264 chunks with more threads
+  each (Big Buck Bunny: faster, and VMAF NEG 92.8 → 93.1 at the same size), and AV1's keyframes are made cheaper to
+  suit chunks this short (1.9–6.1% fewer bits).
 - **A head start.** Once the size plan and the format are settled, Pare starts compressing while the settings are
   still on screen, and Compress picks it up wherever it got to. Clicking 15 seconds after loading, camera footage was
   ready 0.1 s after the click instead of 16.9 s: it had finished while the settings were on screen.
