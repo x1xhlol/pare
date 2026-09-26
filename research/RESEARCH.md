@@ -948,8 +948,9 @@ BT.709 whatever the source was, and a canvas downscale that aliases.
 Now the decoded planes are scaled in WebAssembly, straight into the encoder's (`x264-wasm/pare_scale.h`, linked into
 both encoders): a separable bicubic filter (Catmull-Rom), widened by the ratio when shrinking, as ffmpeg's swscale
 does, in fixed point. It matches ffmpeg's bicubic to 55.6-56.4 dB PSNR. The SIMD version runs the vertical pass 16
-samples at a time and the horizontal pass on four output rows at once, and is bit-exact with the plain C version it
-replaced. 1080p to 720p takes about 12 ms a frame for luma on this machine, 4K about 29 ms. Resized videos now keep
+samples at a time into 16-bit lanes, then lays four output rows out as pairs of neighbouring samples, so one dot
+product makes two taps of all four. It's bit-exact with the plain C version it replaced, and took luma from 1080p to
+720p in 5.8 ms a frame on this machine (11.7 ms before the dot products), from 4K in 13.7 ms (28.8). Resized videos now keep
 their colour tags, and an HDR video resized stays HDR: 10-bit AV1 tagged HLG at 720p. Frames the encoders can't take
 as planes (Firefox decodes to RGB, and 4:2:2 or 4:4:4 sources) still go through the canvas.
 
@@ -963,9 +964,9 @@ source:
 | Big Buck Bunny, 10 s | 32.8 → 24.5 s | 73.1 (71.1) → 83.7 (80.9) | 32.2 → 34.2 dB | 45.8% → 40.4% |
 | Rotated clip, 3 s | 17.3 → 14.1 s | 83.7 (80.9) → 87.0 (84.0) | 37.3 → 38.1 dB | 24.0% → 22.6% |
 
-The files are also smaller at the same rate factor: canvas aliasing is detail x264 had to spend bits on. Scaling is
-still most of the work at 4K (about 7 ms to copy a frame out and, with four encoders' threads competing for the cores,
-85-92 ms to scale it); a dot-product layout for the horizontal pass could about halve that part.
+The files are also smaller at the same rate factor: canvas aliasing is detail x264 had to spend bits on. A later run
+with the faster version, while another job loaded the machine: the time each worker spent bringing frames in went
+from 44.5 s to 5.6 s on the 4K clip, 48.9 s to 5.3 s on the phone clips and 10.9 s to 1.8 s on Big Buck Bunny.
 
 ## Firefox
 
@@ -974,7 +975,9 @@ from 10-bit AV1. Frames going into the encoder take the RGB path, which was fine
 for VMAF were read as if their first plane were luma, and Auto scored both formats 0.00. They're converted back to
 luma now. After that, Firefox made the same choices as Chrome: town and a 3-second clip to AV1 (VMAF NEG 95.6 against
 H.264's 92.5), the camera footage to the superfast tier. Its RGB frames cost 3.4-5.5 s per worker to bring in, against
-0.1-0.4 s for Chrome's YUV frames; that's `enc_import_rgba`, still plain C.
+0.1-0.4 s for Chrome's YUV frames. The conversion to YUV is now WebAssembly SIMD too (`x264-wasm/pare_rgb.h`,
+bit-exact, 13.2 → 4.3 ms a 1080p frame), but most of the time is Firefox's own `copyTo`, about 68 ms a frame here: its
+decoder hands over BGRX whether asked for hardware or software decoding.
 
 Same headless Chrome, same files, production builds:
 

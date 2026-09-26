@@ -7,6 +7,7 @@
 #include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 #include <wasm_simd128.h>
 
 #define SCALE_BITS 14 // filter weights sum to 1 << SCALE_BITS
@@ -57,9 +58,10 @@ static int16_t *scale_filter(int sn, int dn, int *taps_out, int **starts_out) {
   return weights;
 }
 
-// The vertical filter over `taps` lines for every sample of a row, rounded and shifted down by `down` bits. 8-bit
-// samples go 16 at a time, 10- and 12-bit ones 8 at a time, each widened to 16 bits and multiplied into 32.
-static void scale_rows(int32_t *acc, const uint8_t *const *lines, const int16_t *w, int taps, int row, int bytes,
+// The vertical filter over `taps` lines for every sample of a row, rounded and shifted down by `down` bits into 16-bit
+// lanes (the results stay within ±20,500). 8-bit samples go 16 at a time, 10- and 12-bit ones 8 at a time, each widened
+// to 16 bits and multiplied into 32.
+static void scale_rows(int16_t *acc, const uint8_t *const *lines, const int16_t *w, int taps, int row, int bytes,
                        int down) {
   const v128_t round = wasm_i32x4_splat(1 << (down - 1));
   int x = 0;
@@ -74,10 +76,8 @@ static void scale_rows(int32_t *acc, const uint8_t *const *lines, const int16_t 
         a2 = wasm_i32x4_add(a2, wasm_i32x4_extmul_low_i16x8(hi, wk));
         a3 = wasm_i32x4_add(a3, wasm_i32x4_extmul_high_i16x8(hi, wk));
       }
-      wasm_v128_store(acc + x, wasm_i32x4_shr(a0, down));
-      wasm_v128_store(acc + x + 4, wasm_i32x4_shr(a1, down));
-      wasm_v128_store(acc + x + 8, wasm_i32x4_shr(a2, down));
-      wasm_v128_store(acc + x + 12, wasm_i32x4_shr(a3, down));
+      wasm_v128_store(acc + x, wasm_i16x8_narrow_i32x4(wasm_i32x4_shr(a0, down), wasm_i32x4_shr(a1, down)));
+      wasm_v128_store(acc + x + 8, wasm_i16x8_narrow_i32x4(wasm_i32x4_shr(a2, down), wasm_i32x4_shr(a3, down)));
     }
   else
     for (; x + 8 <= row; x += 8) {
@@ -87,13 +87,12 @@ static void scale_rows(int32_t *acc, const uint8_t *const *lines, const int16_t 
         a0 = wasm_i32x4_add(a0, wasm_i32x4_extmul_low_i16x8(p, wk));
         a1 = wasm_i32x4_add(a1, wasm_i32x4_extmul_high_i16x8(p, wk));
       }
-      wasm_v128_store(acc + x, wasm_i32x4_shr(a0, down));
-      wasm_v128_store(acc + x + 4, wasm_i32x4_shr(a1, down));
+      wasm_v128_store(acc + x, wasm_i16x8_narrow_i32x4(wasm_i32x4_shr(a0, down), wasm_i32x4_shr(a1, down)));
     }
   for (; x < row; x++) {
     int32_t a = 1 << (down - 1);
     for (int k = 0; k < taps; k++) a += w[k] * (bytes == 1 ? lines[k][x] : ((const uint16_t *)lines[k])[x]);
-    acc[x] = a >> down;
+    acc[x] = (int16_t)(a >> down);
   }
 }
 
@@ -102,20 +101,28 @@ static void scale_rows(int32_t *acc, const uint8_t *const *lines, const int16_t 
 // dst + (x * dst_step + c) * dst_bytes, rows `dst_stride` bytes apart, shifted right by `shift` bits (12-bit into a
 // 10-bit encoder: 2; 10-bit into an 8-bit one: 2), rounded and clamped to `max`. Returns 0, or -1 without memory.
 //
-// Four output rows at a time: their vertical sums are interleaved sample by sample, so the horizontal filter makes all
-// four with each multiply.
+// Four output rows at a time. Their vertical sums are laid out as pairs of neighbouring samples, four rows to a vector,
+// so each dot product makes two taps of all four rows.
 EMSCRIPTEN_KEEPALIVE int scale_plane(const uint8_t *src, int src_stride, int sw, int sh, int src_bytes, int channels,
                                      uint8_t *dst, int dst_stride, int dw, int dh, int dst_bytes, int dst_step,
                                      int shift, int max) {
   int vtaps, htaps, *vstart = NULL, *hstart = NULL;
   int16_t *vw = scale_filter(sh, dh, &vtaps, &vstart), *hw = scale_filter(sw, dw, &htaps, &hstart);
-  const int row = sw * channels;
-  int32_t *acc = malloc((size_t)row * 4 * sizeof(int32_t)), *quad = malloc(((size_t)row * 4 + 4) * sizeof(int32_t));
+  const int row = sw * channels, pad = 16, pairs = (htaps + 1) / 2;
+  int16_t *acc = malloc(((size_t)row + pad) * 4 * sizeof(int16_t));
+  int32_t *quad = malloc(((size_t)row + pad) * 4 * sizeof(int32_t)), *wp = malloc((size_t)dw * pairs * sizeof(int32_t));
   const uint8_t **lines = malloc((size_t)vtaps * sizeof(*lines));
-  if (!vw || !hw || !acc || !quad || !lines) {
-    free(vw), free(hw), free(vstart), free(hstart), free(acc), free(quad), free(lines);
+  if (!vw || !hw || !acc || !quad || !wp || !lines) {
+    free(vw), free(hw), free(vstart), free(hstart), free(acc), free(quad), free(wp), free(lines);
     return -1;
   }
+  // Each output position's weights in pairs, as the dot product takes them; an odd last tap pairs with 0.
+  for (int x = 0; x < dw; x++)
+    for (int j = 0; j < pairs; j++) {
+      const int16_t w0 = hw[x * htaps + 2 * j], w1 = 2 * j + 1 < htaps ? hw[x * htaps + 2 * j + 1] : 0;
+      wp[x * pairs + j] = (int32_t)(uint16_t)w0 | (int32_t)((uint32_t)(uint16_t)w1 << 16);
+    }
+  memset(acc, 0, ((size_t)row + pad) * 4 * sizeof(int16_t));
   // The vertical pass keeps `extra` bits of its fraction: as many as fit the horizontal sum in 32 bits.
   const int extra = src_bytes == 1 ? 6 : 2, down = SCALE_BITS - extra, final = SCALE_BITS + extra + shift;
   const v128_t round = wasm_i32x4_splat(1 << (final - 1)), low = wasm_i32x4_splat(0), high = wasm_i32x4_splat(max);
@@ -125,29 +132,29 @@ EMSCRIPTEN_KEEPALIVE int scale_plane(const uint8_t *src, int src_stride, int sw,
     for (int r = 0; r < 4; r++) {
       const int y = y0 + (r < rows ? r : rows - 1);
       for (int k = 0; k < vtaps; k++) lines[k] = src + (size_t)(vstart[y] + k) * src_stride;
-      scale_rows(acc + (size_t)r * row, lines, vw + y * vtaps, vtaps, row, src_bytes, down);
+      scale_rows(acc + (size_t)r * (row + pad), lines, vw + y * vtaps, vtaps, row, src_bytes, down);
     }
-    const int32_t *r0 = acc, *r1 = acc + row, *r2 = acc + 2 * row, *r3 = acc + 3 * row;
-    int s = 0;
-    for (; s + 4 <= row; s += 4) {
-      const v128_t a = wasm_v128_load(r0 + s), b = wasm_v128_load(r1 + s), c = wasm_v128_load(r2 + s),
-                   d = wasm_v128_load(r3 + s);
+    // quad[4 i + r]: row r's samples i and i + channels, as a pair of 16-bit lanes.
+    const int16_t *r0 = acc, *r1 = acc + row + pad, *r2 = acc + 2 * (row + pad), *r3 = acc + 3 * (row + pad);
+    for (int i = 0; i < row; i += 4) {
+#define SCALE_PAIRS(r) wasm_i16x8_shuffle(wasm_v128_load64_zero(r + i), wasm_v128_load64_zero(r + i + channels), 0, 8, 1, 9, 2, 10, 3, 11)
+      const v128_t a = SCALE_PAIRS(r0), b = SCALE_PAIRS(r1), c = SCALE_PAIRS(r2), d = SCALE_PAIRS(r3);
+#undef SCALE_PAIRS
       const v128_t ab01 = wasm_i32x4_shuffle(a, b, 0, 4, 1, 5), ab23 = wasm_i32x4_shuffle(a, b, 2, 6, 3, 7);
       const v128_t cd01 = wasm_i32x4_shuffle(c, d, 0, 4, 1, 5), cd23 = wasm_i32x4_shuffle(c, d, 2, 6, 3, 7);
-      wasm_v128_store(quad + 4 * s, wasm_i32x4_shuffle(ab01, cd01, 0, 1, 4, 5));
-      wasm_v128_store(quad + 4 * s + 4, wasm_i32x4_shuffle(ab01, cd01, 2, 3, 6, 7));
-      wasm_v128_store(quad + 4 * s + 8, wasm_i32x4_shuffle(ab23, cd23, 0, 1, 4, 5));
-      wasm_v128_store(quad + 4 * s + 12, wasm_i32x4_shuffle(ab23, cd23, 2, 3, 6, 7));
+      wasm_v128_store(quad + 4 * i, wasm_i32x4_shuffle(ab01, cd01, 0, 1, 4, 5));
+      wasm_v128_store(quad + 4 * i + 4, wasm_i32x4_shuffle(ab01, cd01, 2, 3, 6, 7));
+      wasm_v128_store(quad + 4 * i + 8, wasm_i32x4_shuffle(ab23, cd23, 0, 1, 4, 5));
+      wasm_v128_store(quad + 4 * i + 12, wasm_i32x4_shuffle(ab23, cd23, 2, 3, 6, 7));
     }
-    for (; s < row; s++) quad[4 * s] = r0[s], quad[4 * s + 1] = r1[s], quad[4 * s + 2] = r2[s], quad[4 * s + 3] = r3[s];
     uint8_t *out = dst + (size_t)y0 * dst_stride;
     for (int x = 0; x < dw; x++) {
-      const int16_t *h = hw + x * htaps;
+      const int32_t *w = wp + x * pairs;
       for (int c = 0; c < channels; c++) {
         const int32_t *base = quad + 4 * (hstart[x] * channels + c);
         v128_t sum = round;
-        for (int k = 0; k < htaps; k++)
-          sum = wasm_i32x4_add(sum, wasm_i32x4_mul(wasm_v128_load(base + 4 * k * channels), wasm_i32x4_splat(h[k])));
+        for (int j = 0; j < pairs; j++)
+          sum = wasm_i32x4_add(sum, wasm_i32x4_dot_i16x8(wasm_v128_load(base + 8 * j * channels), wasm_i32x4_splat(w[j])));
         const v128_t v = wasm_i32x4_min(wasm_i32x4_max(wasm_i32x4_shr(sum, final), low), high);
         const size_t at = (size_t)x * dst_step + c;
         if (dst_bytes == 1) {
@@ -164,6 +171,6 @@ EMSCRIPTEN_KEEPALIVE int scale_plane(const uint8_t *src, int src_stride, int sw,
       }
     }
   }
-  free(vw), free(hw), free(vstart), free(hstart), free(acc), free(quad), free(lines);
+  free(vw), free(hw), free(vstart), free(hstart), free(acc), free(quad), free(wp), free(lines);
   return 0;
 }
