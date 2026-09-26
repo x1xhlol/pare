@@ -938,6 +938,13 @@ Now town and a 3-second clip compress in WebKit, to H.264 (42% and 50% of the or
 included. It's slow: the size plan took 34 s on town against 11 s in Chrome. Real Safari on a Mac decodes with
 VideoToolbox instead, and hasn't been tried.
 
+WebKit also decodes HEVC, which headless Chrome here can't, so it's the one place phone-style video could be tried:
+8-bit HEVC comes out as I420 and goes in directly (40.8% of the size, SSIM 0.975), while 10-bit HEVC comes out in a
+format WebCodecs doesn't name, so it takes the canvas and becomes SDR, as the settings say. That clip also showed a
+promise Pare couldn't keep: efficient HEVC that H.264 can't halve, with AV1 not decoding there. The settings had
+estimated -53% and the result said only "Done" at -45%; now the estimate is what x264's highest rate factor gives
+(-35%), and both screens say half the size is out of reach.
+
 ## Resizing without a canvas
 
 Resizing used to draw every frame on an RGB canvas at the output size (Mediabunny's `transform`) and convert it back
