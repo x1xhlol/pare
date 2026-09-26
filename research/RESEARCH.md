@@ -1050,7 +1050,15 @@ two tests 10 apart said park would hold 93 at 28, where it really scores 82. A t
 windows themselves are off by about 3 points against their scenes (park's read 85.7 at 28 against 82.4; ducks' 82.5
 at 25 against 84.0), and the gain lives in offsets of about 1.5. The encode moved park too far and park became the
 new worst part. Doing this well needs each chunk's own quality, which means measuring the first pass and encoding
-some chunks again: a different trade of time for quality, not tried yet.
+some chunks again.
+
+That was tried next, with the one measure the first pass has for free: the encoder's SSIM on every frame. The bytes
+the first pass leaves under the limit (typically 3-4% of the source) went to the chunks losing at least 1.3 times the
+median chunk's 1 − SSIM, encoded again up to 3 finer. On the phone clips it picked two tree chunks, spent the room
+(46.5% → 48.8% of the source) and 32 s, and the file got slightly worse (VMAF NEG 87.94 → 87.76, worst 1% of frames
+79.19 → 78.37). SSIM ranks the chunks differently from VMAF NEG: tree's fine detail costs SSIM, ducks' water costs
+VMAF. On Big Buck Bunny, town and ducks the chunks' SSIM was too even for it to start. Not shipped either; the next
+thing to try would be scoring a few frames of every finished chunk with VMAF, which the workers can do.
 
 ## End to end in the browser
 
