@@ -383,6 +383,8 @@ type Pool = {
     onProgress: (frames: number, stats: FrameStat[], index: number) => void,
     prepare?: (chunk: WorkerChunk) => WorkerChunk,
     divider?: Divider,
+    /** Applied to each chunk as it finishes. */
+    keep?: (chunk: EncodedChunk) => EncodedChunk,
   ): Promise<EncodedChunk[]>
   terminate(): void
   /** x264 threads per encoder: what was asked for, or 1 if the threaded build couldn't start. */
@@ -484,7 +486,7 @@ async function startPool(profile: Profile, build: EncoderBuild, size: number, th
     terminate,
     threads,
     score: (index) => scoreOf(index).promise,
-    run: (chunks, onProgress, prepare, divider) =>
+    run: (chunks, onProgress, prepare, divider, keep) =>
       new Promise((resolve, reject) => {
         abort = reject
         const queue = [...chunks]
@@ -551,7 +553,7 @@ async function startPool(profile: Profile, build: EncoderBuild, size: number, th
               ask()
             } else if (message.type === 'done') {
               running.delete(worker)
-              results[message.chunk.index] = message.chunk
+              results[message.chunk.index] = keep ? keep(message.chunk) : message.chunk
               if (--pending === 0) resolve(results)
               else next(worker)
             } else if (message.type === 'error') {
@@ -654,14 +656,34 @@ function planAround({ times }: Timeline, workers: number, done: (Omit<Reusable, 
   return { chunks, reused }
 }
 
+const EMPTY = new Uint8Array(0)
+
+/**
+ * Hands a finished chunk's frames to the browser's blob store, keeping their sizes and timing: an hour of video would
+ * otherwise sit in the page's memory until the file is written. Chrome keeps large blobs on disk.
+ */
+function stash(chunk: EncodedChunk): EncodedChunk {
+  if (chunk.store) return chunk
+  return { ...chunk, store: new Blob(chunk.packets.map((p) => p.data)), packets: chunk.packets.map((p) => ({ ...p, data: EMPTY })) }
+}
+
+/** A stashed chunk's frames back in memory, for writing the file. */
+async function unstash(chunk: EncodedChunk): Promise<EncodedChunk> {
+  if (!chunk.store) return chunk
+  const all = new Uint8Array(await chunk.store.arrayBuffer())
+  let at = 0
+  return { ...chunk, packets: chunk.packets.map((p) => ({ ...p, data: all.subarray(at, (at += p.size)) })) }
+}
+
 async function mux(probe: Probe, settings: Settings, chunks: EncodedChunk[], size: { width: number; height: number },
                    { rotation, flip }: Orientation) {
-  const parts: Uint8Array<ArrayBuffer>[] = []
+  // The file goes to the blob store as it's written, 8 MB at a time, rather than piling up in the page.
+  const parts: Blob[] = []
   let written = 0
   const writable = new WritableStream<{ type: 'write'; data: Uint8Array<ArrayBuffer>; position: number }>({
     write(chunk) {
       if (chunk.position !== written) throw new Error('Output was written out of order.')
-      parts.push(chunk.data)
+      parts.push(new Blob([chunk.data]))
       written += chunk.data.byteLength
     },
   })
@@ -703,7 +725,8 @@ async function mux(probe: Probe, settings: Settings, chunks: EncodedChunk[], siz
     const frameDuration = allTimes.length > 1 ? (allTimes[allTimes.length - 1] - allTimes[0]) / (allTimes.length - 1) : 1 / 30
     let first = true
     let offset = 0
-    for (const chunk of chunks) {
+    for (const stashed of chunks) {
+      const chunk = await unstash(stashed)
       for (const packet of chunk.packets) {
         const i = offset + packet.pts
         const timestamp = allTimes[i]
@@ -823,7 +846,7 @@ function spread<T>(items: T[], first: number): T[] {
   return [...items.filter((_, i) => picked.has(i)), ...items.filter((_, i) => !picked.has(i))]
 }
 
-const chunkBytes = (c: EncodedChunk) => c.packets.reduce((t, p) => t + p.data.byteLength, 0)
+const chunkBytes = (c: EncodedChunk) => c.packets.reduce((t, p) => t + p.size, 0)
 
 /** What a chunk's opening keyframe costs over an ordinary frame, on average: the price of one more cut. */
 function keyframeCost(chunks: EncodedChunk[]) {
@@ -831,9 +854,9 @@ function keyframeCost(chunks: EncodedChunk[]) {
   for (const c of chunks)
     for (const p of c.packets) {
       if (p.pts === 0) {
-        keys += p.data.byteLength
+        keys += p.size
       } else {
-        rest += p.data.byteLength
+        rest += p.size
         count++
       }
     }
@@ -1014,7 +1037,7 @@ export function encode(probe: Probe, settings: Settings, start: EncodeStart, onP
       }
       for (const [index, chunk] of reused) {
         budget?.assign(index)
-        budget?.add(index, chunk.packets.map((p) => ({ bytes: p.data.byteLength, crf, first: p.pts === 0 })))
+        budget?.add(index, chunk.packets.map((p) => ({ bytes: p.size, crf, first: p.pts === 0 })))
         finished += chunk.times.length
       }
       const encoded = await pool.run(
@@ -1025,8 +1048,9 @@ export function encode(probe: Probe, settings: Settings, start: EncodeStart, onP
         },
         budget ? (chunk) => withCrf(chunk, budget.assign(chunk.index)) : undefined,
         divider,
+        stash,
       )
-      for (const [index, chunk] of reused) encoded[index] = chunk
+      for (const [index, chunk] of reused) encoded[index] = stash(chunk)
       const passes = [chunks.map((c) => crfs[c.index].toFixed(1)).join(' ')]
 
       // The size limit is a promise, so check the real total and encode chunks again until it holds. A total far
@@ -1068,7 +1092,7 @@ export function encode(probe: Probe, settings: Settings, start: EncodeStart, onP
             poolThreads = pool.threads
             if (canceled) throw new Canceled()
           }
-          const redone = await pool!.run(again, (frames) => report(frames, 'refitting'))
+          const redone = await pool!.run(again, (frames) => report(frames, 'refitting'), undefined, undefined, stash)
           for (const c of redone) if (c) encoded[c.index] = c
           const before = total
           total = encoded.reduce((t, c) => t + chunkBytes(c), 0)
@@ -1394,8 +1418,8 @@ export async function plan(probe: Probe, settings: Settings, signal: AbortSignal
       for (const chunk of tests) {
         frames += chunk.times.length
         for (const p of chunk.packets) {
-          if (p.key) (keyBytes += p.data.byteLength), keyCount++
-          else (restBytes += p.data.byteLength), restCount++
+          if (p.key) (keyBytes += p.size), keyCount++
+          else (restBytes += p.size), restCount++
           if (p.key && p.pts > 0) sceneCuts++
         }
       }

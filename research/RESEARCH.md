@@ -1005,6 +1005,11 @@ fixed:
   one actually encoded.
 - The fast engine's size estimate, the Repackage summary and the HDR note for H.264 disagreed with what would happen.
 
+Separately, finished chunks' frames and the MP4 being written now go to the browser's blob store as they're made, not
+held in the page until the end. On the 2-minute benchmark video the page's peak memory didn't change (4.66 GB either
+way: eight encoders' WebAssembly memory is most of it, and the file is 189 MB). It's for long videos: an hour of
+1080p makes about 1 GB of output, which the page used to hold twice, and Chrome keeps large blobs on disk.
+
 ## End to end in the browser
 
 Same headless Chrome, same files, production builds:

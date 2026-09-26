@@ -59,8 +59,10 @@ export type EncodedChunk = {
   /** Source timestamp of each input frame, by x264 pts. */
   times: number[]
   /** SSIM of each output frame against its input, as measured by x264 (luma). */
-  packets: { data: Uint8Array<ArrayBuffer>; pts: number; key: boolean; ssim: number }[]
+  packets: { data: Uint8Array<ArrayBuffer>; size: number; pts: number; key: boolean; ssim: number }[]
   headers: Uint8Array<ArrayBuffer>
+  /** The frames' bytes, back to back, once the page has handed them to the browser (their `data` is then empty). */
+  store?: Blob
 }
 export type WorkerMessage =
   | { type: 'ready' }
@@ -425,7 +427,7 @@ async function encodeChunk({ index, start, end, options: override, score }: Work
     if (size <= 0) return
     const ptr = x._enc_payload(enc)
     const pts = x._enc_out_pts(enc)
-    packets.push({ data: x.HEAPU8.slice(ptr, ptr + size), pts, key: !!x._enc_out_keyframe(enc), ssim: x._enc_out_ssim(enc) })
+    packets.push({ data: x.HEAPU8.slice(ptr, ptr + size), size, pts, key: !!x._enc_out_keyframe(enc), ssim: x._enc_out_ssim(enc) })
     stats.push({ bytes: size, crf, first: pts === 0 })
   }
   const report = () => post({ type: 'progress', index, fed: times.length, frames: packets.length, stats: stats.splice(0) })
