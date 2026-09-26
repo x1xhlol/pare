@@ -151,11 +151,13 @@ const X264: Profile = {
   // 30 ms to decode, 310 ms to encode.
   decodeShare: 0.09,
   options: (crf, color, width, height) => {
-    // 3 reference frames and smart weighted prediction cost no measurable speed; with the 40-frame lookahead they
-    // take "faster" from -27.8% to -29.7% BD-rate (VMAF NEG) against the old "veryfast". ssim=1 scores every frame
-    // as it's encoded. stitchable=1 keeps the picture parameter set independent of the rate factor, so chunks
+    // "faster" with smart weighted prediction and (below) a 40-frame lookahead, minus the work that buys least:
+    // diamond motion search and no 8x8-and-smaller inter partitions take a third of the CPU time off at the same
+    // quality per byte (-0.4% BD-rate on VMAF NEG over the corpus; research/speed_sweep.py). ssim=1 scores every
+    // frame as it's encoded. stitchable=1 keeps the picture parameter set independent of the rate factor, so chunks
     // encoded at different ones can share it.
-    const options = ['faster', '', `crf=${crf.toFixed(1)}`, 'ref=3', 'weightp=2', 'ssim=1', 'stitchable=1']
+    const options = ['faster', '', `crf=${crf.toFixed(1)}`, 'weightp=2', 'me=dia', 'partitions=i8x8,i4x4', 'ssim=1',
+      'stitchable=1']
     if (longLookahead(width, height)) options.push('rc-lookahead=40')
     if (color.primaries && X264_PRIMARIES[color.primaries]) options.push(`colorprim=${X264_PRIMARIES[color.primaries]}`)
     if (color.transfer && X264_TRANSFER[color.transfer]) options.push(`transfer=${X264_TRANSFER[color.transfer]}`)
@@ -1018,8 +1020,10 @@ const SIZE_AIM = 0.47
 const WINDOW_FRAMES = 24
 /** Test-window estimates came in 3-11% under the finished files (median ~7%); scale them to match. */
 const ESTIMATE_BIAS = 1.08
-/** How far from both of the plan's tests its answer has to fall before a third test near it. */
+/** How far from both of the plan's tests its answer has to fall before a third test near it... */
 const MID_TEST = 1.5
+/** ...where size falls at least this steeply between them (log bytes per rate factor step). */
+const CURVED = -0.18
 /** How far either side of its predicted rate factor AV1's test encodes, when choosing the codec. */
 const AV1_BRACKET = 6
 /** The plan windows AV1's test uses when choosing the codec: every other one of four. */
@@ -1038,11 +1042,16 @@ const AUTO_HIGH = 95
  */
 const AUTO_QUICK = 93
 /**
- * How much better AV1 has to look before Auto picks it: it encodes slower and some older devices can't play it. In the
- * corpus test (two AV1 windows, compared like for like) half a point gave up 0.12 VMAF NEG on average against always
- * picking the better encoder, 1.08 at worst; a whole point gave up 0.20 and 2.01, missing AV1's +1.4 on the phone clips.
+ * ...and only where H.264's size falls steeply with the rate factor near the target: AV1's big wins at half the size
+ * (town 90.3 -> 94.0, tree 88.2 -> 92.3) came where H.264's local slope was -0.29 and -0.33, and waiting bought nothing
+ * on the phone clips (-0.14), the PCM clip (-0.15) or Big Buck Bunny (-0.16).
  */
-const AUTO_MARGIN = 0.5
+const AUTO_STEEP = -0.18
+/**
+ * How much better AV1 has to look before Auto picks it: it encodes slower and some older devices can't play it. Half a
+ * point was tried: it put Big Buck Bunny on AV1 for +0.85 VMAF NEG (93.0 -> 93.8, 1:1 either way) at 1.9x the time.
+ */
+const AUTO_MARGIN = 1
 
 /** Video bytes the size target leaves once the audio is paid for. */
 function videoGoal(probe: Probe, settings: Settings) {
@@ -1252,10 +1261,12 @@ export async function plan(probe: Probe, settings: Settings, signal: AbortSignal
     ]
     const points = await videoAt([lo, hi])
     let planned = fit(probe, settings, points)
-    // Far from both tests, or past the higher one, the straight line can be badly off: noisy footage sheds bits
-    // steeply once the noise stops being coded, and 5-second clips missed by 46-52%, which cost a second encode. One
-    // more round of the same windows near the answer is much cheaper.
-    if (planned.bound && planned.crf > lo + MID_TEST && Math.abs(planned.crf - hi) > MID_TEST) {
+    // Past the higher test, or far from both where size falls steeply, the straight line can be badly off: noisy
+    // footage sheds bits once the noise stops being coded, and 5-second clips missed by 46-52%, which cost a second
+    // encode. One more round of the same windows near the answer is much cheaper. Where size falls gently (Big Buck
+    // Bunny, the phone clips) the line held within a few percent and the round isn't worth its time.
+    const curved = planned.crf > hi || (planned.slope ?? 0) <= CURVED
+    if (planned.bound && curved && planned.crf > lo + MID_TEST && Math.abs(planned.crf - hi) > MID_TEST) {
       points.push(...(await videoAt([Math.round(Math.min(profile.max, planned.crf) * 2) / 2])))
       planned = fit(probe, settings, points)
     }
@@ -1329,9 +1340,14 @@ export const planAvc = (probe: Probe, settings: Settings, signal: AbortSignal) =
 export const avcReaches = (probe: Probe, settings: Settings, avc: SizePlan) =>
   !settings.sizeTarget || !avc.bound || bytesAt(avc.points, X264.max) <= videoGoal(probe, settings)
 
-/** Whether a compression started now may skip AV1's test, given H.264's plan once it's scored. */
-export function quickStart(probe: Probe, settings: Settings, avc: SizePlan) {
+/**
+ * Whether a compression started now may skip AV1's test, given H.264's plan: once its sizes are in when they fall
+ * gently near the target, otherwise once its windows are scored.
+ */
+export async function quickStart(probe: Probe, settings: Settings, avc: SizePlan) {
   if (!avcReaches(probe, settings, avc)) return false
+  if ((avc.slope ?? 0) > AUTO_STEEP) return true
+  await avc.scored
   return !testsAv1(probe, settings, avc) || (vmafAt(avc.points, videoGoal(probe, settings)) ?? 0) >= AUTO_QUICK
 }
 

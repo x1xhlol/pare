@@ -212,10 +212,7 @@ export default function App() {
     const entry: CalibrationEntry = {
       controller,
       first: first?.then(({ m, avc }) => ({ ...fromPlan(avc), codec: 'avc' as const, reaches: m.avcReaches(probe, settings, avc) })),
-      quick: first?.then(async ({ m, avc }) => {
-        await avc.scored
-        return m.quickStart(probe, settings, avc)
-      }),
+      quick: first?.then(({ m, avc }) => m.quickStart(probe, settings, avc)),
       // Stops H.264's scoring as well as AV1's test: neither may compete with the encode for the cores.
       skipTest: () => controller.abort(),
       promise: first

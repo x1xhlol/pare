@@ -31,6 +31,10 @@ CONFIGS = {
     'bframes2': [*PARE, '--bframes', '2'],
     'b-adapt0': [*PARE, '--b-adapt', '0'],
     'subme3+part-i': [*PARE, '--subme', '3', '--partitions', 'i8x8,i4x4'],
+    # Combinations of the ones that cost almost nothing.
+    'dia+part-i': [*PARE, '--me', 'dia', '--partitions', 'i8x8,i4x4'],
+    'dia+part-i+ref2': ['--preset', 'faster', '--weightp', '2', '--rc-lookahead', '40', '--me', 'dia',
+                        '--partitions', 'i8x8,i4x4'],
 }
 
 

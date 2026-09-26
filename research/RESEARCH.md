@@ -396,13 +396,14 @@ In the app, Auto (the default format) works like this:
   take about half as long as eight sharing them, and two windows chose as well as four. AV1's size estimate is scaled
   by how those two windows compare with all four in H.264's test, and its VMAF is compared with H.264's on the same
   two windows.
-- AV1 wins when it's at least half a point ahead and this device can play AV1, or when H.264 can't reach half the size
-  at its highest rate factor and AV1 can. In the simulation half a point gave up 0.12 VMAF NEG on average against
-  always picking the better encoder (1.08 at worst); a whole point, the first margin, gave up 0.20 (2.01) and missed
-  AV1's +1.4 on the phone clips.
+- AV1 wins when it's at least a point ahead and this device can play AV1, or when H.264 can't reach half the size at
+  its highest rate factor and AV1 can. Half a point was tried too: in the simulation it gave up less (0.12 VMAF NEG on
+  average against always picking the better encoder, against 0.20), but in the app it put Big Buck Bunny on AV1 for
+  +0.85 (93.0 → 93.8, 1:1 either way) at 1.9× the time.
 - The AV1 test runs while the settings are on screen, starting as soon as H.264's sizes show the target binds. A
-  compression started before it ends goes ahead with H.264 only when H.264 is predicted at 93 or more, or waits (see
-  the next section).
+  compression started before it ends waits for it only when H.264 is predicted under 93 and its size falls steeply near
+  the target (local slope −0.18 or steeper), or when H.264 can't reach half the size (see "How close to 1:1 half the
+  size can get" below).
 
 | Clip | Auto | Predicted, AV1 − H.264 | Whole file, AV1 − H.264 |
 | --- | --- | --- | --- |
@@ -426,6 +427,33 @@ factors with sample encodes and VMAF on the command line, and per-title encoding
 Measuring the test encodes of a client-side compressor to choose its format for a size target is new as far as I can
 tell.
 
+## A third less work for x264
+
+Pare's x264 setting was chosen for quality per byte (`faster` plus 3 references, smart weighted prediction and a
+40-frame lookahead), with no search for settings that are much faster at nearly the same quality.
+`research/speed_sweep.py` sweeps candidates over the corpus at CRF 16, 20 and 24 with the native build on one thread,
+scores them with VMAF NEG, and reports BD-rate against Pare's setting and CPU time (user plus system, which holds up
+on a busy machine where wall time doesn't):
+
+| Change | CPU | BD-rate, VMAF NEG |
+| --- | --- | --- |
+| `--preset veryfast` (with the same additions) | 0.65× | +39.6% |
+| `--subme 2` | 0.77× | +20.0% |
+| `--trellis 0` | 0.83× | +20.3% |
+| `--subme 3` | 0.92× | +2.4% |
+| `--rc-lookahead 20` | 0.94× | +3.4% |
+| `--b-adapt 0` | 1.01× | +34.3% |
+| `--bframes 2` | 0.88× | −1.2% (Big Buck Bunny +9.4%) |
+| `--ref 2` | 0.91× | +0.5% |
+| `--me dia` | 0.93× | −1.7% |
+| `--partitions i8x8,i4x4` (no 8×8-and-smaller inter partitions) | 0.75× | +0.7% |
+| `--me dia --partitions i8x8,i4x4` | 0.73× | −1.1% |
+| **`--me dia --partitions i8x8,i4x4 --ref 2` (shipped)** | **0.66×** | **−0.4%** |
+
+The three that ship give the same quality per byte on average (animation +6.2%, screen content −6.4%, the noisy
+clips even or better) for two thirds of the CPU time. In the WebAssembly build the partition change alone took 28% off
+(80 frames of park: 35.4 → 25.7 s of CPU).
+
 ## How close to 1:1 half the size can get
 
 VMAF NEG 93 to 95 is about where a re-encode stops looking different from its source at normal viewing distance.
@@ -441,8 +469,9 @@ From the whole-clip sweeps above, this is the file size each encoder needs to ge
 
 So half the size at about 1:1 is out of reach for park and ducks with any encoder here: the source's noise is the
 detail, and it needs more bits than the source already spends. On town and tree it's within reach, but only with AV1,
-which is why Auto's shortcut changed: a compression started before AV1's test ends goes ahead with H.264 only when H.264
-is predicted at 93 or more. Town went from 90.3 to 94.0 at the same size, its worst frame from 84.2 to 90.6.
+which is why Auto's shortcut changed: a compression started before AV1's test ends waits for it when H.264 is predicted
+under 93 and its size falls steeply near the target, as it does on town and tree. Town went from 90.3 to 94.0 at the
+same size, its worst frame from 84.2 to 90.6; tree from 88.2 to 92.3.
 
 The same data says where AV1 usually lands: at equal size its rate factor is about 1.88 times x264's minus 10.7 (5.6
 spread across clips). AV1's test now brackets that guess, 6 either side, instead of starting at its quality ceiling,
