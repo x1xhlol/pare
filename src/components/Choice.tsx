@@ -14,9 +14,11 @@ type Props<T extends string> = {
   onChange: (value: T) => void
   hint?: ReactNode
   disabled?: boolean
+  /** Controls that belong to the chosen option, under the options. */
+  children?: ReactNode
 }
 
-export function Choice<T extends string>({ legend, value, options, onChange, hint, disabled }: Props<T>) {
+export function Choice<T extends string>({ legend, value, options, onChange, hint, disabled, children }: Props<T>) {
   const name = useId()
   return (
     <fieldset className="choice" disabled={disabled}>
@@ -36,6 +38,7 @@ export function Choice<T extends string>({ legend, value, options, onChange, hin
           </label>
         ))}
       </div>
+      {children && <div className="choice-extra">{children}</div>}
       {hint && <p className="choice-hint">{hint}</p>}
     </fieldset>
   )

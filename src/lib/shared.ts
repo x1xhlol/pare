@@ -15,8 +15,10 @@ export type Settings = {
   /** Target length of the short side in pixels, or null to keep the source resolution. */
   shortSide: number | null
   keepAudio: boolean
-  /** Keep the result at or below half the original's size, raising compression only when needed. */
+  /** Keep the result at or below a size (half the original's, or `targetBytes`), raising compression only when needed. */
   sizeTarget: boolean
+  /** With the size target: the most the file may weigh, in bytes, or null for half the original. */
+  targetBytes?: number | null
 }
 
 export type Probe = {
@@ -63,11 +65,17 @@ export type AudioPlan =
   | ({ kind: 'encode' } & AudioEncode)
   | { kind: 'drop'; reason: 'decode' | 'encode' }
 
-/** The size target: at most half the original. Steering aims a little lower to absorb its error at the very end. */
+/** The default size target: at most half the original. The first pass aims 6% under a target, for its errors. */
 export const SIZE_TARGET = 0.5
 export const SIZE_AIM = 0.47
-/** The least the video may be given, as a share of the original, however much the audio takes. */
-export const VIDEO_FLOOR = 0.05
+/** The least the video may be given, as a share of the target, however much the audio takes. */
+export const VIDEO_FLOOR = 0.1
+
+/** The most the file may weigh: the size chosen, or half the original. */
+export const targetBytes = (probe: Probe, settings: Settings) => settings.targetBytes ?? probe.file.size * SIZE_TARGET
+
+/** What the first pass aims at: 6% under the target, as 47% is under half. */
+export const aimBytes = (probe: Probe, settings: Settings) => targetBytes(probe, settings) * (SIZE_AIM / SIZE_TARGET)
 
 /**
  * The audio plan for these settings, or null for none. With the size target, audio copied at more than twice what
@@ -79,7 +87,7 @@ export function audioFor(probe: Probe, settings: Settings): AudioPlan | null {
   if (!audio || !settings.keepAudio) return null
   const plan = audio.plan
   if (plan.kind === 'copy' && plan.encode && settings.sizeTarget && settings.preset !== 'copy' &&
-      audio.bitrate > 2 * plan.encode.bitrate && (audio.bitrate * probe.duration) / 8 > 0.25 * SIZE_TARGET * probe.file.size)
+      audio.bitrate > 2 * plan.encode.bitrate && (audio.bitrate * probe.duration) / 8 > 0.25 * targetBytes(probe, settings))
     return { kind: 'encode', ...plan.encode }
   return plan
 }
@@ -91,9 +99,9 @@ export function audioBytes(probe: Probe, settings: Settings) {
   return ((plan.kind === 'copy' ? probe.audio!.bitrate : plan.bitrate) * probe.duration) / 8
 }
 
-/** Whether half the size can be reached at all: the audio and container leave the video its floor. */
-export const halvable = (probe: Probe, settings: Settings) =>
-  probe.file.size * SIZE_AIM - audioBytes(probe, settings) >= probe.file.size * VIDEO_FLOOR
+/** Whether the size target can be reached at all: the audio and container leave the video its floor. */
+export const reachable = (probe: Probe, settings: Settings) =>
+  aimBytes(probe, settings) - audioBytes(probe, settings) >= targetBytes(probe, settings) * VIDEO_FLOOR
 
 /**
  * The settings the encoders get. Where the audio alone rules out half the size, squeezing the video to its floor would
@@ -101,7 +109,7 @@ export const halvable = (probe: Probe, settings: Settings) =>
  * it's encoded at the chosen quality instead.
  */
 export const forEngine = (probe: Probe, settings: Settings): Settings =>
-  settings.sizeTarget && !halvable(probe, settings) ? { ...settings, sizeTarget: false } : settings
+  settings.sizeTarget && !reachable(probe, settings) ? { ...settings, sizeTarget: false } : settings
 
 export const CODEC_LABEL: Record<string, string> = {
   avc: 'H.264',

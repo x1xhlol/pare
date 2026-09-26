@@ -25,7 +25,7 @@ import {
 import { ownDownmix, stereoDownmix } from './downmix'
 import { lumaOf, psnr, ssim } from './metrics'
 import {
-  audioBytes as plannedAudioBytes, audioFor, deepFormat, even, MP4_AUDIO, outputSize, playsAv1, type AudioEncode,
+  audioBytes as plannedAudioBytes, audioFor, deepFormat, even, MP4_AUDIO, outputSize, playsAv1, targetBytes, type AudioEncode,
   type AudioPlan, type OutputCodec, type Preset, type Probe, type Settings,
 } from './shared'
 
@@ -288,7 +288,8 @@ export async function calibrate(
   const fps = probe.fps || 30
   const target = SSIM_TARGET[settings.preset]
   // Some containers don't report a usable bitrate; fall back to a generous per-pixel budget.
-  const share = settings.sizeTarget ? 0.45 : MAX_SHARE_OF_SOURCE
+  // With a size target, 90% of it (45% of the original for half).
+  const share = settings.sizeTarget ? (0.9 * targetBytes(probe, settings)) / probe.file.size : MAX_SHARE_OF_SOURCE
   const ceiling = probe.videoBitrate > 0 ? probe.videoBitrate * share : width * height * fps * 0.4
   const floor = Math.min(ceiling, 150_000)
   const clampRate = (b: number) => Math.min(ceiling, Math.max(floor, b))

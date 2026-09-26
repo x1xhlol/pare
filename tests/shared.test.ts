@@ -1,6 +1,7 @@
 import { expect, test } from 'bun:test'
 import {
-  audioBytes, audioFor, codecName, copiesFrames, forEngine, halvable, keepsHdr, outputSize, type AudioPlan, type Probe,
+  aimBytes, audioBytes, audioFor, codecName, copiesFrames, forEngine, keepsHdr, outputSize, reachable, targetBytes,
+  type AudioPlan, type Probe,
   type Settings,
 } from '../src/lib/shared'
 
@@ -46,13 +47,13 @@ test('the size target is dropped only when the audio alone rules out half the si
   // A podcast: a still picture (60 KB of video) and 200 KB of AAC at 160 kbps, under twice Opus's rate, so copied.
   const podcast = probe(260_000, 160_000, { kind: 'copy', encode: opus })
   expect(audioFor(podcast, settings)?.kind).toBe('copy')
-  expect(halvable(podcast, settings)).toBe(false)
+  expect(reachable(podcast, settings)).toBe(false)
   expect(forEngine(podcast, settings).sizeTarget).toBe(false)
   const ordinary = probe(20e6, 256_000, { kind: 'copy', encode: opus })
-  expect(halvable(ordinary, settings)).toBe(true)
+  expect(reachable(ordinary, settings)).toBe(true)
   expect(forEngine(ordinary, settings)).toBe(settings)
   // Lossless audio at 1.28 Mbps would rule it out copied, but encoded it leaves the video room.
-  expect(halvable(probe(2.6e6, 1.28e6, { kind: 'copy', encode: opus }), settings)).toBe(true)
+  expect(reachable(probe(2.6e6, 1.28e6, { kind: 'copy', encode: opus }), settings)).toBe(true)
 })
 
 test('frames go in as planes only in planar 4:2:0 formats, at any size', () => {
@@ -85,4 +86,17 @@ test('codec names', () => {
   expect(codecName('pcm-s24')).toBe('PCM')
   expect(codecName('aac')).toBe('AAC')
   expect(codecName(null)).toBe('Unknown')
+})
+
+test('a chosen size replaces half the original everywhere', () => {
+  const p = probe(100e6, 128_000, { kind: 'copy', encode: opus })
+  const fit = { ...settings, targetBytes: 10e6 }
+  expect(targetBytes(p, settings)).toBe(50e6)
+  expect(targetBytes(p, fit)).toBe(10e6)
+  expect(aimBytes(p, fit)).toBeCloseTo(9.4e6, -3)
+  expect(reachable(p, fit)).toBe(true)
+  // 10 s of 7 Mbps audio (8.75 MB) leaves 10 MB no room for video, even encoded (a 192 kbps plan here isn't possible).
+  expect(reachable(probe(100e6, 7e6, { kind: 'copy' }), fit)).toBe(false)
+  // With an encoder, the lossless-size track is encoded and the target is within reach again.
+  expect(reachable(probe(100e6, 7e6, { kind: 'copy', encode: opus }), fit)).toBe(true)
 })

@@ -6,7 +6,7 @@ import * as fmt from './lib/format'
 import type { Calibration, Job, QualityReport } from './lib/media'
 import type { Progress, SizePlan } from './lib/x264'
 import {
-  audioFor, CODEC_LABEL, codecName, copiesFrames, deepFormat, forEngine, halvable, keepsHdr, SIZE_TARGET, outputSize, type Engine, type OutputCodec, type Preset, type Probe,
+  audioFor, CODEC_LABEL, codecName, copiesFrames, deepFormat, forEngine, keepsHdr, reachable, targetBytes, outputSize, type Engine, type OutputCodec, type Preset, type Probe,
   type Settings,
 } from './lib/shared'
 
@@ -26,8 +26,8 @@ type Phase =
       quality: QualityReport | 'pending' | 'failed'
       /** The format Pare's own encoders wrote, when they ran. */
       codec?: 'avc' | 'av1'
-      /** The size target was on and the file still came out over half the original. */
-      missed?: boolean
+      /** The size target was on and the file still came out over it: the target, or null for half the original. */
+      missed?: { target: number | null }
     }
 
 type Tuning = { round: number } | { result: Calibration } | { error: string }
@@ -53,7 +53,7 @@ const usesX264 = (s: Settings) => s.engine === 'thorough' && s.preset !== 'copy'
 const thoroughCodec = (s: Settings): 'avc' | 'av1' => (s.codec === 'av1' ? 'av1' : 'avc')
 const thoroughFormat = (s: Settings): ThoroughFormat => (s.autoCodec ? 'auto' : thoroughCodec(s))
 const settingsKey = (s: Settings) =>
-  `${s.preset}|${usesX264(s) ? `wasm-${thoroughFormat(s)}` : s.codec}|${s.shortSide}|${s.keepAudio}|${s.sizeTarget}`
+  `${s.preset}|${usesX264(s) ? `wasm-${thoroughFormat(s)}` : s.codec}|${s.shortSide}|${s.keepAudio}|${s.sizeTarget}|${s.targetBytes ?? ''}`
 const isAbort = (err: unknown) => err instanceof Error && (err.name === 'AbortError' || err.name === 'ConversionCanceledError')
 
 // The landing page is rendered to HTML at build time, where there is no window: render it as supported, and let the
@@ -77,15 +77,25 @@ const PRESETS: { value: Preset; label: string; hint: string }[] = [
   },
 ]
 
-const SIZE_OPTIONS: Option<'half' | 'any'>[] = [
+type SizeMode = 'half' | 'fit' | 'any'
+
+const SIZE_OPTIONS: Option<SizeMode>[] = [
   { value: 'half', label: 'At least 50% smaller' },
+  { value: 'fit', label: 'Fit under' },
   { value: 'any', label: 'No limit' },
 ]
 
-const SIZE_HINT = {
+const SIZE_HINT: Record<SizeMode, string> = {
   half: "Keeps the chosen quality when that already halves the file. If it wouldn't, compression is raised just enough to get there, and the quality check shows how close it stayed.",
+  fit: 'Keeps the chosen quality when that already fits. If it wouldn’t, compression is raised just enough to get under the size. For much smaller files, a lower resolution usually looks better.',
   any: 'Always encodes at the chosen quality, even if the file barely shrinks.',
 }
+
+/** Common upload limits, in MB: Discord's free tier, email attachments, and two larger ones. */
+const FIT_PRESETS = [10, 25, 50, 100]
+
+/** Where "Fit under" starts: 10 MB, or a quarter of a smaller file. */
+const defaultFit = (size: number) => (size > 20e6 ? 10e6 : Math.max(1e6, Math.round(size / 4 / 1e5) * 1e5))
 
 const ENGINES: Option<Engine>[] = [
   { value: 'thorough', label: 'Thorough' },
@@ -395,7 +405,8 @@ export default function App() {
       const { measureQuality } = await media()
       const { blob, scores } = await run.job.promise
       const url = URL.createObjectURL(blob)
-      const missed = engine.sizeTarget && settings.preset !== 'copy' && blob.size > probe.file.size * SIZE_TARGET
+      const missed = engine.sizeTarget && settings.preset !== 'copy' && blob.size > targetBytes(probe, settings)
+        ? { target: settings.targetBytes ?? null } : undefined
       setPhase({ kind: 'done', probe, blob, url, quality: settings.preset === 'copy' ? 'failed' : 'pending', codec, missed })
       if (settings.preset === 'copy') return
       const quality = await measureQuality(probe, blob, scores).catch(() => 'failed' as const)
@@ -780,6 +791,7 @@ function Ready(props: {
     () => settings.engine !== 'thorough' || !settings.autoCodec || settings.shortSide !== null || !settings.keepAudio,
   )
   const thoroughName = (c: 'avc' | 'av1') => (c === 'av1' ? 'SVT-AV1' : 'x264')
+  const sizeMode: SizeMode = !settings.sizeTarget ? 'any' : settings.targetBytes ? 'fit' : 'half'
   const audioNote = () => {
     const audio = probe.audio
     if (!audio) return 'This video has no audio.'
@@ -844,12 +856,21 @@ function Ready(props: {
         />
         <Choice
           legend="Size"
-          value={settings.sizeTarget ? 'half' : 'any'}
+          value={sizeMode}
           options={SIZE_OPTIONS}
           disabled={copy}
-          onChange={(v) => setSettings((s) => ({ ...s, sizeTarget: v === 'half' }))}
-          hint={copy ? 'Unchanged.' : SIZE_HINT[settings.sizeTarget ? 'half' : 'any']}
-        />
+          onChange={(v) => setSettings((s) => ({ ...s, sizeTarget: v !== 'any',
+            targetBytes: v === 'fit' ? (s.targetBytes ?? defaultFit(probe.file.size)) : null }))}
+          hint={copy ? 'Unchanged.' : SIZE_HINT[sizeMode]}
+        >
+          {sizeMode === 'fit' && !copy && (
+            <FitSize
+              bytes={settings.targetBytes ?? defaultFit(probe.file.size)}
+              limit={probe.file.size}
+              onChange={(targetBytes) => setSettings((s) => ({ ...s, targetBytes }))}
+            />
+          )}
+        </Choice>
         <details className="more" open={more} onToggle={(e) => setMore(e.currentTarget.open)}>
           <summary>
             <span className="more-label">More options</span>
@@ -911,10 +932,10 @@ function Ready(props: {
           </div>
         </details>
         {probe.hdr && !copy && <p className="note">{hdrNote()}</p>}
-        {settings.sizeTarget && !copy && !halvable(probe, settings) && (
+        {settings.sizeTarget && !copy && !reachable(probe, settings) && (
           <p className="note">
-            The audio takes up most of this file, so no video size makes it half as big. The video is compressed at the
-            quality you chose instead.
+            The audio alone takes up most of {settings.targetBytes ? 'that size' : 'half this file'}, so no video size
+            gets under it. The video is compressed at the quality you chose instead.
           </p>
         )}
       </div>
@@ -936,8 +957,8 @@ function Ready(props: {
           )}
           <span className="estimate-detail">
             {result?.choice && result.choice.reason !== 'unlimited' && result.choice.reason !== 'fits'
-              ? result.choice.reason === 'device' && result.size > probe.file.size * SIZE_TARGET
-                ? 'H.264 can’t halve this one, and this device can’t play AV1'
+              ? result.choice.reason === 'device' && result.size > targetBytes(probe, settings)
+                ? `H.264 can’t get this one ${settings.targetBytes ? 'under that size' : 'to half'}, and this device can’t play AV1`
                 : choiceDetail(result.choice)
               : !result && usesX264(settings) && settings.autoCodec && settings.sizeTarget && !(tuning && 'error' in tuning)
               ? 'Test-encoding to pick the format'
@@ -967,7 +988,9 @@ function Ready(props: {
       {result && !result.reached && !copy && (
         <p className="note">
           {CODEC_LABEL[settings.codec]} in this browser can't reach {presetLabel} quality on this video{' '}
-          {settings.sizeTarget ? 'at half the original size' : "without growing past the original's bitrate"}, so this is
+          {settings.sizeTarget
+            ? settings.targetBytes ? `under ${fmt.bytes(settings.targetBytes)}` : 'at half the original size'
+            : "without growing past the original's bitrate"}, so this is
           as close as it gets.{' '}
           {better.length
             ? `${better.map((c) => CODEC_LABEL[c]).join(' or ')} should do better.`
@@ -1063,6 +1086,41 @@ function verdict(ssim: number) {
   return 'Visible loss'
 }
 
+/** The size for "Fit under": typed in megabytes, or one of the common limits smaller than the file. */
+function FitSize({ bytes, limit, onChange }: { bytes: number; limit: number; onChange: (bytes: number) => void }) {
+  const [text, setText] = useState(() => String(bytes / 1e6))
+  const presets = FIT_PRESETS.filter((mb) => mb * 1e6 < limit)
+  const set = (mb: number) => {
+    setText(String(mb))
+    onChange(mb * 1e6)
+  }
+  return (
+    <div className="fit">
+      <label className="fit-field">
+        <input
+          type="number"
+          inputMode="decimal"
+          min={0.1}
+          step="any"
+          value={text}
+          aria-label="Largest size, in megabytes"
+          onChange={(e) => {
+            setText(e.target.value)
+            const mb = Number(e.target.value)
+            if (mb > 0) onChange(Math.round(mb * 1e6))
+          }}
+        />
+        <span>MB</span>
+      </label>
+      {presets.map((mb) => (
+        <button key={mb} type="button" className="fit-preset" aria-pressed={bytes === mb * 1e6} onClick={() => set(mb)}>
+          {mb} MB
+        </button>
+      ))}
+    </div>
+  )
+}
+
 function Done(props: {
   phase: Extract<Phase, { kind: 'done' }>
   copy: boolean
@@ -1122,7 +1180,9 @@ function Done(props: {
         {smaller && props.phase.missed && (
           <p className="note">
             This video was already efficiently compressed, and this is as small as{' '}
-            {props.phase.codec === 'av1' ? 'AV1' : 'H.264'} could make it: short of half the size.
+            {props.phase.codec === 'av1' ? 'AV1' : 'H.264'} could make it: short of{' '}
+            {props.phase.missed.target ? fmt.bytes(props.phase.missed.target) : 'half the size'}. A lower resolution
+            would get further.
           </p>
         )}
         <div className="result-actions">

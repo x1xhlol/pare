@@ -106,7 +106,8 @@ it took town from 90.3 to 93.9 and noisy from 80.9 to 87.5.
 
 - Quality: visually lossless, high, compact, or an exact copy (the original streams in a new container, every frame
   bit-identical).
-- Size: at least 50% smaller (the default), or no limit.
+- Size: at least 50% smaller (the default), under a size you choose (10, 25, 50 or 100 MB, or any other), or no
+  limit. The same plan, per-chunk budget and final weigh hold either target.
 - More options: the encoder (Pare's own, or the browser's WebCodecs encoder, which is faster but less efficient), the
   format (Auto, H.264 or AV1, and HEVC with the browser's encoder), resolution, and audio.
 

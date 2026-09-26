@@ -28,7 +28,7 @@ import type { EncodedChunk, FrameStat, WorkerChunk, WorkerInit, WorkerMessage, W
 import { av1Config, avcConfig } from './codec-config'
 import { ownDownmix, stereoDownmix } from './downmix'
 import {
-  audioBytes, audioFor, copiesFrames, keepsHdr, outputSize, playsAv1, SIZE_AIM, SIZE_TARGET, VIDEO_FLOOR, type Preset, type Probe,
+  aimBytes, audioBytes, audioFor, copiesFrames, keepsHdr, outputSize, playsAv1, targetBytes, VIDEO_FLOOR, type Preset, type Probe,
   type Settings,
 } from './shared'
 
@@ -966,8 +966,8 @@ export function encode(probe: Probe, settings: Settings, start: EncodeStart, onP
       let poolThreads = pool.threads
       if (canceled) throw new Canceled()
       const goal = videoGoal(probe, settings)
-      const target = probe.file.size * SIZE_TARGET
-      const limit = Math.max(target - besidesVideo(probe, settings, times.length, sound), probe.file.size * VIDEO_FLOOR)
+      const target = targetBytes(probe, settings)
+      const limit = Math.max(target - besidesVideo(probe, settings, times.length, sound), target * VIDEO_FLOOR)
       // A steeper slope than measured keeps the budget from overreaching when it lowers the rate factor: near the
       // sizes it lands on, noisy footage grows much faster than the plan's two distant tests suggest.
       const budget = settings.sizeTarget
@@ -1118,7 +1118,7 @@ export function encode(probe: Probe, settings: Settings, start: EncodeStart, onP
       for (let again = 0; budget && blob.size > target && again < 2; again++) {
         if (canceled) throw new Canceled()
         const room = target - (blob.size - total)
-        if (room < probe.file.size * VIDEO_FLOOR) break
+        if (room < target * VIDEO_FLOOR) break
         console.warn(`[pare] ${blob.size - target} bytes over after muxing; encoding again`)
         const before = total
         await fitTo(room)
@@ -1150,7 +1150,7 @@ export function encode(probe: Probe, settings: Settings, start: EncodeStart, onP
 /** A first pass landing under this share of the goal is encoded again at a lower rate factor. */
 const UNDER_GOAL = 0.75
 /**
- * Where a second pass aims, as a share of the real limit. The first pass aims at SIZE_AIM to absorb the plan's error; a
+ * Where a second pass aims, as a share of the real limit. The first pass aims 6% lower to absorb the plan's error; a
  * second pass re-encodes chunks it has measured, and across 11 logged refits landed 9% under to 1.1% over its target.
  */
 const REFIT_AIM = 0.985
@@ -1239,7 +1239,7 @@ const AUTO_MARGIN = 1
 
 /** Video bytes the size target leaves once the audio is paid for. */
 function videoGoal(probe: Probe, settings: Settings) {
-  return Math.max(probe.file.size * SIZE_AIM - audioBytes(probe, settings), probe.file.size * VIDEO_FLOOR)
+  return Math.max(aimBytes(probe, settings) - audioBytes(probe, settings), targetBytes(probe, settings) * VIDEO_FLOOR)
 }
 
 export type SizePlan = {

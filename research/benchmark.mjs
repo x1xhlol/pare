@@ -4,7 +4,7 @@
 //   URL=http://localhost:4173 OUT=/tmp/bench TAG=now node research/benchmark.mjs clip.mp4 ...
 //   CODEC=auto|avc|av1 (the Format setting; default Auto), ENGINE=fast (the browser's encoder), NOLIMIT=1 (no size
 //   target), CORES=n (pretend core count), CLICK_AFTER=seconds after the file loads (default 1), RES=720 (short side),
-//   BROWSER=webkit|firefox (Playwright's WebKit or Firefox build instead of Chrome)
+//   BROWSER=webkit|firefox (Playwright's WebKit or Firefox build instead of Chrome), FIT=10 (fit under 10 MB)
 //
 // Prints one JSON line per video: seconds, sizes, the app's quality line, and the encoder log.
 import { chromium, firefox, webkit } from 'playwright-core'
@@ -35,6 +35,10 @@ for (const file of process.argv.slice(2)) {
   await page.setInputFiles('input[type=file]', file)
   await page.waitForSelector('.settings', { timeout: 60000 })
   if (process.env.NOLIMIT) await page.getByRole('radio', { name: 'No limit', exact: true }).check()
+  if (process.env.FIT) {
+    await page.getByRole('radio', { name: 'Fit under', exact: true }).check()
+    await page.fill('.fit-field input', process.env.FIT)
+  }
   if (process.env.ENGINE === 'fast') {
     if (!(await page.$('.more[open]'))) await page.click('.more summary')
     await page.getByRole('radio', { name: 'Fast', exact: true }).check()
