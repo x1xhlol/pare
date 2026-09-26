@@ -1,0 +1,745 @@
+From b5c5b6dcdcede09a984c5b4afd65c33a619f88a0 Mon Sep 17 00:00:00 2001
+From: x1xhlol <lucknitelol@proton.me>
+Date: Sat, 26 Sep 2026 21:23:22 +0000
+Subject: [PATCH 4/7] wasm: Add SIMD128 motion compensation functions
+
+mc_luma, get_ref, mc_chroma, avg, weight/offsetadd/offsetsub, copy,
+hpel_filter, frame_init_lowres_core and the chroma (de)interleaving
+functions, 8-bit only.
+
+Explicit weights reach 255 for chroma, so the weighted pixels are
+computed as unsigned 16-bit values and saturated before the signed
+offset is added, which keeps the result identical to the C version.
+---
+ Makefile         |   3 +-
+ common/mc.c      |   7 +
+ common/wasm/mc.c | 638 +++++++++++++++++++++++++++++++++++++++++++++++
+ common/wasm/mc.h |  32 +++
+ 4 files changed, 679 insertions(+), 1 deletion(-)
+ create mode 100644 common/wasm/mc.c
+ create mode 100644 common/wasm/mc.h
+
+diff --git a/Makefile b/Makefile
+index 3fae3c56..fd64cf8f 100644
+--- a/Makefile
++++ b/Makefile
+@@ -255,7 +255,8 @@ endif
+ # WebAssembly SIMD128 optims
+ ifeq ($(SYS_ARCH),WASM)
+ ifneq ($(findstring HAVE_SIMD128 1, $(CONFIG)),)
+-SRCS_X += common/wasm/pixel.c
++SRCS_X += common/wasm/mc.c \
++          common/wasm/pixel.c
+ endif
+ endif
+ 
+diff --git a/common/mc.c b/common/mc.c
+index ae81ce4b..ba559e0f 100644
+--- a/common/mc.c
++++ b/common/mc.c
+@@ -44,6 +44,9 @@
+ #if HAVE_LSX
+ #   include "loongarch/mc.h"
+ #endif
++#if HAVE_SIMD128
++#include "wasm/mc.h"
++#endif
+ 
+ 
+ static inline void pixel_avg( pixel *dst,  intptr_t i_dst_stride,
+@@ -693,6 +696,10 @@ void x264_mc_init( uint32_t cpu, x264_mc_functions_t *pf, int cpu_independent )
+ #if HAVE_LSX
+     x264_mc_init_loongarch( cpu, pf );
+ #endif
++#if HAVE_SIMD128
++    if( cpu&X264_CPU_SIMD128 )
++        x264_mc_init_simd128( pf );
++#endif
+ 
+     if( cpu_independent )
+     {
+diff --git a/common/wasm/mc.c b/common/wasm/mc.c
+new file mode 100644
+index 00000000..7383a49f
+--- /dev/null
++++ b/common/wasm/mc.c
+@@ -0,0 +1,638 @@
++/*****************************************************************************
++ * mc.c: wasm motion compensation
++ *****************************************************************************
++ * Copyright (C) 2026 x264 project
++ *
++ * Authors: x1xhlol
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02111, USA.
++ *
++ * This program is also available under a commercial proprietary license.
++ * For more information, contact us at licensing@x264.com.
++ *****************************************************************************/
++
++#include "common/common.h"
++#include "wasmcommon.h"
++#include "mc.h"
++
++#if !HIGH_BIT_DEPTH
++/* dst = (a + b + 1) >> 1, which is exactly i8x16.avgr_u. Specialised by
++ * width, as this runs for every subpel candidate in the motion search. */
++static ALWAYS_INLINE void pixel_avg2_w16( pixel *dst, intptr_t i_dst, pixel *src1, intptr_t i_src1,
++                                          pixel *src2, intptr_t i_src2, int i_height )
++{
++    for( int y = 0; y < i_height; y++, dst += i_dst, src1 += i_src1, src2 += i_src2 )
++        wasm_v128_store( dst, wasm_u8x16_avgr( wasm_v128_load( src1 ), wasm_v128_load( src2 ) ) );
++}
++
++/* Two rows per vector. The motion search also asks for odd heights (bh+1). */
++static ALWAYS_INLINE void pixel_avg2_w8( pixel *dst, intptr_t i_dst, pixel *src1, intptr_t i_src1,
++                                         pixel *src2, intptr_t i_src2, int i_height )
++{
++    int y = 0;
++    for( ; y + 2 <= i_height; y += 2, dst += 2*i_dst, src1 += 2*i_src1, src2 += 2*i_src2 )
++    {
++        v128_t a = wasm_v128_load64_lane( src1 + i_src1, wasm_v128_load64_zero( src1 ), 1 );
++        v128_t b = wasm_v128_load64_lane( src2 + i_src2, wasm_v128_load64_zero( src2 ), 1 );
++        v128_t r = wasm_u8x16_avgr( a, b );
++        wasm_v128_store64_lane( dst, r, 0 );
++        wasm_v128_store64_lane( dst + i_dst, r, 1 );
++    }
++    if( y < i_height )
++        wasm_v128_store64_lane( dst, wasm_u8x16_avgr( wasm_v128_load64_zero( src1 ), wasm_v128_load64_zero( src2 ) ), 0 );
++}
++
++static ALWAYS_INLINE void pixel_avg2_w4( pixel *dst, intptr_t i_dst, pixel *src1, intptr_t i_src1,
++                                         pixel *src2, intptr_t i_src2, int i_height )
++{
++    int y = 0;
++    for( ; y + 2 <= i_height; y += 2, dst += 2*i_dst, src1 += 2*i_src1, src2 += 2*i_src2 )
++    {
++        v128_t a = wasm_v128_load32_lane( src1 + i_src1, wasm_v128_load32_zero( src1 ), 1 );
++        v128_t b = wasm_v128_load32_lane( src2 + i_src2, wasm_v128_load32_zero( src2 ), 1 );
++        v128_t r = wasm_u8x16_avgr( a, b );
++        wasm_v128_store32_lane( dst, r, 0 );
++        wasm_v128_store32_lane( dst + i_dst, r, 1 );
++    }
++    if( y < i_height )
++        wasm_v128_store32_lane( dst, wasm_u8x16_avgr( wasm_v128_load32_zero( src1 ), wasm_v128_load32_zero( src2 ) ), 0 );
++}
++
++static void pixel_avg2_wxh( pixel *dst, intptr_t i_dst, pixel *src1, intptr_t i_src1,
++                            pixel *src2, intptr_t i_src2, int i_width, int i_height )
++{
++    switch( i_width )
++    {
++        case 16:
++            pixel_avg2_w16( dst, i_dst, src1, i_src1, src2, i_src2, i_height );
++            return;
++        case 8:
++            pixel_avg2_w8( dst, i_dst, src1, i_src1, src2, i_src2, i_height );
++            return;
++        case 4:
++            pixel_avg2_w4( dst, i_dst, src1, i_src1, src2, i_src2, i_height );
++            return;
++        case 20:
++            pixel_avg2_w16( dst, i_dst, src1, i_src1, src2, i_src2, i_height );
++            pixel_avg2_w4( dst+16, i_dst, src1+16, i_src1, src2+16, i_src2, i_height );
++            return;
++        case 12:
++            pixel_avg2_w8( dst, i_dst, src1, i_src1, src2, i_src2, i_height );
++            pixel_avg2_w4( dst+8, i_dst, src1+8, i_src1, src2+8, i_src2, i_height );
++            return;
++    }
++    for( int y = 0; y < i_height; y++, dst += i_dst, src1 += i_src1, src2 += i_src2 )
++        for( int x = 0; x < i_width; x++ )
++            dst[x] = ( src1[x] + src2[x] + 1 ) >> 1;
++}
++
++static ALWAYS_INLINE void mc_copy( pixel *src, intptr_t i_src, pixel *dst, intptr_t i_dst, int i_width, int i_height )
++{
++    for( int y = 0; y < i_height; y++, dst += i_dst, src += i_src )
++    {
++        int x = 0;
++        for( ; x + 16 <= i_width; x += 16 )
++            wasm_v128_store( dst + x, wasm_v128_load( src + x ) );
++        if( x + 8 <= i_width )
++        {
++            wasm_v128_store64_lane( dst + x, wasm_v128_load64_zero( src + x ), 0 );
++            x += 8;
++        }
++        if( x + 4 <= i_width )
++        {
++            wasm_v128_store32_lane( dst + x, wasm_v128_load32_zero( src + x ), 0 );
++            x += 4;
++        }
++        for( ; x < i_width; x++ )
++            dst[x] = src[x];
++    }
++}
++
++/* Explicit weighted prediction as in mc_weight():
++ * dst = clip( ((src*scale + 2^(denom-1)) >> denom) + offset ).
++ * Chroma scales go up to 255, so src*scale only fits in 16 bits unsigned. A
++ * lane that doesn't fit a signed 16-bit value would clip to 255 anyway, so it
++ * saturates there before the signed offset is added. */
++static ALWAYS_INLINE v128_t weight_8px( v128_t src, v128_t scale, v128_t round, int denom, v128_t offset )
++{
++    v128_t v = wasm_u16x8_shr( wasm_i16x8_add( wasm_i16x8_mul( src, scale ), round ), denom );
++    return wasm_i16x8_add_sat( wasm_u16x8_min( v, wasm_i16x8_splat( 0x7fff ) ), offset );
++}
++
++static void mc_weight( pixel *dst, intptr_t i_dst, pixel *src, intptr_t i_src,
++                       const x264_weight_t *weight, int i_width, int i_height )
++{
++    const int denom = weight->i_denom;
++    const v128_t scale = wasm_i16x8_splat( weight->i_scale );
++    const v128_t offset = wasm_i16x8_splat( weight->i_offset );
++    const v128_t round = wasm_i16x8_splat( denom ? 1 << (denom - 1) : 0 );
++    for( int y = 0; y < i_height; y++, dst += i_dst, src += i_src )
++    {
++        int x = 0;
++        for( ; x + 16 <= i_width; x += 16 )
++        {
++            v128_t v = wasm_v128_load( src + x );
++            v128_t lo = weight_8px( wasm_u16x8_extend_low_u8x16( v ), scale, round, denom, offset );
++            v128_t hi = weight_8px( wasm_u16x8_extend_high_u8x16( v ), scale, round, denom, offset );
++            wasm_v128_store( dst + x, wasm_u8x16_narrow_i16x8( lo, hi ) );
++        }
++        for( ; x + 8 <= i_width; x += 8 )
++        {
++            v128_t r = weight_8px( wasm_u16x8_load8x8( src + x ), scale, round, denom, offset );
++            wasm_v128_store64_lane( dst + x, wasm_u8x16_narrow_i16x8( r, r ), 0 );
++        }
++        if( x + 4 <= i_width )
++        {
++            v128_t v = wasm_u16x8_extend_low_u8x16( wasm_v128_load32_zero( src + x ) );
++            v128_t r = weight_8px( v, scale, round, denom, offset );
++            wasm_v128_store32_lane( dst + x, wasm_u8x16_narrow_i16x8( r, r ), 0 );
++            x += 4;
++        }
++        for( ; x < i_width; x++ )
++        {
++            int v = src[x] * weight->i_scale;
++            if( denom )
++                v = (v + (1 << (denom - 1))) >> denom;
++            dst[x] = x264_clip_pixel( v + weight->i_offset );
++        }
++    }
++}
++
++#define MC_WEIGHT( w )\
++static void mc_weight_w##w##_simd128( pixel *dst, intptr_t i_dst, pixel *src, intptr_t i_src,\
++                                      const x264_weight_t *weight, int i_height )\
++{\
++    mc_weight( dst, i_dst, src, i_src, weight, w, i_height );\
++}
++
++MC_WEIGHT( 2 )
++MC_WEIGHT( 4 )
++MC_WEIGHT( 8 )
++MC_WEIGHT( 12 )
++MC_WEIGHT( 16 )
++MC_WEIGHT( 20 )
++
++static weight_fn_t mc_weight_wtab_simd128[6] =
++{
++    mc_weight_w2_simd128,
++    mc_weight_w4_simd128,
++    mc_weight_w8_simd128,
++    mc_weight_w12_simd128,
++    mc_weight_w16_simd128,
++    mc_weight_w20_simd128,
++};
++
++static void mc_luma_simd128( pixel *dst, intptr_t i_dst_stride,
++                             pixel *src[4], intptr_t i_src_stride,
++                             int mvx, int mvy,
++                             int i_width, int i_height, const x264_weight_t *weight )
++{
++    int qpel_idx = ((mvy&3)<<2) + (mvx&3);
++    int offset = (mvy>>2)*i_src_stride + (mvx>>2);
++    pixel *src1 = src[x264_hpel_ref0[qpel_idx]] + offset + ((mvy&3) == 3) * i_src_stride;
++
++    if( qpel_idx & 5 ) /* qpel interpolation needed */
++    {
++        pixel *src2 = src[x264_hpel_ref1[qpel_idx]] + offset + ((mvx&3) == 3);
++        pixel_avg2_wxh( dst, i_dst_stride, src1, i_src_stride,
++                        src2, i_src_stride, i_width, i_height );
++        if( weight->weightfn )
++            mc_weight( dst, i_dst_stride, dst, i_dst_stride, weight, i_width, i_height );
++    }
++    else if( weight->weightfn )
++        mc_weight( dst, i_dst_stride, src1, i_src_stride, weight, i_width, i_height );
++    else
++        mc_copy( src1, i_src_stride, dst, i_dst_stride, i_width, i_height );
++}
++
++static pixel *get_ref_simd128( pixel *dst,   intptr_t *i_dst_stride,
++                               pixel *src[4], intptr_t i_src_stride,
++                               int mvx, int mvy,
++                               int i_width, int i_height, const x264_weight_t *weight )
++{
++    int qpel_idx = ((mvy&3)<<2) + (mvx&3);
++    int offset = (mvy>>2)*i_src_stride + (mvx>>2);
++    pixel *src1 = src[x264_hpel_ref0[qpel_idx]] + offset + ((mvy&3) == 3) * i_src_stride;
++
++    if( qpel_idx & 5 ) /* qpel interpolation needed */
++    {
++        pixel *src2 = src[x264_hpel_ref1[qpel_idx]] + offset + ((mvx&3) == 3);
++        pixel_avg2_wxh( dst, *i_dst_stride, src1, i_src_stride,
++                        src2, i_src_stride, i_width, i_height );
++        if( weight->weightfn )
++            mc_weight( dst, *i_dst_stride, dst, *i_dst_stride, weight, i_width, i_height );
++        return dst;
++    }
++    else if( weight->weightfn )
++    {
++        mc_weight( dst, *i_dst_stride, src1, i_src_stride, weight, i_width, i_height );
++        return dst;
++    }
++    else
++    {
++        *i_dst_stride = i_src_stride;
++        return src1;
++    }
++}
++
++/* Bipred: plain average for weight 32, else (a*w + b*(64-w) + 32) >> 6, clipped.
++ * The sum fits in 16 bits for the implicit weights x264 uses, -64 to 128. */
++static ALWAYS_INLINE void pixel_avg_weight_wxh( pixel *dst,  intptr_t i_dst,
++                                                pixel *src1, intptr_t i_src1,
++                                                pixel *src2, intptr_t i_src2,
++                                                int i_width, int i_height, int i_weight1 )
++{
++    if( i_weight1 == 32 )
++    {
++        pixel_avg2_wxh( dst, i_dst, src1, i_src1, src2, i_src2, i_width, i_height );
++        return;
++    }
++    const v128_t w1 = wasm_i16x8_splat( i_weight1 ), w2 = wasm_i16x8_splat( 64 - i_weight1 );
++    const v128_t round = wasm_i16x8_splat( 32 );
++    for( int y = 0; y < i_height; y++, dst += i_dst, src1 += i_src1, src2 += i_src2 )
++        for( int x = 0; x < i_width; x += 8 )
++        {
++            /* 4 pixel wide blocks load 4 more pixels than they use */
++            v128_t a = wasm_u16x8_load8x8( src1 + x ), b = wasm_u16x8_load8x8( src2 + x );
++            v128_t v = wasm_i16x8_add( wasm_i16x8_add( wasm_i16x8_mul( a, w1 ), wasm_i16x8_mul( b, w2 ) ), round );
++            v = wasm_i16x8_shr( v, 6 );
++            v = wasm_u8x16_narrow_i16x8( v, v );
++            if( i_width - x >= 8 )
++                wasm_v128_store64_lane( dst + x, v, 0 );
++            else
++                wasm_v128_store32_lane( dst + x, v, 0 );
++        }
++}
++
++#define PIXEL_AVG_SIMD128( w, h )\
++static void pixel_avg_##w##x##h##_simd128( pixel *pix1, intptr_t i_stride_pix1,\
++                                           pixel *pix2, intptr_t i_stride_pix2,\
++                                           pixel *pix3, intptr_t i_stride_pix3, int weight )\
++{\
++    pixel_avg_weight_wxh( pix1, i_stride_pix1, pix2, i_stride_pix2, pix3, i_stride_pix3, w, h, weight );\
++}
++
++PIXEL_AVG_SIMD128( 16, 16 )
++PIXEL_AVG_SIMD128( 16, 8 )
++PIXEL_AVG_SIMD128( 8, 16 )
++PIXEL_AVG_SIMD128( 8, 8 )
++PIXEL_AVG_SIMD128( 8, 4 )
++PIXEL_AVG_SIMD128( 4, 16 )
++PIXEL_AVG_SIMD128( 4, 8 )
++PIXEL_AVG_SIMD128( 4, 4 )
++PIXEL_AVG_SIMD128( 4, 2 )
++
++#define MC_COPY( w )\
++static void mc_copy_w##w##_simd128( pixel *dst, intptr_t i_dst, pixel *src, intptr_t i_src, int i_height )\
++{\
++    mc_copy( src, i_src, dst, i_dst, w, i_height );\
++}
++
++MC_COPY( 16 )
++MC_COPY( 8 )
++MC_COPY( 4 )
++
++/****************************************************************************
++ * Half-pel filter, 6-tap (1,-5,20,20,-5,1). The horizontal and vertical
++ * filters are computed in 16 bits (|tap| < 2^14); the centre filter runs
++ * horizontally over the 16-bit vertical results, in 32 bits.
++ ****************************************************************************/
++static ALWAYS_INLINE v128_t tap_i16( v128_t m2, v128_t m1, v128_t p0, v128_t p1, v128_t p2, v128_t p3 )
++{
++    /* m2 + p3 - 5*(m1 + p2) + 20*(p0 + p1) */
++    v128_t outer = wasm_i16x8_add( m2, p3 );
++    v128_t mid = wasm_i16x8_add( m1, p2 );
++    v128_t inner = wasm_i16x8_add( p0, p1 );
++    return wasm_i16x8_add( wasm_i16x8_sub( outer, wasm_i16x8_mul( mid, wasm_i16x8_splat( 5 ) ) ),
++                           wasm_i16x8_mul( inner, wasm_i16x8_splat( 20 ) ) );
++}
++
++static ALWAYS_INLINE v128_t tap_i32( v128_t m2, v128_t m1, v128_t p0, v128_t p1, v128_t p2, v128_t p3 )
++{
++    v128_t outer = wasm_i32x4_add( m2, p3 );
++    v128_t mid = wasm_i32x4_add( m1, p2 );
++    v128_t inner = wasm_i32x4_add( p0, p1 );
++    return wasm_i32x4_add( wasm_i32x4_sub( outer, wasm_i32x4_mul( mid, wasm_i32x4_splat( 5 ) ) ),
++                           wasm_i32x4_mul( inner, wasm_i32x4_splat( 20 ) ) );
++}
++
++/* 6-tap filter of 16 pixels, in two vectors of 16-bit lanes */
++static ALWAYS_INLINE void tap_u8( v128_t r[6], v128_t *lo, v128_t *hi )
++{
++    *lo = tap_i16( wasm_u16x8_extend_low_u8x16( r[0] ), wasm_u16x8_extend_low_u8x16( r[1] ),
++                   wasm_u16x8_extend_low_u8x16( r[2] ), wasm_u16x8_extend_low_u8x16( r[3] ),
++                   wasm_u16x8_extend_low_u8x16( r[4] ), wasm_u16x8_extend_low_u8x16( r[5] ) );
++    *hi = tap_i16( wasm_u16x8_extend_high_u8x16( r[0] ), wasm_u16x8_extend_high_u8x16( r[1] ),
++                   wasm_u16x8_extend_high_u8x16( r[2] ), wasm_u16x8_extend_high_u8x16( r[3] ),
++                   wasm_u16x8_extend_high_u8x16( r[4] ), wasm_u16x8_extend_high_u8x16( r[5] ) );
++}
++
++/* (v + 16) >> 5, clipped to 8 bits */
++static ALWAYS_INLINE v128_t round5_u8( v128_t lo, v128_t hi )
++{
++    const v128_t r = wasm_i16x8_splat( 16 );
++    return wasm_u8x16_narrow_i16x8( wasm_i16x8_shr( wasm_i16x8_add( lo, r ), 5 ),
++                                    wasm_i16x8_shr( wasm_i16x8_add( hi, r ), 5 ) );
++}
++
++#define TAPFILTER(pix, d) ((pix)[x-2*d] + (pix)[x+3*d] - 5*((pix)[x-d] + (pix)[x+2*d]) + 20*((pix)[x] + (pix)[x+d]))
++
++static void hpel_filter_simd128( pixel *dsth, pixel *dstv, pixel *dstc, pixel *src,
++                                 intptr_t stride, int width, int height, int16_t *buf )
++{
++    for( int y = 0; y < height; y++ )
++    {
++        /* vertical, over [-2, width+3), keeping the 16-bit results for the centre */
++        int x = -2;
++        for( ; x + 16 <= width + 3; x += 16 )
++        {
++            v128_t r[6], lo, hi;
++            for( int k = 0; k < 6; k++ )
++                r[k] = wasm_v128_load( src + x + (k-2)*stride );
++            tap_u8( r, &lo, &hi );
++            wasm_v128_store( dstv + x, round5_u8( lo, hi ) );
++            wasm_v128_store( buf + x + 2, lo );
++            wasm_v128_store( buf + x + 10, hi );
++        }
++        for( ; x < width + 3; x++ )
++        {
++            int v = TAPFILTER( src, stride );
++            dstv[x] = x264_clip_pixel( (v + 16) >> 5 );
++            buf[x+2] = v;
++        }
++
++        /* centre: (v + 512) >> 10 */
++        int16_t *b = buf + 2;
++        x = 0;
++        for( ; x + 8 <= width; x += 8 )
++        {
++            v128_t out[2];
++            for( int i = 0; i < 2; i++ )
++            {
++                v128_t t[6];
++                for( int k = 0; k < 6; k++ )
++                    t[k] = wasm_i32x4_load16x4( b + x + 4*i + k - 2 );
++                v128_t v = tap_i32( t[0], t[1], t[2], t[3], t[4], t[5] );
++                out[i] = wasm_i32x4_shr( wasm_i32x4_add( v, wasm_i32x4_splat( 512 ) ), 10 );
++            }
++            v128_t v = wasm_i16x8_narrow_i32x4( out[0], out[1] );
++            wasm_v128_store64_lane( dstc + x, wasm_u8x16_narrow_i16x8( v, v ), 0 );
++        }
++        for( ; x < width; x++ )
++            dstc[x] = x264_clip_pixel( (TAPFILTER( b, 1 ) + 512) >> 10 );
++
++        /* horizontal */
++        x = 0;
++        for( ; x + 16 <= width; x += 16 )
++        {
++            v128_t r[6], lo, hi;
++            for( int k = 0; k < 6; k++ )
++                r[k] = wasm_v128_load( src + x + k - 2 );
++            tap_u8( r, &lo, &hi );
++            wasm_v128_store( dsth + x, round5_u8( lo, hi ) );
++        }
++        for( ; x < width; x++ )
++            dsth[x] = x264_clip_pixel( (TAPFILTER( src, 1 ) + 16) >> 5 );
++
++        dsth += stride;
++        dstv += stride;
++        dstc += stride;
++        src += stride;
++    }
++}
++#undef TAPFILTER
++
++/* Bilinear 1/8-pel filter on interleaved UV, then split into U and V.
++ * cA+cB+cC+cD = 64, so all the weighted sums fit in 16 bits. */
++static void mc_chroma_simd128( pixel *dstu, pixel *dstv, intptr_t i_dst_stride,
++                               pixel *src, intptr_t i_src_stride,
++                               int mvx, int mvy,
++                               int i_width, int i_height )
++{
++    int d8x = mvx&0x07;
++    int d8y = mvy&0x07;
++    const v128_t cA = wasm_i16x8_splat( (8-d8x)*(8-d8y) );
++    const v128_t cB = wasm_i16x8_splat( d8x    *(8-d8y) );
++    const v128_t cC = wasm_i16x8_splat( (8-d8x)*d8y );
++    const v128_t cD = wasm_i16x8_splat( d8x    *d8y );
++    const v128_t round = wasm_i16x8_splat( 32 );
++
++    src += (mvy >> 3) * i_src_stride + (mvx >> 3)*2;
++    pixel *srcp = &src[i_src_stride];
++
++    for( int y = 0; y < i_height; y++ )
++    {
++        /* up to 8 pixels of each plane, 16 interleaved bytes */
++        v128_t a = wasm_v128_load( src ), b = wasm_v128_load( src + 2 );
++        v128_t c = wasm_v128_load( srcp ), d = wasm_v128_load( srcp + 2 );
++        v128_t lo = wasm_i16x8_add( wasm_i16x8_add( wasm_i16x8_mul( wasm_u16x8_extend_low_u8x16( a ), cA ),
++                                                    wasm_i16x8_mul( wasm_u16x8_extend_low_u8x16( b ), cB ) ),
++                                    wasm_i16x8_add( wasm_i16x8_mul( wasm_u16x8_extend_low_u8x16( c ), cC ),
++                                                    wasm_i16x8_mul( wasm_u16x8_extend_low_u8x16( d ), cD ) ) );
++        v128_t hi = wasm_i16x8_add( wasm_i16x8_add( wasm_i16x8_mul( wasm_u16x8_extend_high_u8x16( a ), cA ),
++                                                    wasm_i16x8_mul( wasm_u16x8_extend_high_u8x16( b ), cB ) ),
++                                    wasm_i16x8_add( wasm_i16x8_mul( wasm_u16x8_extend_high_u8x16( c ), cC ),
++                                                    wasm_i16x8_mul( wasm_u16x8_extend_high_u8x16( d ), cD ) ) );
++        lo = wasm_u16x8_shr( wasm_i16x8_add( lo, round ), 6 );
++        hi = wasm_u16x8_shr( wasm_i16x8_add( hi, round ), 6 );
++        v128_t uv = wasm_u8x16_narrow_i16x8( lo, hi );
++        /* even bytes are U, odd bytes are V */
++        uv = wasm_i8x16_shuffle( uv, uv, 0, 2, 4, 6, 8, 10, 12, 14, 1, 3, 5, 7, 9, 11, 13, 15 );
++        if( i_width == 8 )
++        {
++            wasm_v128_store64_lane( dstu, uv, 0 );
++            wasm_v128_store64_lane( dstv, uv, 1 );
++        }
++        else if( i_width == 4 )
++        {
++            wasm_v128_store32_lane( dstu, uv, 0 );
++            wasm_v128_store32_lane( dstv, uv, 2 );
++        }
++        else
++        {
++            wasm_v128_store16_lane( dstu, uv, 0 );
++            wasm_v128_store16_lane( dstv, uv, 4 );
++        }
++        dstu += i_dst_stride;
++        dstv += i_dst_stride;
++        src   = srcp;
++        srcp += i_src_stride;
++    }
++}
++
++static ALWAYS_INLINE v128_t even_bytes( v128_t lo, v128_t hi )
++{
++    return wasm_i8x16_shuffle( lo, hi, 0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30 );
++}
++
++static ALWAYS_INLINE v128_t odd_bytes( v128_t lo, v128_t hi )
++{
++    return wasm_i8x16_shuffle( lo, hi, 1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31 );
++}
++
++/* FILTER(a,b,c,d) is avg(avg(a,b), avg(c,d)), all rounding up, so nested i8x16.avgr_u */
++static void frame_init_lowres_core_simd128( pixel *src0, pixel *dst0, pixel *dsth, pixel *dstv, pixel *dstc,
++                                            intptr_t src_stride, intptr_t dst_stride, int width, int height )
++{
++    for( int y = 0; y < height; y++ )
++    {
++        pixel *src1 = src0+src_stride;
++        pixel *src2 = src1+src_stride;
++        int x = 0;
++        for( ; x + 16 <= width; x += 16 )
++        {
++            pixel *p0 = src0 + 2*x, *p1 = src1 + 2*x, *p2 = src2 + 2*x;
++            /* vertical averages at columns 2x and 2x+1 */
++            v128_t a_lo = wasm_u8x16_avgr( wasm_v128_load( p0 ),      wasm_v128_load( p1 ) );
++            v128_t a_hi = wasm_u8x16_avgr( wasm_v128_load( p0 + 16 ), wasm_v128_load( p1 + 16 ) );
++            v128_t b_lo = wasm_u8x16_avgr( wasm_v128_load( p0 + 1 ),  wasm_v128_load( p1 + 1 ) );
++            v128_t b_hi = wasm_u8x16_avgr( wasm_v128_load( p0 + 17 ), wasm_v128_load( p1 + 17 ) );
++            v128_t c_lo = wasm_u8x16_avgr( wasm_v128_load( p1 ),      wasm_v128_load( p2 ) );
++            v128_t c_hi = wasm_u8x16_avgr( wasm_v128_load( p1 + 16 ), wasm_v128_load( p2 + 16 ) );
++            v128_t d_lo = wasm_u8x16_avgr( wasm_v128_load( p1 + 1 ),  wasm_v128_load( p2 + 1 ) );
++            v128_t d_hi = wasm_u8x16_avgr( wasm_v128_load( p1 + 17 ), wasm_v128_load( p2 + 17 ) );
++            wasm_v128_store( dst0 + x, wasm_u8x16_avgr( even_bytes( a_lo, a_hi ), odd_bytes( a_lo, a_hi ) ) );
++            wasm_v128_store( dsth + x, wasm_u8x16_avgr( odd_bytes( a_lo, a_hi ), odd_bytes( b_lo, b_hi ) ) );
++            wasm_v128_store( dstv + x, wasm_u8x16_avgr( even_bytes( c_lo, c_hi ), odd_bytes( c_lo, c_hi ) ) );
++            wasm_v128_store( dstc + x, wasm_u8x16_avgr( odd_bytes( c_lo, c_hi ), odd_bytes( d_lo, d_hi ) ) );
++        }
++#define FILTER(a,b,c,d) ((((a+b+1)>>1)+((c+d+1)>>1)+1)>>1)
++        for( ; x < width; x++ )
++        {
++            dst0[x] = FILTER(src0[2*x  ], src1[2*x  ], src0[2*x+1], src1[2*x+1]);
++            dsth[x] = FILTER(src0[2*x+1], src1[2*x+1], src0[2*x+2], src1[2*x+2]);
++            dstv[x] = FILTER(src1[2*x  ], src2[2*x  ], src1[2*x+1], src2[2*x+1]);
++            dstc[x] = FILTER(src1[2*x+1], src2[2*x+1], src1[2*x+2], src2[2*x+2]);
++        }
++#undef FILTER
++        src0 += src_stride*2;
++        dst0 += dst_stride;
++        dsth += dst_stride;
++        dstv += dst_stride;
++        dstc += dst_stride;
++    }
++}
++
++static void plane_copy_interleave_simd128( pixel *dst,  intptr_t i_dst,
++                                           pixel *srcu, intptr_t i_srcu,
++                                           pixel *srcv, intptr_t i_srcv, int w, int h )
++{
++    for( int y = 0; y < h; y++, dst += i_dst, srcu += i_srcu, srcv += i_srcv )
++    {
++        int x = 0;
++        for( ; x + 16 <= w; x += 16 )
++        {
++            v128_t u = wasm_v128_load( srcu + x ), v = wasm_v128_load( srcv + x );
++            wasm_v128_store( dst + 2*x,      wasm_i8x16_shuffle( u, v, 0, 16, 1, 17, 2, 18, 3, 19, 4, 20, 5, 21, 6, 22, 7, 23 ) );
++            wasm_v128_store( dst + 2*x + 16, wasm_i8x16_shuffle( u, v, 8, 24, 9, 25, 10, 26, 11, 27, 12, 28, 13, 29, 14, 30, 15, 31 ) );
++        }
++        for( ; x < w; x++ )
++        {
++            dst[2*x]   = srcu[x];
++            dst[2*x+1] = srcv[x];
++        }
++    }
++}
++
++static void plane_copy_deinterleave_simd128( pixel *dsta, intptr_t i_dsta,
++                                             pixel *dstb, intptr_t i_dstb,
++                                             pixel *src,  intptr_t i_src, int w, int h )
++{
++    for( int y = 0; y < h; y++, dsta += i_dsta, dstb += i_dstb, src += i_src )
++    {
++        int x = 0;
++        for( ; x + 16 <= w; x += 16 )
++        {
++            v128_t lo = wasm_v128_load( src + 2*x ), hi = wasm_v128_load( src + 2*x + 16 );
++            wasm_v128_store( dsta + x, even_bytes( lo, hi ) );
++            wasm_v128_store( dstb + x, odd_bytes( lo, hi ) );
++        }
++        for( ; x < w; x++ )
++        {
++            dsta[x] = src[2*x];
++            dstb[x] = src[2*x+1];
++        }
++    }
++}
++
++/* One 16-byte NV12 row gives 8 U and 8 V pixels. */
++static ALWAYS_INLINE void load_deinterleave_chroma( pixel *dst, intptr_t i_dst, pixel *src, intptr_t i_src, int height )
++{
++    for( int y = 0; y < height; y++, dst += i_dst, src += i_src )
++    {
++        v128_t v = wasm_v128_load( src );
++        v = wasm_i8x16_shuffle( v, v, 0, 2, 4, 6, 8, 10, 12, 14, 1, 3, 5, 7, 9, 11, 13, 15 );
++        wasm_v128_store64_lane( dst, v, 0 );
++        wasm_v128_store64_lane( dst + i_dst/2, v, 1 );
++    }
++}
++
++static void load_deinterleave_chroma_fenc_simd128( pixel *dst, pixel *src, intptr_t i_src, int height )
++{
++    load_deinterleave_chroma( dst, FENC_STRIDE, src, i_src, height );
++}
++
++static void load_deinterleave_chroma_fdec_simd128( pixel *dst, pixel *src, intptr_t i_src, int height )
++{
++    load_deinterleave_chroma( dst, FDEC_STRIDE, src, i_src, height );
++}
++
++static void store_interleave_chroma_simd128( pixel *dst, intptr_t i_dst, pixel *srcu, pixel *srcv, int height )
++{
++    for( int y = 0; y < height; y++, dst += i_dst, srcu += FDEC_STRIDE, srcv += FDEC_STRIDE )
++    {
++        v128_t u = wasm_v128_load64_zero( srcu ), v = wasm_v128_load64_zero( srcv );
++        wasm_v128_store( dst, wasm_i8x16_shuffle( u, v, 0, 16, 1, 17, 2, 18, 3, 19, 4, 20, 5, 21, 6, 22, 7, 23 ) );
++    }
++}
++#endif // !HIGH_BIT_DEPTH
++
++void x264_mc_init_simd128( x264_mc_functions_t *pf )
++{
++#if !HIGH_BIT_DEPTH
++    pf->mc_luma   = mc_luma_simd128;
++    pf->get_ref   = get_ref_simd128;
++    pf->mc_chroma = mc_chroma_simd128;
++
++    pf->avg[PIXEL_16x16] = pixel_avg_16x16_simd128;
++    pf->avg[PIXEL_16x8]  = pixel_avg_16x8_simd128;
++    pf->avg[PIXEL_8x16]  = pixel_avg_8x16_simd128;
++    pf->avg[PIXEL_8x8]   = pixel_avg_8x8_simd128;
++    pf->avg[PIXEL_8x4]   = pixel_avg_8x4_simd128;
++    pf->avg[PIXEL_4x16]  = pixel_avg_4x16_simd128;
++    pf->avg[PIXEL_4x8]   = pixel_avg_4x8_simd128;
++    pf->avg[PIXEL_4x4]   = pixel_avg_4x4_simd128;
++    pf->avg[PIXEL_4x2]   = pixel_avg_4x2_simd128;
++
++    pf->weight    = mc_weight_wtab_simd128;
++    pf->offsetadd = mc_weight_wtab_simd128;
++    pf->offsetsub = mc_weight_wtab_simd128;
++
++    pf->copy_16x16_unaligned = mc_copy_w16_simd128;
++    pf->copy[PIXEL_16x16] = mc_copy_w16_simd128;
++    pf->copy[PIXEL_8x8]   = mc_copy_w8_simd128;
++    pf->copy[PIXEL_4x4]   = mc_copy_w4_simd128;
++
++    pf->store_interleave_chroma       = store_interleave_chroma_simd128;
++    pf->load_deinterleave_chroma_fenc = load_deinterleave_chroma_fenc_simd128;
++    pf->load_deinterleave_chroma_fdec = load_deinterleave_chroma_fdec_simd128;
++
++    pf->plane_copy_interleave   = plane_copy_interleave_simd128;
++    pf->plane_copy_deinterleave = plane_copy_deinterleave_simd128;
++
++    pf->hpel_filter = hpel_filter_simd128;
++    pf->frame_init_lowres_core = frame_init_lowres_core_simd128;
++#endif // !HIGH_BIT_DEPTH
++}
+diff --git a/common/wasm/mc.h b/common/wasm/mc.h
+new file mode 100644
+index 00000000..2ad0bfba
+--- /dev/null
++++ b/common/wasm/mc.h
+@@ -0,0 +1,32 @@
++/*****************************************************************************
++ * mc.h: wasm motion compensation
++ *****************************************************************************
++ * Copyright (C) 2026 x264 project
++ *
++ * Authors: x1xhlol
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02111, USA.
++ *
++ * This program is also available under a commercial proprietary license.
++ * For more information, contact us at licensing@x264.com.
++ *****************************************************************************/
++
++#ifndef X264_WASM_MC_H
++#define X264_WASM_MC_H
++
++#define x264_mc_init_simd128 x264_template(mc_init_simd128)
++void x264_mc_init_simd128( x264_mc_functions_t *pf );
++
++#endif
+-- 
+2.43.0
+

@@ -1,0 +1,251 @@
+From c28b7388b092fc86373658714bba6859685db87f Mon Sep 17 00:00:00 2001
+From: x1xhlol <lucknitelol@proton.me>
+Date: Sat, 26 Sep 2026 21:16:47 +0000
+Subject: [PATCH 2/7] wasm: Add compile support
+
+Support WebAssembly targets built with Emscripten, for example
+--host=wasm32-unknown-emscripten (the triplet printed by
+emcc -dumpmachine), and add a cpu flag for the WebAssembly SIMD128
+extension.
+
+WebAssembly has no runtime feature detection: a module containing
+SIMD128 instructions fails to compile on an engine without it. The
+flag is therefore decided at build time. configure adds -msimd128
+unless --disable-asm is given, which gives a plain C build, and
+x264_cpu_detect() reports SIMD128 whenever it was compiled in.
+
+Without -pthread, Emscripten links pthread stubs that fail at
+runtime, so threads are only enabled when -pthread is in the CFLAGS.
+
+HAVE_MMAP is left undefined: Emscripten's mmap() of a file only
+copies it into memory, and its missing madvise() prints a warning
+for every frame the CLI reads.
+
+checkasm --bench uses clock_gettime() as its timer.
+---
+ common/cpu.c     | 11 +++++++++++
+ config.sub       |  5 ++++-
+ configure        | 35 +++++++++++++++++++++++++++++++++--
+ tools/checkasm.c | 16 +++++++++++++++-
+ x264.h           |  3 +++
+ 5 files changed, 66 insertions(+), 4 deletions(-)
+
+diff --git a/common/cpu.c b/common/cpu.c
+index 73900db9..f4783ea3 100644
+--- a/common/cpu.c
++++ b/common/cpu.c
+@@ -106,6 +106,8 @@ const x264_cpu_name_t x264_cpu_names[] =
+ #elif ARCH_LOONGARCH
+     {"LSX",             X264_CPU_LSX},
+     {"LASX",            X264_CPU_LASX},
++#elif ARCH_WASM
++    {"SIMD128",         X264_CPU_SIMD128},
+ #endif
+     {"", 0},
+ };
+@@ -622,6 +624,15 @@ uint32_t x264_cpu_detect( void )
+     return flags;
+ }
+ 
++#elif HAVE_SIMD128
++
++uint32_t x264_cpu_detect( void )
++{
++    /* WebAssembly has no runtime feature detection: a module built with
++     * SIMD128 fails to compile on engines without it. */
++    return X264_CPU_SIMD128;
++}
++
+ #else
+ 
+ uint32_t x264_cpu_detect( void )
+diff --git a/config.sub b/config.sub
+index 8355f6bc..8f472700 100755
+--- a/config.sub
++++ b/config.sub
+@@ -318,6 +318,7 @@ case $basic_machine in
+ 	| tahoe | tic4x | tic54x | tic55x | tic6x | tic80 | tron \
+ 	| ubicom32 \
+ 	| v850 | v850e | v850e1 | v850e2 | v850es | v850e2v3 \
++	| wasm32 | wasm64 \
+ 	| we32k \
+ 	| x86 | xc16x | xstormy16 | xtensa \
+ 	| z8k | z80)
+@@ -439,6 +440,7 @@ case $basic_machine in
+ 	| ubicom32-* \
+ 	| v850-* | v850e-* | v850e1-* | v850es-* | v850e2-* | v850e2v3-* \
+ 	| vax-* \
++	| wasm32-* | wasm64-* \
+ 	| we32k-* \
+ 	| x86-* | x86_64-* | xc16x-* | xps100-* \
+ 	| xstormy16-* | xtensa*-* \
+@@ -1383,7 +1385,8 @@ case $os in
+ 	      | -os2* | -vos* | -palmos* | -uclinux* | -nucleus* \
+ 	      | -morphos* | -superux* | -rtmk* | -rtmk-nova* | -windiss* \
+ 	      | -powermax* | -dnix* | -nx6 | -nx7 | -sei* | -dragonfly* \
+-	      | -skyos* | -haiku* | -rdos* | -toppers* | -drops* | -es*)
++	      | -skyos* | -haiku* | -rdos* | -toppers* | -drops* | -es* \
++	      | -emscripten*)
+ 	# Remember, each alternative MUST END IN *, to match a version number.
+ 		;;
+ 	-qnx*)
+diff --git a/configure b/configure
+index d1d0a471..9f32d3d8 100755
+--- a/configure
++++ b/configure
+@@ -427,6 +427,7 @@ CONFIG_HAVE="MALLOC_H ALTIVEC ALTIVEC_H MMX ARMV6 ARMV6T2 NEON AARCH64 BEOSTHREA
+              SYSCONF SYNC_FETCH_AND_ADD \
+              DOTPROD I8MM SVE SVE2 \
+              RISCV64 RVV \
++             SIMD128 \
+              AS_ARCHEXT_DOTPROD_DIRECTIVE AS_ARCHEXT_I8MM_DIRECTIVE AS_ARCHEXT_SVE_DIRECTIVE AS_ARCHEXT_SVE2_DIRECTIVE"
+ 
+ # parse options
+@@ -752,6 +753,11 @@ case $host_os in
+     *haiku*)
+         SYS="HAIKU"
+         ;;
++    emscripten*)
++        SYS="EMSCRIPTEN"
++        define HAVE_MALLOC_H
++        libm="-lm"
++        ;;
+     *)
+         die "Unknown system $host, edit the configure"
+         ;;
+@@ -892,6 +898,12 @@ case $host_cpu in
+ 
+         AS="${AS-${CC}}"
+         ;;
++    wasm32|wasm64)
++        ARCH="WASM"
++        stack_alignment=16
++        AS="${AS-${CC}}"
++        AS_EXT=".c"
++        ;;
+     s390|s390x)
+         ARCH="S390"
+         ;;
+@@ -1099,6 +1111,20 @@ if [ $asm = auto -a $ARCH = LOONGARCH ] ; then
+     fi
+ fi
+ 
++if [ $asm = auto -a $ARCH = WASM ] ; then
++    if ! echo $CFLAGS | grep -Eq '(-msimd128|-mno-simd128)' ; then
++        cc_check '' -msimd128 && CFLAGS="$CFLAGS -msimd128"
++    fi
++
++    if cc_check wasm_simd128.h '' 'v128_t v = wasm_i8x16_splat( 0 );' ; then
++        define HAVE_SIMD128
++    else
++        echo "No WebAssembly SIMD128 support, try adding -msimd128 to CFLAGS."
++        echo "If you really want to run without SIMD128, configure with --disable-asm."
++        exit 1
++    fi
++fi
++
+ [ $asm = no ] && AS=""
+ [ "x$AS" = x ] && asm="no" || asm="yes"
+ 
+@@ -1167,6 +1193,10 @@ elif [ "$thread" != "no" ] ; then
+         QNX)
+             cc_check pthread.h -lc "pthread_create(0,0,0,0);" && thread="posix" && libpthread="-lc"
+             ;;
++        EMSCRIPTEN)
++            # without -pthread, Emscripten links pthread stubs that fail at runtime
++            cpp_check '' '' 'defined(__EMSCRIPTEN_PTHREADS__)' && thread="posix" && libpthread="-pthread"
++            ;;
+         *)
+             if cc_check pthread.h -lpthread "pthread_create(0,0,0,0);" ; then
+                thread="posix"
+@@ -1217,7 +1247,8 @@ if cc_check 'unistd.h' '' 'sysconf(0);' ; then
+     define HAVE_SYSCONF
+ fi
+ 
+-if [ "$SYS" != "WINDOWS" ] && cpp_check "sys/mman.h unistd.h" "" "defined(MAP_PRIVATE)"; then
++# Emscripten's mmap() of a file only copies it into memory, and madvise() is missing
++if [ "$SYS" != "WINDOWS" -a "$SYS" != "EMSCRIPTEN" ] && cpp_check "sys/mman.h unistd.h" "" "defined(MAP_PRIVATE)"; then
+     define HAVE_MMAP
+ fi
+ 
+@@ -1766,7 +1797,7 @@ cat conftest.log >> config.log
+ cat conftest.log
+ 
+ [ "$SRCPATH" != "." ] && ln -sf ${SRCPATH}/Makefile ./Makefile
+-mkdir -p common/{aarch64,arm,mips,ppc,x86,loongarch,riscv64} encoder extras filters/video input output tools
++mkdir -p common/{aarch64,arm,mips,ppc,x86,loongarch,riscv64,wasm} encoder extras filters/video input output tools
+ 
+ echo
+ echo "You can run 'make' or 'make fprofiled' now."
+diff --git a/tools/checkasm.c b/tools/checkasm.c
+index cdd94eb6..273baf95 100644
+--- a/tools/checkasm.c
++++ b/tools/checkasm.c
+@@ -33,6 +33,10 @@
+ #include <windows.h>
+ #endif
+ 
++#if ARCH_WASM
++#include <time.h>
++#endif
++
+ // GCC doesn't align stack variables on ARM, so use .bss
+ #if ARCH_ARM
+ #undef ALIGNED_16
+@@ -122,6 +126,11 @@ static inline uint32_t read_time(void)
+ #elif ARCH_LOONGARCH
+     uint32_t id = 0;
+     asm volatile( "rdtimel.w  %0, %1" : "=r"(a), "=r"(id) :: "memory" );
++#elif ARCH_WASM
++    /* no cycle counter, use nanoseconds instead */
++    struct timespec ts;
++    clock_gettime( CLOCK_MONOTONIC, &ts );
++    a = ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+ #endif
+     return a;
+ }
+@@ -229,6 +238,8 @@ static void print_bench(void)
+ #elif ARCH_LOONGARCH
+                     b->cpu&X264_CPU_LASX ? "lasx" :
+                     b->cpu&X264_CPU_LSX ? "lsx" :
++#elif ARCH_WASM
++                    b->cpu&X264_CPU_SIMD128 ? "simd128" :
+ #endif
+                     "c",
+ #if ARCH_X86 || ARCH_X86_64
+@@ -3033,6 +3044,9 @@ static int check_all_flags( void )
+         ret |= add_flags( &cpu0, &cpu1, X264_CPU_LSX, "LSX" );
+     if( cpu_detect & X264_CPU_LASX )
+         ret |= add_flags( &cpu0, &cpu1, X264_CPU_LASX, "LASX" );
++#elif ARCH_WASM
++    if( cpu_detect & X264_CPU_SIMD128 )
++        ret |= add_flags( &cpu0, &cpu1, X264_CPU_SIMD128, "SIMD128" );
+ #endif
+     return ret;
+ }
+@@ -3046,7 +3060,7 @@ REALIGN_STACK int main( int argc, char **argv )
+ 
+     if( argc > 1 && !strncmp( argv[1], "--bench", 7 ) )
+     {
+-#if !ARCH_X86 && !ARCH_X86_64 && !ARCH_PPC && !ARCH_ARM && !ARCH_AARCH64 && !ARCH_MIPS && !ARCH_LOONGARCH && !ARCH_RISCV64
++#if !ARCH_X86 && !ARCH_X86_64 && !ARCH_PPC && !ARCH_ARM && !ARCH_AARCH64 && !ARCH_MIPS && !ARCH_LOONGARCH && !ARCH_RISCV64 && !ARCH_WASM
+         fprintf( stderr, "no --bench for your cpu until you port rdtsc\n" );
+         return 1;
+ #endif
+diff --git a/x264.h b/x264.h
+index b3223cd8..7acb1009 100644
+--- a/x264.h
++++ b/x264.h
+@@ -192,6 +192,9 @@ typedef struct x264_nal_t
+ #define X264_CPU_LSX             0x0000001U  /* LOONGARCH LSX */
+ #define X264_CPU_LASX            0x0000002U  /* LOONGARCH LASX */
+ 
++/* WebAssembly */
++#define X264_CPU_SIMD128         0x0000001U  /* WebAssembly SIMD128 */
++
+ /* Analyse flags */
+ #define X264_ANALYSE_I4x4       0x0001U  /* Analyse i4x4 */
+ #define X264_ANALYSE_I8x8       0x0002U  /* Analyse i8x8 (requires 8x8 transform) */
+-- 
+2.43.0
+

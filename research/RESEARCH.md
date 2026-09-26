@@ -19,7 +19,8 @@ WebAssembly too. Profiling the C-only x264 build (`perf`, then V8's `--cpu-prof`
 
 ## What changed
 
-**WebAssembly SIMD128 kernels for x264** (`x264-wasm/x264-simd128.patch`, ~1,500 lines of kernels):
+**WebAssembly SIMD128 kernels for x264** (`x264-wasm/patches`, ~1,500 lines of kernels, since restructured as a
+series for upstream x264: `configure` support for a wasm32 host and one file per module in `common/wasm`):
 SAD/SAD×3/×4, SATD/×3/×4, SA8D, SSD, variance, var2, hadamard_ac, intra mode costs, get_ref/mc_luma, bi-pred
 averaging, the 6-tap half-pel filter, chroma MC, lookahead downscaling, NV12 (de)interleaving, quantization,
 4×4/8×8 DCT and IDCT, and luma/chroma deblocking. Notes:
@@ -1150,7 +1151,7 @@ its spare room goes to speed ("Room to spare goes to speed").
 ## Licensing
 
 x264 is GPL-2.0-or-later, and the WebAssembly build is served to users, so the corresponding source (x264 at
-`X264_COMMIT` plus `x264-simd128.patch` and `pare_x264.c`) has to be offered to them. The previous ffmpeg.wasm build
+`X264_COMMIT` plus the patches in `x264-wasm/patches` and `pare_x264.c`) has to be offered to them. The previous ffmpeg.wasm build
 had the same obligation. SVT-AV1 (BSD-3-Clause-Clear, with the Alliance for Open Media patent license) and libvmaf
 (BSD-2-Clause-Patent) are permissive and GPL-compatible; their patches and bindings are in `av1-wasm/` and
 `vmaf-wasm/`.

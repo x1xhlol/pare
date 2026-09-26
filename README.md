@@ -126,9 +126,9 @@ The x264 module is checked in at `src/lib/x264/`. To rebuild it from source you 
 x264-wasm/build.sh
 ```
 
-The script clones x264 at the commit in `x264-wasm/X264_COMMIT`, applies `x264-simd128.patch`, builds it with
-`-msimd128`, runs `checkasm` to check every SIMD kernel against the C reference, and links the binding in
-`pare_x264.c`.
+The script clones x264 at the commit in `x264-wasm/X264_COMMIT`, applies the series in `x264-wasm/patches` (build
+support for WebAssembly in x264's `configure` and the SIMD128 kernels in `common/wasm`, written for upstream x264),
+runs `checkasm` to check every SIMD kernel against the C reference, and links the binding in `pare_x264.c`.
 
 ## Layout
 
@@ -171,7 +171,7 @@ The script clones x264 at the commit in `x264-wasm/X264_COMMIT`, applies `x264-s
 ## License
 
 Pare is free software under the GNU General Public License, version 2 or later, because x264 is. See
-[LICENSE](LICENSE). The x264 changes are in `x264-wasm/x264-simd128.patch`. SVT-AV1 (BSD-3-Clause-Clear) and libvmaf
+[LICENSE](LICENSE). The x264 changes are the patches in `x264-wasm/patches`. SVT-AV1 (BSD-3-Clause-Clear) and libvmaf
 (BSD-2-Clause-Patent) keep their own licenses; Pare's changes to them are in `av1-wasm/` and `vmaf-wasm/`.
 
 H.264 is covered by patents in some countries. x264's own licensing notes apply to anyone distributing encoders

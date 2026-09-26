@@ -1,0 +1,207 @@
+From e6f174b1a0bf022989c3614088d42202dfcaf8bb Mon Sep 17 00:00:00 2001
+From: x1xhlol <lucknitelol@proton.me>
+Date: Sat, 26 Sep 2026 21:25:44 +0000
+Subject: [PATCH 6/7] wasm: Add SIMD128 quant functions
+
+quant_8x8, quant_4x4, quant_4x4x4 and quant_4x4_dc, 8-bit only.
+
+The bias and multiplication are done in 32-bit lanes with the same
+unsigned wraparound as QUANT_ONE, so the results match the C version
+for all inputs, not only the ranges an encode produces.
+---
+ Makefile            |   3 +-
+ common/quant.c      |   8 ++++
+ common/wasm/quant.c | 101 ++++++++++++++++++++++++++++++++++++++++++++
+ common/wasm/quant.h |  32 ++++++++++++++
+ 4 files changed, 143 insertions(+), 1 deletion(-)
+ create mode 100644 common/wasm/quant.c
+ create mode 100644 common/wasm/quant.h
+
+diff --git a/Makefile b/Makefile
+index 1dcfbc4f..4c2fea89 100644
+--- a/Makefile
++++ b/Makefile
+@@ -257,7 +257,8 @@ ifeq ($(SYS_ARCH),WASM)
+ ifneq ($(findstring HAVE_SIMD128 1, $(CONFIG)),)
+ SRCS_X += common/wasm/dct.c \
+           common/wasm/mc.c \
+-          common/wasm/pixel.c
++          common/wasm/pixel.c \
++          common/wasm/quant.c
+ endif
+ endif
+ 
+diff --git a/common/quant.c b/common/quant.c
+index 21bb2955..7903284d 100644
+--- a/common/quant.c
++++ b/common/quant.c
+@@ -46,6 +46,9 @@
+ #if HAVE_LSX
+ #   include "loongarch/quant.h"
+ #endif
++#if HAVE_SIMD128
++#   include "wasm/quant.h"
++#endif
+ 
+ #define QUANT_ONE( coef, mf, f ) \
+ { \
+@@ -874,6 +877,11 @@ void x264_quant_init( x264_t *h, uint32_t cpu, x264_quant_function_t *pf )
+     }
+ #endif
+ 
++#if HAVE_SIMD128
++    if( cpu&X264_CPU_SIMD128 )
++        x264_quant_init_simd128( pf );
++#endif
++
+ #endif // HIGH_BIT_DEPTH
+     pf->coeff_last[DCT_LUMA_DC]     = pf->coeff_last[DCT_CHROMAU_DC]  = pf->coeff_last[DCT_CHROMAV_DC] =
+     pf->coeff_last[DCT_CHROMAU_4x4] = pf->coeff_last[DCT_CHROMAV_4x4] = pf->coeff_last[DCT_LUMA_4x4];
+diff --git a/common/wasm/quant.c b/common/wasm/quant.c
+new file mode 100644
+index 00000000..865780aa
+--- /dev/null
++++ b/common/wasm/quant.c
+@@ -0,0 +1,101 @@
++/*****************************************************************************
++ * quant.c: wasm quantization
++ *****************************************************************************
++ * Copyright (C) 2026 x264 project
++ *
++ * Authors: x1xhlol
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02111, USA.
++ *
++ * This program is also available under a commercial proprietary license.
++ * For more information, contact us at licensing@x264.com.
++ *****************************************************************************/
++
++#include "common/common.h"
++#include "wasmcommon.h"
++#include "quant.h"
++
++#if !HIGH_BIT_DEPTH
++/* Same as QUANT_ONE: the bias is added and the product taken in 32-bit lanes
++ * with unsigned wraparound, and coefficients <= 0 take the negated branch.
++ * Unlike the x86 and NEON versions, this matches the C for all inputs. */
++static ALWAYS_INLINE v128_t quant_8( v128_t coef, v128_t mf_lo, v128_t mf_hi, v128_t bias_lo, v128_t bias_hi )
++{
++    v128_t positive = wasm_i16x8_gt( coef, wasm_i16x8_splat( 0 ) );
++    /* abs(-32768) stays 0x8000, which is 32768 read as unsigned */
++    v128_t mag = wasm_i16x8_abs( coef );
++    v128_t lo = wasm_i32x4_mul( wasm_i32x4_add( wasm_u32x4_extend_low_u16x8( mag ), bias_lo ), mf_lo );
++    v128_t hi = wasm_i32x4_mul( wasm_i32x4_add( wasm_u32x4_extend_high_u16x8( mag ), bias_hi ), mf_hi );
++    lo = wasm_u32x4_shr( lo, 16 );
++    hi = wasm_u32x4_shr( hi, 16 );
++    /* keep the low 16 bits of each result, as storing to a dctcoef does */
++    v128_t v = wasm_i8x16_shuffle( lo, hi, 0, 1, 4, 5, 8, 9, 12, 13, 16, 17, 20, 21, 24, 25, 28, 29 );
++    return wasm_v128_bitselect( v, wasm_i16x8_neg( v ), positive );
++}
++
++/* Quantizes n coefficients in place and returns the OR of the results. */
++static ALWAYS_INLINE v128_t quant_n( dctcoef *dct, udctcoef *mf, udctcoef *bias, int n )
++{
++    v128_t nz = wasm_i16x8_splat( 0 );
++    for( int i = 0; i < n; i += 8 )
++    {
++        v128_t m = wasm_v128_load( mf + i ), b = wasm_v128_load( bias + i );
++        v128_t q = quant_8( wasm_v128_load( dct + i ),
++                            wasm_u32x4_extend_low_u16x8( m ), wasm_u32x4_extend_high_u16x8( m ),
++                            wasm_u32x4_extend_low_u16x8( b ), wasm_u32x4_extend_high_u16x8( b ) );
++        wasm_v128_store( dct + i, q );
++        nz = wasm_v128_or( nz, q );
++    }
++    return nz;
++}
++
++static int quant_8x8_simd128( dctcoef dct[64], udctcoef mf[64], udctcoef bias[64] )
++{
++    return wasm_v128_any_true( quant_n( dct, mf, bias, 64 ) );
++}
++
++static int quant_4x4_simd128( dctcoef dct[16], udctcoef mf[16], udctcoef bias[16] )
++{
++    return wasm_v128_any_true( quant_n( dct, mf, bias, 16 ) );
++}
++
++static int quant_4x4x4_simd128( dctcoef dct[4][16], udctcoef mf[16], udctcoef bias[16] )
++{
++    int nza = 0;
++    for( int j = 0; j < 4; j++ )
++        nza |= wasm_v128_any_true( quant_n( dct[j], mf, bias, 16 ) ) << j;
++    return nza;
++}
++
++static int quant_4x4_dc_simd128( dctcoef dct[16], int mf, int bias )
++{
++    v128_t vmf = wasm_i32x4_splat( mf ), vbias = wasm_i32x4_splat( bias );
++    v128_t a = quant_8( wasm_v128_load( dct ), vmf, vmf, vbias, vbias );
++    v128_t b = quant_8( wasm_v128_load( dct + 8 ), vmf, vmf, vbias, vbias );
++    wasm_v128_store( dct, a );
++    wasm_v128_store( dct + 8, b );
++    return wasm_v128_any_true( wasm_v128_or( a, b ) );
++}
++#endif // !HIGH_BIT_DEPTH
++
++void x264_quant_init_simd128( x264_quant_function_t *pf )
++{
++#if !HIGH_BIT_DEPTH
++    pf->quant_8x8    = quant_8x8_simd128;
++    pf->quant_4x4    = quant_4x4_simd128;
++    pf->quant_4x4x4  = quant_4x4x4_simd128;
++    pf->quant_4x4_dc = quant_4x4_dc_simd128;
++#endif // !HIGH_BIT_DEPTH
++}
+diff --git a/common/wasm/quant.h b/common/wasm/quant.h
+new file mode 100644
+index 00000000..e05d38f1
+--- /dev/null
++++ b/common/wasm/quant.h
+@@ -0,0 +1,32 @@
++/*****************************************************************************
++ * quant.h: wasm quantization
++ *****************************************************************************
++ * Copyright (C) 2026 x264 project
++ *
++ * Authors: x1xhlol
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02111, USA.
++ *
++ * This program is also available under a commercial proprietary license.
++ * For more information, contact us at licensing@x264.com.
++ *****************************************************************************/
++
++#ifndef X264_WASM_QUANT_H
++#define X264_WASM_QUANT_H
++
++#define x264_quant_init_simd128 x264_template(quant_init_simd128)
++void x264_quant_init_simd128( x264_quant_function_t *pf );
++
++#endif
+-- 
+2.43.0
+

@@ -1,0 +1,799 @@
+From f053f57c0a34c6b46029e5535f93eaaf85622407 Mon Sep 17 00:00:00 2001
+From: x1xhlol <lucknitelol@proton.me>
+Date: Sat, 26 Sep 2026 21:20:54 +0000
+Subject: [PATCH 3/7] wasm: Add SIMD128 pixel functions
+
+sad, sad_x3/x4, ssd, satd, satd_x3/x4, sa8d, var, var2, hadamard_ac,
+the SSIM helpers and the intra mode cost functions, 8-bit only. All of
+them are bit-exact with the C versions, including ssim_end4, which
+does the same float operations in the same order.
+
+The SATD, SA8D and hadamard_ac transforms leave out their last
+butterfly stage and use |a+b| + |a-b| = 2*max(|a|,|b|) instead.
+---
+ Makefile                 |   7 +
+ common/pixel.c           |   9 +
+ common/wasm/pixel.c      | 641 +++++++++++++++++++++++++++++++++++++++
+ common/wasm/pixel.h      |  32 ++
+ common/wasm/wasmcommon.h |  37 +++
+ 5 files changed, 726 insertions(+)
+ create mode 100644 common/wasm/pixel.c
+ create mode 100644 common/wasm/pixel.h
+ create mode 100644 common/wasm/wasmcommon.h
+
+diff --git a/Makefile b/Makefile
+index 2d95b38f..3fae3c56 100644
+--- a/Makefile
++++ b/Makefile
+@@ -252,6 +252,13 @@ OBJCHK += tools/checkasm-loongarch.o
+ endif
+ endif
+ 
++# WebAssembly SIMD128 optims
++ifeq ($(SYS_ARCH),WASM)
++ifneq ($(findstring HAVE_SIMD128 1, $(CONFIG)),)
++SRCS_X += common/wasm/pixel.c
++endif
++endif
++
+ endif
+ 
+ ifneq ($(HAVE_GETOPT_LONG),1)
+diff --git a/common/pixel.c b/common/pixel.c
+index 2f91bd33..fd21429f 100644
+--- a/common/pixel.c
++++ b/common/pixel.c
+@@ -48,6 +48,9 @@
+ #if HAVE_LSX
+ #   include "loongarch/pixel.h"
+ #endif
++#if HAVE_SIMD128
++#   include "wasm/pixel.h"
++#endif
+ 
+ /****************************************************************************
+  * pixel_sad_WxH
+@@ -1656,6 +1659,12 @@ void x264_pixel_init( uint32_t cpu, x264_pixel_function_t *pixf )
+         x264_pixel_init_altivec( pixf );
+     }
+ #endif
++#if HAVE_SIMD128
++    if( cpu&X264_CPU_SIMD128 )
++    {
++        x264_pixel_init_simd128( pixf );
++    }
++#endif
+ 
+     pixf->ads[PIXEL_8x16] =
+     pixf->ads[PIXEL_8x4] =
+diff --git a/common/wasm/pixel.c b/common/wasm/pixel.c
+new file mode 100644
+index 00000000..9f721dad
+--- /dev/null
++++ b/common/wasm/pixel.c
+@@ -0,0 +1,641 @@
++/*****************************************************************************
++ * pixel.c: wasm pixel metrics
++ *****************************************************************************
++ * Copyright (C) 2026 x264 project
++ *
++ * Authors: x1xhlol
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02111, USA.
++ *
++ * This program is also available under a commercial proprietary license.
++ * For more information, contact us at licensing@x264.com.
++ *****************************************************************************/
++
++#include "common/common.h"
++#include "wasmcommon.h"
++#include "pixel.h"
++
++#if !HIGH_BIT_DEPTH
++static ALWAYS_INLINE int hsum_u16x8( v128_t v )
++{
++    v128_t s = wasm_u32x4_extadd_pairwise_u16x8( v );
++    s = wasm_i32x4_add( s, wasm_i32x4_shuffle( s, s, 2, 3, 0, 1 ) );
++    s = wasm_i32x4_add( s, wasm_i32x4_shuffle( s, s, 1, 0, 3, 2 ) );
++    return wasm_i32x4_extract_lane( s, 0 );
++}
++
++static ALWAYS_INLINE int hsum_i32x4( v128_t s )
++{
++    s = wasm_i32x4_add( s, wasm_i32x4_shuffle( s, s, 2, 3, 0, 1 ) );
++    s = wasm_i32x4_add( s, wasm_i32x4_shuffle( s, s, 1, 0, 3, 2 ) );
++    return wasm_i32x4_extract_lane( s, 0 );
++}
++
++/* Rows of a 16, 8 or 4 pixel wide block, packed so that each vector holds 16 pixels. */
++static ALWAYS_INLINE v128_t load_rows( pixel *p, intptr_t stride, int w )
++{
++    if( w == 16 )
++        return wasm_v128_load( p );
++    if( w == 8 )
++        return wasm_v128_load64_lane( p + stride, wasm_v128_load64_zero( p ), 1 );
++    v128_t v = wasm_v128_load32_zero( p );
++    v = wasm_v128_load32_lane( p + stride, v, 1 );
++    v = wasm_v128_load32_lane( p + 2*stride, v, 2 );
++    return wasm_v128_load32_lane( p + 3*stride, v, 3 );
++}
++
++/****************************************************************************
++ * SAD
++ ****************************************************************************/
++static ALWAYS_INLINE v128_t sad_acc( v128_t sum, v128_t a, v128_t b )
++{
++    return wasm_i16x8_add( sum, wasm_u16x8_extadd_pairwise_u8x16( absdiff_u8x16( a, b ) ) );
++}
++
++static ALWAYS_INLINE int sad_wxh( pixel *pix1, intptr_t i_pix1, pixel *pix2, intptr_t i_pix2, int w, int h )
++{
++    const int rows = 16 / w;
++    v128_t sum = wasm_i16x8_splat( 0 );
++    for( int y = 0; y < h; y += rows, pix1 += rows*i_pix1, pix2 += rows*i_pix2 )
++        sum = sad_acc( sum, load_rows( pix1, i_pix1, w ), load_rows( pix2, i_pix2, w ) );
++    return hsum_u16x8( sum );
++}
++
++#define PIXEL_SAD_SIMD128( w, h )\
++static int pixel_sad_##w##x##h##_simd128( pixel *pix1, intptr_t i_pix1, pixel *pix2, intptr_t i_pix2 )\
++{\
++    return sad_wxh( pix1, i_pix1, pix2, i_pix2, w, h );\
++}
++
++PIXEL_SAD_SIMD128( 16, 16 )
++PIXEL_SAD_SIMD128( 16, 8 )
++PIXEL_SAD_SIMD128( 8, 16 )
++PIXEL_SAD_SIMD128( 8, 8 )
++PIXEL_SAD_SIMD128( 8, 4 )
++PIXEL_SAD_SIMD128( 4, 16 )
++PIXEL_SAD_SIMD128( 4, 8 )
++PIXEL_SAD_SIMD128( 4, 4 )
++
++/* One pass over fenc, compared against 3 or 4 references. */
++static ALWAYS_INLINE void sad_xn( pixel *fenc, pixel *pix0, pixel *pix1, pixel *pix2, pixel *pix3,
++                                  intptr_t i_stride, int *scores, int w, int h, int n )
++{
++    const int rows = 16 / w;
++    v128_t sum0 = wasm_i16x8_splat( 0 ), sum1 = sum0, sum2 = sum0, sum3 = sum0;
++    for( int y = 0; y < h; y += rows )
++    {
++        v128_t f = load_rows( fenc, FENC_STRIDE, w );
++        sum0 = sad_acc( sum0, f, load_rows( pix0, i_stride, w ) );
++        sum1 = sad_acc( sum1, f, load_rows( pix1, i_stride, w ) );
++        sum2 = sad_acc( sum2, f, load_rows( pix2, i_stride, w ) );
++        if( n == 4 )
++            sum3 = sad_acc( sum3, f, load_rows( pix3, i_stride, w ) );
++        fenc += rows*FENC_STRIDE;
++        pix0 += rows*i_stride;
++        pix1 += rows*i_stride;
++        pix2 += rows*i_stride;
++        pix3 += rows*i_stride;
++    }
++    scores[0] = hsum_u16x8( sum0 );
++    scores[1] = hsum_u16x8( sum1 );
++    scores[2] = hsum_u16x8( sum2 );
++    if( n == 4 )
++        scores[3] = hsum_u16x8( sum3 );
++}
++
++#define PIXEL_SAD_X_SIMD128( w, h )\
++static void pixel_sad_x3_##w##x##h##_simd128( pixel *fenc, pixel *pix0, pixel *pix1, pixel *pix2,\
++                                              intptr_t i_stride, int scores[3] )\
++{\
++    sad_xn( fenc, pix0, pix1, pix2, pix2, i_stride, scores, w, h, 3 );\
++}\
++static void pixel_sad_x4_##w##x##h##_simd128( pixel *fenc, pixel *pix0, pixel *pix1, pixel *pix2, pixel *pix3,\
++                                              intptr_t i_stride, int scores[4] )\
++{\
++    sad_xn( fenc, pix0, pix1, pix2, pix3, i_stride, scores, w, h, 4 );\
++}
++
++PIXEL_SAD_X_SIMD128( 16, 16 )
++PIXEL_SAD_X_SIMD128( 16, 8 )
++PIXEL_SAD_X_SIMD128( 8, 16 )
++PIXEL_SAD_X_SIMD128( 8, 8 )
++PIXEL_SAD_X_SIMD128( 8, 4 )
++PIXEL_SAD_X_SIMD128( 4, 8 )
++PIXEL_SAD_X_SIMD128( 4, 4 )
++
++/****************************************************************************
++ * SATD: sum of absolute 4x4 Hadamard coefficients, halved.
++ * The last butterfly uses |a+b| + |a-b| = 2*max(|a|,|b|), which also
++ * absorbs the halving.
++ ****************************************************************************/
++
++/* [x0+x1, x1-x0, x2+x3, x3-x2] in every group of four lanes. The sign flips
++ * are the same for every block, and each coefficient ends up inside an abs(). */
++static ALWAYS_INLINE v128_t hadamard_pairs( v128_t v )
++{
++    v128_t sw = wasm_i16x8_shuffle( v, v, 1, 0, 3, 2, 5, 4, 7, 6 );
++    return wasm_i16x8_shuffle( wasm_i16x8_add( v, sw ), wasm_i16x8_sub( v, sw ), 0, 9, 2, 11, 4, 13, 6, 15 );
++}
++
++static ALWAYS_INLINE v128_t load_diff8( pixel *pix1, pixel *pix2 )
++{
++    return wasm_i16x8_sub( wasm_u16x8_load8x8( pix1 ), wasm_u16x8_load8x8( pix2 ) );
++}
++
++/* Returns per-lane partial sums whose total is twice the SATD of the 8x4 block. */
++static ALWAYS_INLINE v128_t satd_8x4_x2( pixel *pix1, intptr_t i_pix1, pixel *pix2, intptr_t i_pix2 )
++{
++    v128_t d0 = hadamard_pairs( load_diff8( pix1,            pix2 ) );
++    v128_t d1 = hadamard_pairs( load_diff8( pix1 + i_pix1,   pix2 + i_pix2 ) );
++    v128_t d2 = hadamard_pairs( load_diff8( pix1 + 2*i_pix1, pix2 + 2*i_pix2 ) );
++    v128_t d3 = hadamard_pairs( load_diff8( pix1 + 3*i_pix1, pix2 + 3*i_pix2 ) );
++    v128_t a0 = wasm_i16x8_add( d0, d1 ), a1 = wasm_i16x8_sub( d0, d1 );
++    v128_t a2 = wasm_i16x8_add( d2, d3 ), a3 = wasm_i16x8_sub( d2, d3 );
++    v128_t b0 = wasm_i16x8_abs( wasm_i16x8_add( a0, a2 ) ), b2 = wasm_i16x8_abs( wasm_i16x8_sub( a0, a2 ) );
++    v128_t b1 = wasm_i16x8_abs( wasm_i16x8_add( a1, a3 ) ), b3 = wasm_i16x8_abs( wasm_i16x8_sub( a1, a3 ) );
++    /* the remaining butterflies pair lanes 0/2 and 1/3 of each group */
++    v128_t m0 = wasm_i16x8_max( b0, wasm_i16x8_shuffle( b0, b0, 2, 3, 0, 1, 6, 7, 4, 5 ) );
++    v128_t m1 = wasm_i16x8_max( b1, wasm_i16x8_shuffle( b1, b1, 2, 3, 0, 1, 6, 7, 4, 5 ) );
++    v128_t m2 = wasm_i16x8_max( b2, wasm_i16x8_shuffle( b2, b2, 2, 3, 0, 1, 6, 7, 4, 5 ) );
++    v128_t m3 = wasm_i16x8_max( b3, wasm_i16x8_shuffle( b3, b3, 2, 3, 0, 1, 6, 7, 4, 5 ) );
++    /* every max appears twice in the vector; lanes stay below 8160 */
++    return wasm_i16x8_add( wasm_i16x8_add( m0, m1 ), wasm_i16x8_add( m2, m3 ) );
++}
++
++static ALWAYS_INLINE int satd_8wide( pixel *pix1, intptr_t i_pix1, pixel *pix2, intptr_t i_pix2, int w, int h )
++{
++    v128_t sum = wasm_i32x4_splat( 0 );
++    for( int y = 0; y < h; y += 4 )
++        for( int x = 0; x < w; x += 8 )
++            sum = wasm_i32x4_add( sum, wasm_i32x4_extadd_pairwise_i16x8(
++                      satd_8x4_x2( pix1 + y*i_pix1 + x, i_pix1, pix2 + y*i_pix2 + x, i_pix2 ) ) );
++    return hsum_i32x4( sum ) >> 1;
++}
++
++/* 4 pixel wide blocks: two rows share a vector (lanes 0-3 and 4-7), so the
++ * vertical butterflies work across vectors and across vector halves. */
++static ALWAYS_INLINE v128_t load_diff4x2( pixel *pix1, intptr_t i_pix1, pixel *pix2, intptr_t i_pix2 )
++{
++    v128_t a = wasm_v128_load32_lane( pix1 + i_pix1, wasm_v128_load32_zero( pix1 ), 1 );
++    v128_t b = wasm_v128_load32_lane( pix2 + i_pix2, wasm_v128_load32_zero( pix2 ), 1 );
++    return wasm_i16x8_sub( wasm_u16x8_extend_low_u8x16( a ), wasm_u16x8_extend_low_u8x16( b ) );
++}
++
++static ALWAYS_INLINE v128_t satd_4x4_x2( pixel *pix1, intptr_t i_pix1, pixel *pix2, intptr_t i_pix2 )
++{
++    /* r01 holds rows 0|1, r23 rows 2|3 */
++    v128_t r01 = hadamard_pairs( load_diff4x2( pix1, i_pix1, pix2, i_pix2 ) );
++    v128_t r23 = hadamard_pairs( load_diff4x2( pix1 + 2*i_pix1, i_pix1, pix2 + 2*i_pix2, i_pix2 ) );
++    v128_t a = wasm_i16x8_add( r01, r23 ); /* rows 0+2 | 1+3 */
++    v128_t b = wasm_i16x8_sub( r01, r23 ); /* rows 0-2 | 1-3 */
++    v128_t sa = wasm_i16x8_shuffle( a, a, 4, 5, 6, 7, 0, 1, 2, 3 );
++    v128_t sb = wasm_i16x8_shuffle( b, b, 4, 5, 6, 7, 0, 1, 2, 3 );
++    /* both halves now hold the same values, up to sign */
++    v128_t c0 = wasm_i16x8_abs( wasm_i16x8_add( a, sa ) );
++    v128_t c1 = wasm_i16x8_abs( wasm_i16x8_sub( a, sa ) );
++    v128_t c2 = wasm_i16x8_abs( wasm_i16x8_add( b, sb ) );
++    v128_t c3 = wasm_i16x8_abs( wasm_i16x8_sub( b, sb ) );
++    v128_t m0 = wasm_i16x8_max( c0, wasm_i16x8_shuffle( c0, c0, 2, 3, 0, 1, 6, 7, 4, 5 ) );
++    v128_t m1 = wasm_i16x8_max( c1, wasm_i16x8_shuffle( c1, c1, 2, 3, 0, 1, 6, 7, 4, 5 ) );
++    v128_t m2 = wasm_i16x8_max( c2, wasm_i16x8_shuffle( c2, c2, 2, 3, 0, 1, 6, 7, 4, 5 ) );
++    v128_t m3 = wasm_i16x8_max( c3, wasm_i16x8_shuffle( c3, c3, 2, 3, 0, 1, 6, 7, 4, 5 ) );
++    /* every max appears twice per half; keeping one half leaves a total of
++     * twice the SATD, as in satd_8x4_x2 */
++    v128_t sum = wasm_i16x8_add( wasm_i16x8_add( m0, m1 ), wasm_i16x8_add( m2, m3 ) );
++    return wasm_v128_and( sum, wasm_i32x4_const( -1, -1, 0, 0 ) );
++}
++
++static ALWAYS_INLINE int satd_4wide( pixel *pix1, intptr_t i_pix1, pixel *pix2, intptr_t i_pix2, int h )
++{
++    v128_t sum = wasm_i32x4_splat( 0 );
++    for( int y = 0; y < h; y += 4 )
++        sum = wasm_i32x4_add( sum, wasm_i32x4_extadd_pairwise_i16x8(
++                  satd_4x4_x2( pix1 + y*i_pix1, i_pix1, pix2 + y*i_pix2, i_pix2 ) ) );
++    return hsum_i32x4( sum ) >> 1;
++}
++
++#define PIXEL_SATD_SIMD128( w, h )\
++static int pixel_satd_##w##x##h##_simd128( pixel *pix1, intptr_t i_pix1, pixel *pix2, intptr_t i_pix2 )\
++{\
++    if( w == 4 )\
++        return satd_4wide( pix1, i_pix1, pix2, i_pix2, h );\
++    return satd_8wide( pix1, i_pix1, pix2, i_pix2, w, h );\
++}
++
++PIXEL_SATD_SIMD128( 16, 16 )
++PIXEL_SATD_SIMD128( 16, 8 )
++PIXEL_SATD_SIMD128( 8, 16 )
++PIXEL_SATD_SIMD128( 8, 8 )
++PIXEL_SATD_SIMD128( 8, 4 )
++PIXEL_SATD_SIMD128( 4, 16 )
++PIXEL_SATD_SIMD128( 4, 8 )
++PIXEL_SATD_SIMD128( 4, 4 )
++
++#define PIXEL_SATD_X_SIMD128( size )\
++static void pixel_satd_x3_##size##_simd128( pixel *fenc, pixel *pix0, pixel *pix1, pixel *pix2,\
++                                            intptr_t i_stride, int scores[3] )\
++{\
++    scores[0] = pixel_satd_##size##_simd128( fenc, FENC_STRIDE, pix0, i_stride );\
++    scores[1] = pixel_satd_##size##_simd128( fenc, FENC_STRIDE, pix1, i_stride );\
++    scores[2] = pixel_satd_##size##_simd128( fenc, FENC_STRIDE, pix2, i_stride );\
++}\
++static void pixel_satd_x4_##size##_simd128( pixel *fenc, pixel *pix0, pixel *pix1, pixel *pix2, pixel *pix3,\
++                                            intptr_t i_stride, int scores[4] )\
++{\
++    scores[0] = pixel_satd_##size##_simd128( fenc, FENC_STRIDE, pix0, i_stride );\
++    scores[1] = pixel_satd_##size##_simd128( fenc, FENC_STRIDE, pix1, i_stride );\
++    scores[2] = pixel_satd_##size##_simd128( fenc, FENC_STRIDE, pix2, i_stride );\
++    scores[3] = pixel_satd_##size##_simd128( fenc, FENC_STRIDE, pix3, i_stride );\
++}
++
++PIXEL_SATD_X_SIMD128( 16x16 )
++PIXEL_SATD_X_SIMD128( 16x8 )
++PIXEL_SATD_X_SIMD128( 8x16 )
++PIXEL_SATD_X_SIMD128( 8x8 )
++PIXEL_SATD_X_SIMD128( 8x4 )
++PIXEL_SATD_X_SIMD128( 4x8 )
++PIXEL_SATD_X_SIMD128( 4x4 )
++
++/****************************************************************************
++ * SA8D: sum of absolute 8x8 Hadamard coefficients, (sum+2)>>2
++ ****************************************************************************/
++static ALWAYS_INLINE v128_t hadamard8_rows( v128_t v )
++{
++    /* stage 1: lanes 0/1, 2/3, 4/5, 6/7 */
++    v = hadamard_pairs( v );
++    /* stage 2: lanes 0/2, 1/3, 4/6, 5/7; stage 3 is left to the max trick */
++    v128_t sw = wasm_i16x8_shuffle( v, v, 2, 3, 0, 1, 6, 7, 4, 5 );
++    return wasm_i16x8_shuffle( wasm_i16x8_add( v, sw ), wasm_i16x8_sub( v, sw ), 0, 1, 10, 11, 4, 5, 14, 15 );
++}
++
++/* Returns the sum of the coefficients of one 8x8 block, before rounding. */
++static ALWAYS_INLINE int sa8d_8x8( pixel *pix1, intptr_t i_pix1, pixel *pix2, intptr_t i_pix2 )
++{
++    v128_t r[8];
++    for( int i = 0; i < 8; i++ )
++        r[i] = hadamard8_rows( load_diff8( pix1 + i*i_pix1, pix2 + i*i_pix2 ) );
++    /* vertical 8-point Hadamard, lane-wise */
++    for( int step = 1; step < 8; step <<= 1 )
++        for( int i = 0; i < 8; i += 2*step )
++            for( int j = i; j < i + step; j++ )
++            {
++                v128_t a = r[j], b = r[j+step];
++                r[j]      = wasm_i16x8_add( a, b );
++                r[j+step] = wasm_i16x8_sub( a, b );
++            }
++    v128_t sum = wasm_i32x4_splat( 0 );
++    for( int i = 0; i < 8; i++ )
++    {
++        v128_t a = wasm_i16x8_abs( r[i] );
++        /* every max appears twice and |a+b| + |a-b| = 2*max(|a|,|b|),
++         * so the lanes add up to exactly the coefficient sum */
++        v128_t m = wasm_i16x8_max( a, wasm_i16x8_shuffle( a, a, 4, 5, 6, 7, 0, 1, 2, 3 ) );
++        sum = wasm_i32x4_add( sum, wasm_i32x4_extadd_pairwise_i16x8( m ) );
++    }
++    return hsum_i32x4( sum );
++}
++
++static int pixel_sa8d_8x8_simd128( pixel *pix1, intptr_t i_pix1, pixel *pix2, intptr_t i_pix2 )
++{
++    return ( sa8d_8x8( pix1, i_pix1, pix2, i_pix2 ) + 2 ) >> 2;
++}
++
++static int pixel_sa8d_16x16_simd128( pixel *pix1, intptr_t i_pix1, pixel *pix2, intptr_t i_pix2 )
++{
++    int sum = sa8d_8x8( pix1,              i_pix1, pix2,              i_pix2 )
++            + sa8d_8x8( pix1 + 8,          i_pix1, pix2 + 8,          i_pix2 )
++            + sa8d_8x8( pix1 + 8*i_pix1,   i_pix1, pix2 + 8*i_pix2,   i_pix2 )
++            + sa8d_8x8( pix1 + 8*i_pix1+8, i_pix1, pix2 + 8*i_pix2+8, i_pix2 );
++    return ( sum + 2 ) >> 2;
++}
++
++/****************************************************************************
++ * SSD and variance
++ ****************************************************************************/
++static ALWAYS_INLINE int ssd_wxh( pixel *pix1, intptr_t i_pix1, pixel *pix2, intptr_t i_pix2, int w, int h )
++{
++    const int rows = 16 / w;
++    v128_t sum = wasm_i32x4_splat( 0 );
++    for( int y = 0; y < h; y += rows, pix1 += rows*i_pix1, pix2 += rows*i_pix2 )
++    {
++        v128_t a = load_rows( pix1, i_pix1, w ), b = load_rows( pix2, i_pix2, w );
++        v128_t lo = wasm_i16x8_sub( wasm_u16x8_extend_low_u8x16( a ), wasm_u16x8_extend_low_u8x16( b ) );
++        v128_t hi = wasm_i16x8_sub( wasm_u16x8_extend_high_u8x16( a ), wasm_u16x8_extend_high_u8x16( b ) );
++        sum = wasm_i32x4_add( sum, wasm_i32x4_dot_i16x8( lo, lo ) );
++        sum = wasm_i32x4_add( sum, wasm_i32x4_dot_i16x8( hi, hi ) );
++    }
++    return hsum_i32x4( sum );
++}
++
++#define PIXEL_SSD_SIMD128( w, h )\
++static int pixel_ssd_##w##x##h##_simd128( pixel *pix1, intptr_t i_pix1, pixel *pix2, intptr_t i_pix2 )\
++{\
++    return ssd_wxh( pix1, i_pix1, pix2, i_pix2, w, h );\
++}
++
++PIXEL_SSD_SIMD128( 16, 16 )
++PIXEL_SSD_SIMD128( 16, 8 )
++PIXEL_SSD_SIMD128( 8, 16 )
++PIXEL_SSD_SIMD128( 8, 8 )
++PIXEL_SSD_SIMD128( 8, 4 )
++PIXEL_SSD_SIMD128( 4, 16 )
++PIXEL_SSD_SIMD128( 4, 8 )
++PIXEL_SSD_SIMD128( 4, 4 )
++
++/* Returns sum + (sum of squares << 32), as pixel_var_wxh() does. */
++static ALWAYS_INLINE uint64_t var_wxh( pixel *pix, intptr_t i_stride, int w, int h )
++{
++    const int rows = 16 / w;
++    v128_t sum = wasm_i16x8_splat( 0 ), sqr = wasm_i32x4_splat( 0 );
++    for( int y = 0; y < h; y += rows, pix += rows*i_stride )
++    {
++        v128_t v = load_rows( pix, i_stride, w );
++        v128_t lo = wasm_u16x8_extend_low_u8x16( v ), hi = wasm_u16x8_extend_high_u8x16( v );
++        sum = wasm_i16x8_add( sum, wasm_u16x8_extadd_pairwise_u8x16( v ) );
++        sqr = wasm_i32x4_add( sqr, wasm_i32x4_dot_i16x8( lo, lo ) );
++        sqr = wasm_i32x4_add( sqr, wasm_i32x4_dot_i16x8( hi, hi ) );
++    }
++    return (uint32_t)hsum_u16x8( sum ) + ((uint64_t)(uint32_t)hsum_i32x4( sqr ) << 32);
++}
++
++static uint64_t pixel_var_16x16_simd128( pixel *pix, intptr_t i_stride )
++{
++    return var_wxh( pix, i_stride, 16, 16 );
++}
++
++static uint64_t pixel_var_8x16_simd128( pixel *pix, intptr_t i_stride )
++{
++    return var_wxh( pix, i_stride, 8, 16 );
++}
++
++static uint64_t pixel_var_8x8_simd128( pixel *pix, intptr_t i_stride )
++{
++    return var_wxh( pix, i_stride, 8, 8 );
++}
++
++/* Chroma residual variance: U at x and V at x+8 in fenc, x+16 in fdec. */
++static ALWAYS_INLINE int var2_8xh( pixel *fenc, pixel *fdec, int ssd[2], int h, int shift )
++{
++    v128_t sum = wasm_i16x8_splat( 0 ), sqr_u = wasm_i32x4_splat( 0 ), sqr_v = wasm_i32x4_splat( 0 );
++    for( int y = 0; y < h; y++, fenc += FENC_STRIDE, fdec += FDEC_STRIDE )
++    {
++        v128_t e = wasm_v128_load( fenc );
++        v128_t d = wasm_v128_load64_lane( fdec + FDEC_STRIDE/2, wasm_v128_load64_zero( fdec ), 1 );
++        v128_t du = wasm_i16x8_sub( wasm_u16x8_extend_low_u8x16( e ), wasm_u16x8_extend_low_u8x16( d ) );
++        v128_t dv = wasm_i16x8_sub( wasm_u16x8_extend_high_u8x16( e ), wasm_u16x8_extend_high_u8x16( d ) );
++        /* U sums in lanes 0-3, V sums in lanes 4-7 */
++        v128_t su = wasm_i16x8_add( du, wasm_i16x8_shuffle( du, du, 4, 5, 6, 7, 0, 1, 2, 3 ) );
++        v128_t sv = wasm_i16x8_add( dv, wasm_i16x8_shuffle( dv, dv, 4, 5, 6, 7, 0, 1, 2, 3 ) );
++        sum = wasm_i16x8_add( sum, wasm_i16x8_shuffle( su, sv, 0, 1, 2, 3, 8, 9, 10, 11 ) );
++        sqr_u = wasm_i32x4_add( sqr_u, wasm_i32x4_dot_i16x8( du, du ) );
++        sqr_v = wasm_i32x4_add( sqr_v, wasm_i32x4_dot_i16x8( dv, dv ) );
++    }
++    v128_t s32 = wasm_i32x4_extadd_pairwise_i16x8( sum ); /* u, u, v, v */
++    int sum_u = wasm_i32x4_extract_lane( s32, 0 ) + wasm_i32x4_extract_lane( s32, 1 );
++    int sum_v = wasm_i32x4_extract_lane( s32, 2 ) + wasm_i32x4_extract_lane( s32, 3 );
++    ssd[0] = hsum_i32x4( sqr_u );
++    ssd[1] = hsum_i32x4( sqr_v );
++    return ssd[0] - ((int64_t)sum_u * sum_u >> shift) + ssd[1] - ((int64_t)sum_v * sum_v >> shift);
++}
++
++static int pixel_var2_8x8_simd128( pixel *fenc, pixel *fdec, int ssd[2] )
++{
++    return var2_8xh( fenc, fdec, ssd, 8, 6 );
++}
++
++static int pixel_var2_8x16_simd128( pixel *fenc, pixel *fdec, int ssd[2] )
++{
++    return var2_8xh( fenc, fdec, ssd, 16, 7 );
++}
++
++/****************************************************************************
++ * hadamard_ac: AC energy of the 4x4 and 8x8 Hadamard transforms of the
++ * pixels. Returns sum8 << 32 | sum4 per 8x8 block, DC excluded.
++ ****************************************************************************/
++static ALWAYS_INLINE uint64_t hadamard_ac_8x8( pixel *pix, intptr_t i_stride )
++{
++    v128_t r[8];
++    /* horizontal stages 1-2 */
++    for( int i = 0; i < 8; i++ )
++        r[i] = hadamard8_rows( wasm_u16x8_load8x8( pix + i*i_stride ) );
++    /* vertical stages 1-2 within each group of four rows */
++    for( int g = 0; g < 8; g += 4 )
++    {
++        v128_t a0 = wasm_i16x8_add( r[g],   r[g+1] ), a1 = wasm_i16x8_sub( r[g],   r[g+1] );
++        v128_t a2 = wasm_i16x8_add( r[g+2], r[g+3] ), a3 = wasm_i16x8_sub( r[g+2], r[g+3] );
++        r[g]   = wasm_i16x8_add( a0, a2 );
++        r[g+1] = wasm_i16x8_add( a1, a3 );
++        r[g+2] = wasm_i16x8_sub( a0, a2 );
++        r[g+3] = wasm_i16x8_sub( a1, a3 );
++    }
++    /* r now holds the four 4x4 transforms */
++    v128_t sum4 = wasm_i32x4_splat( 0 );
++    for( int i = 0; i < 8; i++ )
++        sum4 = wasm_i32x4_add( sum4, wasm_i32x4_extadd_pairwise_i16x8( wasm_i16x8_abs( r[i] ) ) );
++    /* the 8x8 DC is the sum of the four 4x4 DCs (rows 0 and 4, lanes 0 and 4) */
++    int dc = wasm_i16x8_extract_lane( r[0], 0 ) + wasm_i16x8_extract_lane( r[0], 4 )
++           + wasm_i16x8_extract_lane( r[4], 0 ) + wasm_i16x8_extract_lane( r[4], 4 );
++    /* vertical stage 3, then horizontal stage 3 through the max trick */
++    v128_t sum8 = wasm_i32x4_splat( 0 );
++    for( int i = 0; i < 4; i++ )
++    {
++        v128_t a = wasm_i16x8_abs( wasm_i16x8_add( r[i], r[i+4] ) );
++        v128_t b = wasm_i16x8_abs( wasm_i16x8_sub( r[i], r[i+4] ) );
++        v128_t ma = wasm_i16x8_max( a, wasm_i16x8_shuffle( a, a, 4, 5, 6, 7, 0, 1, 2, 3 ) );
++        v128_t mb = wasm_i16x8_max( b, wasm_i16x8_shuffle( b, b, 4, 5, 6, 7, 0, 1, 2, 3 ) );
++        sum8 = wasm_i32x4_add( sum8, wasm_i32x4_extadd_pairwise_i16x8( ma ) );
++        sum8 = wasm_i32x4_add( sum8, wasm_i32x4_extadd_pairwise_i16x8( mb ) );
++    }
++    uint32_t s4 = hsum_i32x4( sum4 ) - dc;
++    uint32_t s8 = hsum_i32x4( sum8 ) - dc;
++    return ((uint64_t)s8 << 32) + s4;
++}
++
++#define PIXEL_HADAMARD_AC_SIMD128( w, h )\
++static uint64_t pixel_hadamard_ac_##w##x##h##_simd128( pixel *pix, intptr_t i_stride )\
++{\
++    uint64_t sum = hadamard_ac_8x8( pix, i_stride );\
++    if( w == 16 )\
++        sum += hadamard_ac_8x8( pix + 8, i_stride );\
++    if( h == 16 )\
++        sum += hadamard_ac_8x8( pix + 8*i_stride, i_stride );\
++    if( w == 16 && h == 16 )\
++        sum += hadamard_ac_8x8( pix + 8*i_stride + 8, i_stride );\
++    return ((sum>>34)<<32) + ((uint32_t)sum>>1);\
++}
++
++PIXEL_HADAMARD_AC_SIMD128( 16, 16 )
++PIXEL_HADAMARD_AC_SIMD128( 16, 8 )
++PIXEL_HADAMARD_AC_SIMD128( 8, 16 )
++PIXEL_HADAMARD_AC_SIMD128( 8, 8 )
++
++/****************************************************************************
++ * SSIM
++ ****************************************************************************/
++/* Sums for two horizontally adjacent 4x4 blocks. Each 8 pixel row covers
++ * both blocks, and the pairwise sums keep block 0 in lanes 0-1 and block 1
++ * in lanes 2-3 until the final transpose. */
++static void ssim_4x4x2_core_simd128( const pixel *pix1, intptr_t stride1,
++                                     const pixel *pix2, intptr_t stride2,
++                                     int sums[2][4] )
++{
++    v128_t s1 = wasm_i32x4_splat( 0 ), s2 = s1, ss = s1, s12 = s1;
++    for( int y = 0; y < 4; y++ )
++    {
++        v128_t a = wasm_u16x8_load8x8( pix1 + y*stride1 );
++        v128_t b = wasm_u16x8_load8x8( pix2 + y*stride2 );
++        s1  = wasm_i32x4_add( s1, wasm_i32x4_extadd_pairwise_i16x8( a ) );
++        s2  = wasm_i32x4_add( s2, wasm_i32x4_extadd_pairwise_i16x8( b ) );
++        ss  = wasm_i32x4_add( ss, wasm_i32x4_add( wasm_i32x4_dot_i16x8( a, a ), wasm_i32x4_dot_i16x8( b, b ) ) );
++        s12 = wasm_i32x4_add( s12, wasm_i32x4_dot_i16x8( a, b ) );
++    }
++    /* p = [s1 b0, s1 b1, s2 b0, s2 b1], q = [ss b0, ss b1, s12 b0, s12 b1] */
++    v128_t p = wasm_i32x4_add( wasm_i32x4_shuffle( s1, s2, 0, 2, 4, 6 ), wasm_i32x4_shuffle( s1, s2, 1, 3, 5, 7 ) );
++    v128_t q = wasm_i32x4_add( wasm_i32x4_shuffle( ss, s12, 0, 2, 4, 6 ), wasm_i32x4_shuffle( ss, s12, 1, 3, 5, 7 ) );
++    wasm_v128_store( sums[0], wasm_i32x4_shuffle( p, q, 0, 2, 4, 6 ) );
++    wasm_v128_store( sums[1], wasm_i32x4_shuffle( p, q, 1, 3, 5, 7 ) );
++}
++
++/* Four SSIM values at once. The integer terms are those of ssim_end1() (8-bit
++ * sums don't overflow 32 bits), the float products and the division are the
++ * same operations in the same order, and the values are added up in C's
++ * order, so the result is bit-exact. */
++static float ssim_end4_simd128( int sum0[5][4], int sum1[5][4], int width )
++{
++    static const int ssim_c1 = (int)(.01*.01*PIXEL_MAX*PIXEL_MAX*64 + .5);
++    static const int ssim_c2 = (int)(.03*.03*PIXEL_MAX*PIXEL_MAX*64*63 + .5);
++    v128_t c[5];
++    for( int i = 0; i < 5; i++ )
++        c[i] = wasm_i32x4_add( wasm_v128_load( sum0[i] ), wasm_v128_load( sum1[i] ) );
++    v128_t t0 = wasm_i32x4_add( c[0], c[1] ), t1 = wasm_i32x4_add( c[1], c[2] );
++    v128_t t2 = wasm_i32x4_add( c[2], c[3] ), t3 = wasm_i32x4_add( c[3], c[4] );
++    /* transpose to one vector per term, one lane per block */
++    v128_t u0 = wasm_i32x4_shuffle( t0, t1, 0, 4, 1, 5 ), u1 = wasm_i32x4_shuffle( t2, t3, 0, 4, 1, 5 );
++    v128_t u2 = wasm_i32x4_shuffle( t0, t1, 2, 6, 3, 7 ), u3 = wasm_i32x4_shuffle( t2, t3, 2, 6, 3, 7 );
++    v128_t s1  = wasm_i32x4_shuffle( u0, u1, 0, 1, 4, 5 );
++    v128_t s2  = wasm_i32x4_shuffle( u0, u1, 2, 3, 6, 7 );
++    v128_t ss  = wasm_i32x4_shuffle( u2, u3, 0, 1, 4, 5 );
++    v128_t s12 = wasm_i32x4_shuffle( u2, u3, 2, 3, 6, 7 );
++    v128_t s1s1 = wasm_i32x4_mul( s1, s1 ), s2s2 = wasm_i32x4_mul( s2, s2 ), s1s2 = wasm_i32x4_mul( s1, s2 );
++    v128_t vars  = wasm_i32x4_sub( wasm_i32x4_sub( wasm_i32x4_shl( ss, 6 ), s1s1 ), s2s2 );
++    v128_t covar = wasm_i32x4_sub( wasm_i32x4_shl( s12, 6 ), s1s2 );
++    v128_t c1 = wasm_i32x4_splat( ssim_c1 ), c2 = wasm_i32x4_splat( ssim_c2 );
++    v128_t num = wasm_f32x4_mul( wasm_f32x4_convert_i32x4( wasm_i32x4_add( wasm_i32x4_shl( s1s2, 1 ), c1 ) ),
++                                 wasm_f32x4_convert_i32x4( wasm_i32x4_add( wasm_i32x4_shl( covar, 1 ), c2 ) ) );
++    v128_t den = wasm_f32x4_mul( wasm_f32x4_convert_i32x4( wasm_i32x4_add( wasm_i32x4_add( s1s1, s2s2 ), c1 ) ),
++                                 wasm_f32x4_convert_i32x4( wasm_i32x4_add( vars, c2 ) ) );
++    float v[4];
++    wasm_v128_store( v, wasm_f32x4_div( num, den ) );
++    float ssim = 0.0;
++    for( int i = 0; i < width; i++ )
++        ssim += v[i];
++    return ssim;
++}
++
++/****************************************************************************
++ * Intra mode costs: C predictors, SIMD comparisons
++ ****************************************************************************/
++#define INTRA_MBCMP_8x8( mbcmp )\
++static void intra_##mbcmp##_x3_8x8_simd128( pixel *fenc, pixel edge[36], int res[3] )\
++{\
++    ALIGNED_ARRAY_16( pixel, pix, [8*FDEC_STRIDE] );\
++    x264_predict_8x8_v_c( pix, edge );\
++    res[0] = pixel_##mbcmp##_8x8_simd128( pix, FDEC_STRIDE, fenc, FENC_STRIDE );\
++    x264_predict_8x8_h_c( pix, edge );\
++    res[1] = pixel_##mbcmp##_8x8_simd128( pix, FDEC_STRIDE, fenc, FENC_STRIDE );\
++    x264_predict_8x8_dc_c( pix, edge );\
++    res[2] = pixel_##mbcmp##_8x8_simd128( pix, FDEC_STRIDE, fenc, FENC_STRIDE );\
++}
++
++INTRA_MBCMP_8x8( sad )
++INTRA_MBCMP_8x8( sa8d )
++
++#define INTRA_MBCMP( mbcmp, size, pred1, pred2, pred3, chroma )\
++static void intra_##mbcmp##_x3_##size##chroma##_simd128( pixel *fenc, pixel *fdec, int res[3] )\
++{\
++    x264_predict_##size##chroma##_##pred1##_c( fdec );\
++    res[0] = pixel_##mbcmp##_##size##_simd128( fdec, FDEC_STRIDE, fenc, FENC_STRIDE );\
++    x264_predict_##size##chroma##_##pred2##_c( fdec );\
++    res[1] = pixel_##mbcmp##_##size##_simd128( fdec, FDEC_STRIDE, fenc, FENC_STRIDE );\
++    x264_predict_##size##chroma##_##pred3##_c( fdec );\
++    res[2] = pixel_##mbcmp##_##size##_simd128( fdec, FDEC_STRIDE, fenc, FENC_STRIDE );\
++}
++
++INTRA_MBCMP( sad,  4x4,   v, h, dc,  )
++INTRA_MBCMP(satd,  4x4,   v, h, dc,  )
++INTRA_MBCMP( sad,  8x8,  dc, h,  v, c )
++INTRA_MBCMP(satd,  8x8,  dc, h,  v, c )
++INTRA_MBCMP( sad,  8x16, dc, h,  v, c )
++INTRA_MBCMP(satd,  8x16, dc, h,  v, c )
++INTRA_MBCMP( sad, 16x16,  v, h, dc,  )
++INTRA_MBCMP(satd, 16x16,  v, h, dc,  )
++#endif // !HIGH_BIT_DEPTH
++
++/****************************************************************************
++ * x264_pixel_init:
++ ****************************************************************************/
++void x264_pixel_init_simd128( x264_pixel_function_t *pixf )
++{
++#if !HIGH_BIT_DEPTH
++#define INIT4_NAME( name1, name2 )\
++    pixf->name1[PIXEL_16x16] = pixel_##name2##_16x16_simd128;\
++    pixf->name1[PIXEL_16x8]  = pixel_##name2##_16x8_simd128;\
++    pixf->name1[PIXEL_8x16]  = pixel_##name2##_8x16_simd128;\
++    pixf->name1[PIXEL_8x8]   = pixel_##name2##_8x8_simd128;
++#define INIT7_NAME( name1, name2 )\
++    INIT4_NAME( name1, name2 )\
++    pixf->name1[PIXEL_8x4]   = pixel_##name2##_8x4_simd128;\
++    pixf->name1[PIXEL_4x8]   = pixel_##name2##_4x8_simd128;\
++    pixf->name1[PIXEL_4x4]   = pixel_##name2##_4x4_simd128;
++#define INIT8_NAME( name1, name2 )\
++    INIT7_NAME( name1, name2 )\
++    pixf->name1[PIXEL_4x16]  = pixel_##name2##_4x16_simd128;
++#define INIT4( name ) INIT4_NAME( name, name )
++#define INIT7( name ) INIT7_NAME( name, name )
++#define INIT8( name ) INIT8_NAME( name, name )
++
++    INIT8( sad );
++    INIT8_NAME( sad_aligned, sad );
++    INIT7( sad_x3 );
++    INIT7( sad_x4 );
++    INIT8( ssd );
++    INIT8( satd );
++    INIT7( satd_x3 );
++    INIT7( satd_x4 );
++    INIT4( hadamard_ac );
++
++    pixf->sa8d[PIXEL_16x16] = pixel_sa8d_16x16_simd128;
++    pixf->sa8d[PIXEL_8x8]   = pixel_sa8d_8x8_simd128;
++    pixf->var[PIXEL_16x16]  = pixel_var_16x16_simd128;
++    pixf->var[PIXEL_8x16]   = pixel_var_8x16_simd128;
++    pixf->var[PIXEL_8x8]    = pixel_var_8x8_simd128;
++    pixf->var2[PIXEL_8x16]  = pixel_var2_8x16_simd128;
++    pixf->var2[PIXEL_8x8]   = pixel_var2_8x8_simd128;
++
++    pixf->ssim_4x4x2_core = ssim_4x4x2_core_simd128;
++    pixf->ssim_end4       = ssim_end4_simd128;
++
++    pixf->intra_sad_x3_4x4    = intra_sad_x3_4x4_simd128;
++    pixf->intra_satd_x3_4x4   = intra_satd_x3_4x4_simd128;
++    pixf->intra_sad_x3_8x8    = intra_sad_x3_8x8_simd128;
++    pixf->intra_sa8d_x3_8x8   = intra_sa8d_x3_8x8_simd128;
++    pixf->intra_sad_x3_8x8c   = intra_sad_x3_8x8c_simd128;
++    pixf->intra_satd_x3_8x8c  = intra_satd_x3_8x8c_simd128;
++    pixf->intra_sad_x3_8x16c  = intra_sad_x3_8x16c_simd128;
++    pixf->intra_satd_x3_8x16c = intra_satd_x3_8x16c_simd128;
++    pixf->intra_sad_x3_16x16  = intra_sad_x3_16x16_simd128;
++    pixf->intra_satd_x3_16x16 = intra_satd_x3_16x16_simd128;
++#endif // !HIGH_BIT_DEPTH
++}
+diff --git a/common/wasm/pixel.h b/common/wasm/pixel.h
+new file mode 100644
+index 00000000..3eb891a5
+--- /dev/null
++++ b/common/wasm/pixel.h
+@@ -0,0 +1,32 @@
++/*****************************************************************************
++ * pixel.h: wasm pixel metrics
++ *****************************************************************************
++ * Copyright (C) 2026 x264 project
++ *
++ * Authors: x1xhlol
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02111, USA.
++ *
++ * This program is also available under a commercial proprietary license.
++ * For more information, contact us at licensing@x264.com.
++ *****************************************************************************/
++
++#ifndef X264_WASM_PIXEL_H
++#define X264_WASM_PIXEL_H
++
++#define x264_pixel_init_simd128 x264_template(pixel_init_simd128)
++void x264_pixel_init_simd128( x264_pixel_function_t *pixf );
++
++#endif
+diff --git a/common/wasm/wasmcommon.h b/common/wasm/wasmcommon.h
+new file mode 100644
+index 00000000..016fdd04
+--- /dev/null
++++ b/common/wasm/wasmcommon.h
+@@ -0,0 +1,37 @@
++/*****************************************************************************
++ * wasmcommon.h: wasm utility functions
++ *****************************************************************************
++ * Copyright (C) 2026 x264 project
++ *
++ * Authors: x1xhlol
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02111, USA.
++ *
++ * This program is also available under a commercial proprietary license.
++ * For more information, contact us at licensing@x264.com.
++ *****************************************************************************/
++
++#ifndef X264_WASM_WASMCOMMON_H
++#define X264_WASM_WASMCOMMON_H
++
++#include <wasm_simd128.h>
++
++/* |a - b| for unsigned bytes */
++static ALWAYS_INLINE v128_t absdiff_u8x16( v128_t a, v128_t b )
++{
++    return wasm_i8x16_sub( wasm_u8x16_max( a, b ), wasm_u8x16_min( a, b ) );
++}
++
++#endif
+-- 
+2.43.0
+

@@ -1,0 +1,59 @@
+From 1d425997560f1aa030a3a0ea904f972aa25298e1 Mon Sep 17 00:00:00 2001
+From: x1xhlol <lucknitelol@proton.me>
+Date: Sat, 26 Sep 2026 21:10:41 +0000
+Subject: [PATCH 1/7] Return void * from all thread pool jobs
+
+slicetype_slice_cost and the CLI's read_frame_thread_int are run as
+thread pool jobs, and the pool calls its jobs through a
+void *(*)(void *) pointer. Calling a function that returns void
+through that type is undefined behaviour. It happens to work with the
+usual native ABIs, but WebAssembly checks the signature of every
+indirect call and traps as soon as more than one lookahead thread is
+used, or when the CLI reads its input in a separate thread.
+
+Return a pointer, like slices_write, the other thread pool job, does.
+---
+ encoder/slicetype.c | 3 ++-
+ input/thread.c      | 3 ++-
+ 2 files changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/encoder/slicetype.c b/encoder/slicetype.c
+index 160d9795..101575d2 100644
+--- a/encoder/slicetype.c
++++ b/encoder/slicetype.c
+@@ -811,7 +811,7 @@ typedef struct
+     int *output_intra;
+ } x264_slicetype_slice_t;
+ 
+-static void slicetype_slice_cost( x264_slicetype_slice_t *s )
++static void *slicetype_slice_cost( x264_slicetype_slice_t *s )
+ {
+     x264_t *h = s->h;
+ 
+@@ -831,6 +831,7 @@ static void slicetype_slice_cost( x264_slicetype_slice_t *s )
+         for( h->mb.i_mb_x = start_x; h->mb.i_mb_x >= end_x; h->mb.i_mb_x-- )
+             slicetype_mb_cost( h, s->a, s->frames, s->p0, s->p1, s->b, s->dist_scale_factor,
+                                s->do_search, s->w, s->output_inter, s->output_intra );
++    return NULL;
+ }
+ 
+ static int slicetype_frame_cost( x264_t *h, x264_mb_analysis_t *a,
+diff --git a/input/thread.c b/input/thread.c
+index b235f0c1..3eab4c27 100644
+--- a/input/thread.c
++++ b/input/thread.c
+@@ -70,9 +70,10 @@ static int open_file( char *psz_filename, hnd_t *p_handle, video_info_t *info, c
+     return 0;
+ }
+ 
+-static void read_frame_thread_int( thread_input_arg_t *i )
++static void *read_frame_thread_int( thread_input_arg_t *i )
+ {
+     i->status = i->h->input.read_frame( i->pic, i->h->p_handle, i->i_frame );
++    return NULL;
+ }
+ 
+ static int read_frame( cli_pic_t *p_pic, hnd_t handle, int i_frame )
+-- 
+2.43.0
+

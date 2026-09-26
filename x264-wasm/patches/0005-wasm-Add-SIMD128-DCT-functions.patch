@@ -1,0 +1,417 @@
+From 6a5669b5c668f7522864b55880651507f87051d4 Mon Sep 17 00:00:00 2001
+From: x1xhlol <lucknitelol@proton.me>
+Date: Sat, 26 Sep 2026 21:25:04 +0000
+Subject: [PATCH 5/7] wasm: Add SIMD128 DCT functions
+
+sub4x4_dct, sub8x8_dct, sub16x16_dct, sub8x8_dct8, sub16x16_dct8 and
+the matching add*_idct functions, 8-bit only.
+
+Each 1D pass works lane-wise across the rows of the block and the
+transposes are shuffles. The 4x4 transforms handle two blocks per
+vector.
+---
+ Makefile                 |   3 +-
+ common/dct.c             |   8 ++
+ common/wasm/dct.c        | 277 +++++++++++++++++++++++++++++++++++++++
+ common/wasm/dct.h        |  32 +++++
+ common/wasm/wasmcommon.h |  23 ++++
+ 5 files changed, 342 insertions(+), 1 deletion(-)
+ create mode 100644 common/wasm/dct.c
+ create mode 100644 common/wasm/dct.h
+
+diff --git a/Makefile b/Makefile
+index fd64cf8f..1dcfbc4f 100644
+--- a/Makefile
++++ b/Makefile
+@@ -255,7 +255,8 @@ endif
+ # WebAssembly SIMD128 optims
+ ifeq ($(SYS_ARCH),WASM)
+ ifneq ($(findstring HAVE_SIMD128 1, $(CONFIG)),)
+-SRCS_X += common/wasm/mc.c \
++SRCS_X += common/wasm/dct.c \
++          common/wasm/mc.c \
+           common/wasm/pixel.c
+ endif
+ endif
+diff --git a/common/dct.c b/common/dct.c
+index b208e26e..2f561f41 100644
+--- a/common/dct.c
++++ b/common/dct.c
+@@ -44,6 +44,9 @@
+ #if HAVE_LSX
+ #   include "loongarch/dct.h"
+ #endif
++#if HAVE_SIMD128
++#   include "wasm/dct.h"
++#endif
+ static void dct4x4dc( dctcoef d[16] )
+ {
+     dctcoef tmp[16];
+@@ -773,6 +776,11 @@ void x264_dct_init( uint32_t cpu, x264_dct_function_t *dctf )
+     }
+ #endif
+ 
++#if HAVE_SIMD128
++    if( cpu&X264_CPU_SIMD128 )
++        x264_dct_init_simd128( dctf );
++#endif
++
+ #endif // HIGH_BIT_DEPTH
+ }
+ 
+diff --git a/common/wasm/dct.c b/common/wasm/dct.c
+new file mode 100644
+index 00000000..8146bdea
+--- /dev/null
++++ b/common/wasm/dct.c
+@@ -0,0 +1,277 @@
++/*****************************************************************************
++ * dct.c: wasm transform
++ *****************************************************************************
++ * Copyright (C) 2026 x264 project
++ *
++ * Authors: x1xhlol
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02111, USA.
++ *
++ * This program is also available under a commercial proprietary license.
++ * For more information, contact us at licensing@x264.com.
++ *****************************************************************************/
++
++#include "common/common.h"
++#include "wasmcommon.h"
++#include "dct.h"
++
++#if !HIGH_BIT_DEPTH
++/* The C transforms do a 1D pass, a transpose and another 1D pass. Here each
++ * 1D pass works lane-wise across row vectors and the transposes are
++ * shuffles. The intermediate values fit in 16 bits, as in the x86 asm. */
++
++/* Transposes the two 4x4 blocks held in lanes 0-3 and 4-7 of v[0..3]. */
++static ALWAYS_INLINE void transpose_4x4x2_i16( v128_t v[4] )
++{
++    v128_t t0 = wasm_i16x8_shuffle( v[0], v[1], 0, 8, 1, 9, 4, 12, 5, 13 );
++    v128_t t1 = wasm_i16x8_shuffle( v[0], v[1], 2, 10, 3, 11, 6, 14, 7, 15 );
++    v128_t t2 = wasm_i16x8_shuffle( v[2], v[3], 0, 8, 1, 9, 4, 12, 5, 13 );
++    v128_t t3 = wasm_i16x8_shuffle( v[2], v[3], 2, 10, 3, 11, 6, 14, 7, 15 );
++    v[0] = wasm_i32x4_shuffle( t0, t2, 0, 4, 2, 6 );
++    v[1] = wasm_i32x4_shuffle( t0, t2, 1, 5, 3, 7 );
++    v[2] = wasm_i32x4_shuffle( t1, t3, 0, 4, 2, 6 );
++    v[3] = wasm_i32x4_shuffle( t1, t3, 1, 5, 3, 7 );
++}
++
++/****************************************************************************
++ * 4x4
++ ****************************************************************************/
++static ALWAYS_INLINE void dct4_1d( v128_t v[4] )
++{
++    v128_t s03 = wasm_i16x8_add( v[0], v[3] ), s12 = wasm_i16x8_add( v[1], v[2] );
++    v128_t d03 = wasm_i16x8_sub( v[0], v[3] ), d12 = wasm_i16x8_sub( v[1], v[2] );
++    v[0] = wasm_i16x8_add( s03, s12 );
++    v[1] = wasm_i16x8_add( wasm_i16x8_shl( d03, 1 ), d12 );
++    v[2] = wasm_i16x8_sub( s03, s12 );
++    v[3] = wasm_i16x8_sub( d03, wasm_i16x8_shl( d12, 1 ) );
++}
++
++static ALWAYS_INLINE void idct4_1d( v128_t v[4] )
++{
++    v128_t s02 = wasm_i16x8_add( v[0], v[2] ), d02 = wasm_i16x8_sub( v[0], v[2] );
++    v128_t s13 = wasm_i16x8_add( v[1], wasm_i16x8_shr( v[3], 1 ) );
++    v128_t d13 = wasm_i16x8_sub( wasm_i16x8_shr( v[1], 1 ), v[3] );
++    v[0] = wasm_i16x8_add( s02, s13 );
++    v[1] = wasm_i16x8_add( d02, d13 );
++    v[2] = wasm_i16x8_sub( d02, d13 );
++    v[3] = wasm_i16x8_sub( s02, s13 );
++}
++
++static void sub4x4_dct_simd128( dctcoef dct[16], pixel *pix1, pixel *pix2 )
++{
++    v128_t v[4];
++    for( int i = 0; i < 4; i++ )
++        v[i] = wasm_i16x8_sub( wasm_u16x8_extend_low_u8x16( wasm_v128_load32_zero( pix1 + i*FENC_STRIDE ) ),
++                               wasm_u16x8_extend_low_u8x16( wasm_v128_load32_zero( pix2 + i*FDEC_STRIDE ) ) );
++    dct4_1d( v );
++    transpose_4x4x2_i16( v );
++    dct4_1d( v );
++    for( int i = 0; i < 4; i++ )
++        wasm_v128_store64_lane( dct + i*4, v[i], 0 );
++}
++
++/* Two horizontally adjacent 4x4 blocks at once. */
++static ALWAYS_INLINE void sub8x4_dct( dctcoef dct0[16], dctcoef dct1[16], pixel *pix1, pixel *pix2 )
++{
++    v128_t v[4];
++    for( int i = 0; i < 4; i++ )
++        v[i] = wasm_i16x8_sub( wasm_u16x8_load8x8( pix1 + i*FENC_STRIDE ), wasm_u16x8_load8x8( pix2 + i*FDEC_STRIDE ) );
++    dct4_1d( v );
++    transpose_4x4x2_i16( v );
++    dct4_1d( v );
++    for( int i = 0; i < 4; i++ )
++    {
++        wasm_v128_store64_lane( dct0 + i*4, v[i], 0 );
++        wasm_v128_store64_lane( dct1 + i*4, v[i], 1 );
++    }
++}
++
++static void sub8x8_dct_simd128( dctcoef dct[4][16], pixel *pix1, pixel *pix2 )
++{
++    sub8x4_dct( dct[0], dct[1], &pix1[0], &pix2[0] );
++    sub8x4_dct( dct[2], dct[3], &pix1[4*FENC_STRIDE], &pix2[4*FDEC_STRIDE] );
++}
++
++static void sub16x16_dct_simd128( dctcoef dct[16][16], pixel *pix1, pixel *pix2 )
++{
++    sub8x8_dct_simd128( &dct[ 0], &pix1[0], &pix2[0] );
++    sub8x8_dct_simd128( &dct[ 4], &pix1[8], &pix2[8] );
++    sub8x8_dct_simd128( &dct[ 8], &pix1[8*FENC_STRIDE+0], &pix2[8*FDEC_STRIDE+0] );
++    sub8x8_dct_simd128( &dct[12], &pix1[8*FENC_STRIDE+8], &pix2[8*FDEC_STRIDE+8] );
++}
++
++/* Adds the residual to 8 pixels, with clipping. */
++static ALWAYS_INLINE void add_residual_8px( pixel *dst, v128_t res )
++{
++    v128_t px = wasm_i16x8_add( wasm_u16x8_load8x8( dst ), res );
++    wasm_v128_store64_lane( dst, wasm_u8x16_narrow_i16x8( px, px ), 0 );
++}
++
++static void add4x4_idct_simd128( pixel *p_dst, dctcoef dct[16] )
++{
++    const v128_t round = wasm_i16x8_splat( 32 );
++    v128_t v[4];
++    for( int i = 0; i < 4; i++ )
++        v[i] = wasm_v128_load64_zero( dct + i*4 );
++    idct4_1d( v );
++    transpose_4x4x2_i16( v );
++    idct4_1d( v );
++    for( int i = 0; i < 4; i++ )
++    {
++        v128_t res = wasm_i16x8_shr( wasm_i16x8_add( v[i], round ), 6 );
++        v128_t px = wasm_u16x8_extend_low_u8x16( wasm_v128_load32_zero( p_dst + i*FDEC_STRIDE ) );
++        px = wasm_i16x8_add( px, res );
++        wasm_v128_store32_lane( p_dst + i*FDEC_STRIDE, wasm_u8x16_narrow_i16x8( px, px ), 0 );
++    }
++}
++
++/* Two horizontally adjacent 4x4 blocks at once. */
++static ALWAYS_INLINE void add8x4_idct( pixel *p_dst, dctcoef dct0[16], dctcoef dct1[16] )
++{
++    const v128_t round = wasm_i16x8_splat( 32 );
++    v128_t v[4];
++    for( int i = 0; i < 4; i++ )
++        v[i] = wasm_v128_load64_lane( dct1 + i*4, wasm_v128_load64_zero( dct0 + i*4 ), 1 );
++    idct4_1d( v );
++    transpose_4x4x2_i16( v );
++    idct4_1d( v );
++    for( int i = 0; i < 4; i++ )
++        add_residual_8px( p_dst + i*FDEC_STRIDE, wasm_i16x8_shr( wasm_i16x8_add( v[i], round ), 6 ) );
++}
++
++static void add8x8_idct_simd128( pixel *p_dst, dctcoef dct[4][16] )
++{
++    add8x4_idct( &p_dst[0], dct[0], dct[1] );
++    add8x4_idct( &p_dst[4*FDEC_STRIDE], dct[2], dct[3] );
++}
++
++static void add16x16_idct_simd128( pixel *p_dst, dctcoef dct[16][16] )
++{
++    add8x8_idct_simd128( &p_dst[0], &dct[0] );
++    add8x8_idct_simd128( &p_dst[8], &dct[4] );
++    add8x8_idct_simd128( &p_dst[8*FDEC_STRIDE+0], &dct[8] );
++    add8x8_idct_simd128( &p_dst[8*FDEC_STRIDE+8], &dct[12] );
++}
++
++/****************************************************************************
++ * 8x8
++ ****************************************************************************/
++static ALWAYS_INLINE void dct8_1d( v128_t v[8] )
++{
++    v128_t s07 = wasm_i16x8_add( v[0], v[7] ), s16 = wasm_i16x8_add( v[1], v[6] );
++    v128_t s25 = wasm_i16x8_add( v[2], v[5] ), s34 = wasm_i16x8_add( v[3], v[4] );
++    v128_t a0 = wasm_i16x8_add( s07, s34 ), a1 = wasm_i16x8_add( s16, s25 );
++    v128_t a2 = wasm_i16x8_sub( s07, s34 ), a3 = wasm_i16x8_sub( s16, s25 );
++    v128_t d07 = wasm_i16x8_sub( v[0], v[7] ), d16 = wasm_i16x8_sub( v[1], v[6] );
++    v128_t d25 = wasm_i16x8_sub( v[2], v[5] ), d34 = wasm_i16x8_sub( v[3], v[4] );
++    v128_t a4 = wasm_i16x8_add( wasm_i16x8_add( d16, d25 ), wasm_i16x8_add( d07, wasm_i16x8_shr( d07, 1 ) ) );
++    v128_t a5 = wasm_i16x8_sub( wasm_i16x8_sub( d07, d34 ), wasm_i16x8_add( d25, wasm_i16x8_shr( d25, 1 ) ) );
++    v128_t a6 = wasm_i16x8_sub( wasm_i16x8_add( d07, d34 ), wasm_i16x8_add( d16, wasm_i16x8_shr( d16, 1 ) ) );
++    v128_t a7 = wasm_i16x8_add( wasm_i16x8_sub( d16, d25 ), wasm_i16x8_add( d34, wasm_i16x8_shr( d34, 1 ) ) );
++    v[0] = wasm_i16x8_add( a0, a1 );
++    v[1] = wasm_i16x8_add( a4, wasm_i16x8_shr( a7, 2 ) );
++    v[2] = wasm_i16x8_add( a2, wasm_i16x8_shr( a3, 1 ) );
++    v[3] = wasm_i16x8_add( a5, wasm_i16x8_shr( a6, 2 ) );
++    v[4] = wasm_i16x8_sub( a0, a1 );
++    v[5] = wasm_i16x8_sub( a6, wasm_i16x8_shr( a5, 2 ) );
++    v[6] = wasm_i16x8_sub( wasm_i16x8_shr( a2, 1 ), a3 );
++    v[7] = wasm_i16x8_sub( wasm_i16x8_shr( a4, 2 ), a7 );
++}
++
++static ALWAYS_INLINE void idct8_1d( v128_t v[8] )
++{
++    v128_t a0 = wasm_i16x8_add( v[0], v[4] ), a2 = wasm_i16x8_sub( v[0], v[4] );
++    v128_t a4 = wasm_i16x8_sub( wasm_i16x8_shr( v[2], 1 ), v[6] );
++    v128_t a6 = wasm_i16x8_add( wasm_i16x8_shr( v[6], 1 ), v[2] );
++    v128_t b0 = wasm_i16x8_add( a0, a6 ), b2 = wasm_i16x8_add( a2, a4 );
++    v128_t b4 = wasm_i16x8_sub( a2, a4 ), b6 = wasm_i16x8_sub( a0, a6 );
++    v128_t a1 = wasm_i16x8_sub( wasm_i16x8_sub( wasm_i16x8_sub( v[5], v[3] ), v[7] ), wasm_i16x8_shr( v[7], 1 ) );
++    v128_t a3 = wasm_i16x8_sub( wasm_i16x8_sub( wasm_i16x8_add( v[1], v[7] ), v[3] ), wasm_i16x8_shr( v[3], 1 ) );
++    v128_t a5 = wasm_i16x8_add( wasm_i16x8_add( wasm_i16x8_sub( v[7], v[1] ), v[5] ), wasm_i16x8_shr( v[5], 1 ) );
++    v128_t a7 = wasm_i16x8_add( wasm_i16x8_add( wasm_i16x8_add( v[3], v[5] ), v[1] ), wasm_i16x8_shr( v[1], 1 ) );
++    v128_t b1 = wasm_i16x8_add( wasm_i16x8_shr( a7, 2 ), a1 );
++    v128_t b3 = wasm_i16x8_add( a3, wasm_i16x8_shr( a5, 2 ) );
++    v128_t b5 = wasm_i16x8_sub( wasm_i16x8_shr( a3, 2 ), a5 );
++    v128_t b7 = wasm_i16x8_sub( a7, wasm_i16x8_shr( a1, 2 ) );
++    v[0] = wasm_i16x8_add( b0, b7 );
++    v[1] = wasm_i16x8_add( b2, b5 );
++    v[2] = wasm_i16x8_add( b4, b3 );
++    v[3] = wasm_i16x8_add( b6, b1 );
++    v[4] = wasm_i16x8_sub( b6, b1 );
++    v[5] = wasm_i16x8_sub( b4, b3 );
++    v[6] = wasm_i16x8_sub( b2, b5 );
++    v[7] = wasm_i16x8_sub( b0, b7 );
++}
++
++static void sub8x8_dct8_simd128( dctcoef dct[64], pixel *pix1, pixel *pix2 )
++{
++    v128_t v[8];
++    for( int i = 0; i < 8; i++ )
++        v[i] = wasm_i16x8_sub( wasm_u16x8_load8x8( pix1 + i*FENC_STRIDE ), wasm_u16x8_load8x8( pix2 + i*FDEC_STRIDE ) );
++    dct8_1d( v );
++    transpose_8x8_i16( v );
++    dct8_1d( v );
++    for( int i = 0; i < 8; i++ )
++        wasm_v128_store( dct + i*8, v[i] );
++}
++
++static void sub16x16_dct8_simd128( dctcoef dct[4][64], pixel *pix1, pixel *pix2 )
++{
++    sub8x8_dct8_simd128( dct[0], &pix1[0], &pix2[0] );
++    sub8x8_dct8_simd128( dct[1], &pix1[8], &pix2[8] );
++    sub8x8_dct8_simd128( dct[2], &pix1[8*FENC_STRIDE+0], &pix2[8*FDEC_STRIDE+0] );
++    sub8x8_dct8_simd128( dct[3], &pix1[8*FENC_STRIDE+8], &pix2[8*FDEC_STRIDE+8] );
++}
++
++static void add8x8_idct8_simd128( pixel *dst, dctcoef dct[64] )
++{
++    v128_t v[8];
++    for( int i = 0; i < 8; i++ )
++        v[i] = wasm_v128_load( dct + i*8 );
++    /* the rounding for the final >> 6, carried through both passes as in the C */
++    v[0] = wasm_i16x8_add( v[0], wasm_i16x8_make( 32, 0, 0, 0, 0, 0, 0, 0 ) );
++    idct8_1d( v );
++    transpose_8x8_i16( v );
++    idct8_1d( v );
++    for( int i = 0; i < 8; i++ )
++        add_residual_8px( dst + i*FDEC_STRIDE, wasm_i16x8_shr( v[i], 6 ) );
++}
++
++static void add16x16_idct8_simd128( pixel *dst, dctcoef dct[4][64] )
++{
++    add8x8_idct8_simd128( &dst[0],               dct[0] );
++    add8x8_idct8_simd128( &dst[8],               dct[1] );
++    add8x8_idct8_simd128( &dst[8*FDEC_STRIDE+0], dct[2] );
++    add8x8_idct8_simd128( &dst[8*FDEC_STRIDE+8], dct[3] );
++}
++#endif // !HIGH_BIT_DEPTH
++
++void x264_dct_init_simd128( x264_dct_function_t *dctf )
++{
++#if !HIGH_BIT_DEPTH
++    dctf->sub4x4_dct     = sub4x4_dct_simd128;
++    dctf->add4x4_idct    = add4x4_idct_simd128;
++
++    dctf->sub8x8_dct     = sub8x8_dct_simd128;
++    dctf->sub16x16_dct   = sub16x16_dct_simd128;
++    dctf->add8x8_idct    = add8x8_idct_simd128;
++    dctf->add16x16_idct  = add16x16_idct_simd128;
++
++    dctf->sub8x8_dct8    = sub8x8_dct8_simd128;
++    dctf->sub16x16_dct8  = sub16x16_dct8_simd128;
++    dctf->add8x8_idct8   = add8x8_idct8_simd128;
++    dctf->add16x16_idct8 = add16x16_idct8_simd128;
++#endif // !HIGH_BIT_DEPTH
++}
+diff --git a/common/wasm/dct.h b/common/wasm/dct.h
+new file mode 100644
+index 00000000..575e7a2e
+--- /dev/null
++++ b/common/wasm/dct.h
+@@ -0,0 +1,32 @@
++/*****************************************************************************
++ * dct.h: wasm transform
++ *****************************************************************************
++ * Copyright (C) 2026 x264 project
++ *
++ * Authors: x1xhlol
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02111, USA.
++ *
++ * This program is also available under a commercial proprietary license.
++ * For more information, contact us at licensing@x264.com.
++ *****************************************************************************/
++
++#ifndef X264_WASM_DCT_H
++#define X264_WASM_DCT_H
++
++#define x264_dct_init_simd128 x264_template(dct_init_simd128)
++void x264_dct_init_simd128( x264_dct_function_t *dctf );
++
++#endif
+diff --git a/common/wasm/wasmcommon.h b/common/wasm/wasmcommon.h
+index 016fdd04..6b415108 100644
+--- a/common/wasm/wasmcommon.h
++++ b/common/wasm/wasmcommon.h
+@@ -34,4 +34,27 @@ static ALWAYS_INLINE v128_t absdiff_u8x16( v128_t a, v128_t b )
+     return wasm_i8x16_sub( wasm_u8x16_max( a, b ), wasm_u8x16_min( a, b ) );
+ }
+ 
++/* Transposes an 8x8 matrix of 16-bit elements, one row per vector. */
++static ALWAYS_INLINE void transpose_8x8_i16( v128_t v[8] )
++{
++    v128_t a[8], b[8];
++    for( int i = 0; i < 8; i += 2 )
++    {
++        a[i]   = wasm_i16x8_shuffle( v[i], v[i+1], 0, 8, 1, 9, 2, 10, 3, 11 );
++        a[i+1] = wasm_i16x8_shuffle( v[i], v[i+1], 4, 12, 5, 13, 6, 14, 7, 15 );
++    }
++    for( int i = 0; i < 8; i += 4 )
++    {
++        b[i]   = wasm_i32x4_shuffle( a[i],   a[i+2], 0, 4, 1, 5 );
++        b[i+1] = wasm_i32x4_shuffle( a[i],   a[i+2], 2, 6, 3, 7 );
++        b[i+2] = wasm_i32x4_shuffle( a[i+1], a[i+3], 0, 4, 1, 5 );
++        b[i+3] = wasm_i32x4_shuffle( a[i+1], a[i+3], 2, 6, 3, 7 );
++    }
++    for( int i = 0; i < 4; i++ )
++    {
++        v[2*i]   = wasm_i64x2_shuffle( b[i], b[i+4], 0, 2 );
++        v[2*i+1] = wasm_i64x2_shuffle( b[i], b[i+4], 1, 3 );
++    }
++}
++
+ #endif
+-- 
+2.43.0
+
