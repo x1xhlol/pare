@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <emscripten/emscripten.h>
 #include "x264.h"
+#include "pare_scale.h"
 
 typedef struct {
   x264_t *h;

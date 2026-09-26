@@ -84,6 +84,8 @@ let stagingSize = 0
 let enc = 0
 /** The open encoder takes 10-bit samples (AV1 for an HDR source): its planes hold 16 bits per sample. */
 let tenBit = false
+/** The open encoder's input layout: CSP_I420 or CSP_NV12. */
+let csp = 0
 /** The chunk being encoded: where it ends now, and the last frame that went into the encoder. */
 let running: { index: number; end: number; fed: number } | null = null
 
@@ -204,10 +206,9 @@ function planInput(sample: VideoSample, enc: number): Loader {
     const deep = sample.format === 'I420P10' || sample.format === 'I420P12'
     // The output is tagged for frames like the probed one. One that decodes differently would be written wrong, in
     // colour or, into a 10-bit encoder, as noise.
-    if (!fits(sample) || (tenBit && !deep) || !(deep || sample.format === 'NV12' || sample.format === 'I420' ||
-        sample.format === 'I420A'))
-      throw new Error(`The video decoded as ${sample.format ?? 'an unnamed format'} at ${sample.visibleRect.width}×` +
-        `${sample.visibleRect.height}, not as planned.`)
+    if ((tenBit && !deep) || !(deep || sample.format === 'NV12' || sample.format === 'I420' || sample.format === 'I420A'))
+      throw new Error(`The video decoded as ${sample.format ?? 'an unnamed format'}, not as planned.`)
+    if (!fits(sample)) return scaledInput(sample, enc)
     if (sample.format === 'NV12')
       return async (s) => void (await copyFrame(s, [plane(0), plane(1)]))
     if (sample.format === 'I420' || sample.format === 'I420A')
@@ -250,6 +251,43 @@ function planInput(sample: VideoSample, enc: number): Loader {
   }
 }
 
+/**
+ * Frames at another size than the encoder's: copied out as decoded, then each plane scaled into the encoder's
+ * (x264-wasm/pare_scale.h), keeping the source's colours and bit depth.
+ */
+function scaledInput(sample: VideoSample, enc: number): Loader {
+  const { width, height } = init
+  const bits = sample.format === 'I420P10' ? 10 : sample.format === 'I420P12' ? 12 : 8
+  const bytes = bits > 8 ? 2 : 1
+  const out = tenBit ? 2 : 1
+  const shift = bits - (tenBit ? 10 : 8)
+  const max = tenBit ? 1023 : 255
+  // An I420 encoder input has its chroma in planes 1 and 2; NV12 interleaves it in plane 1.
+  const planar = csp === CSP_I420
+  return async (s) => {
+    const size = s.allocationSize()
+    const base = scratch(size)
+    const layout = await copyFrame(s, null, base, size)
+    const sw = s.visibleRect.width, sh = s.visibleRect.height
+    const scale = (i: number, w: number, h: number, channels: number, plane: number, offset: number, step: number,
+                   dw: number, dh: number) => {
+      if (x._scale_plane(base + layout[i].offset, layout[i].stride, w, h, bytes, channels,
+        x._enc_plane(enc, plane) + offset * out, x._enc_stride(enc, plane), dw, dh, out, step, shift, max))
+        throw new Error('Out of memory while resizing a frame.')
+    }
+    const cw = (sw + 1) >> 1, ch = (sh + 1) >> 1
+    scale(0, sw, sh, 1, 0, 0, 1, width, height)
+    if (s.format === 'NV12') scale(1, cw, ch, 2, 1, 0, 2, width / 2, height / 2)
+    else if (planar) {
+      scale(1, cw, ch, 1, 1, 0, 1, width / 2, height / 2)
+      scale(2, cw, ch, 1, 2, 0, 1, width / 2, height / 2)
+    } else {
+      scale(1, cw, ch, 1, 1, 0, 2, width / 2, height / 2)
+      scale(2, cw, ch, 1, 1, 1, 2, width / 2, height / 2)
+    }
+  }
+}
+
 function cspFor(sample: VideoSample, tenBit: boolean) {
   // A 10-bit encoder only takes planar input; x264's 10-to-8-bit import writes interleaved chroma.
   return tenBit || (init.direct && (sample.format === 'I420' || sample.format === 'I420A')) ? CSP_I420 : CSP_NV12
@@ -271,6 +309,16 @@ function to8(samples: Uint16Array, width: number, height: number, stride: number
   const out = new Uint8Array(width * height)
   for (let y = 0; y < height; y++)
     for (let x = 0; x < width; x++) out[y * width + x] = Math.min(255, (samples[y * stride + x] + 2) >> 2)
+  return out
+}
+
+/** BT.709 limited-range luma of an RGBA/RGBX (or BGRA/BGRX) frame, the formula in pare_x264.c's RGB import. */
+function lumaFromRgb(data: Uint8Array, plane: PlaneLayout, bgr: boolean, width: number, height: number) {
+  const out = new Uint8Array(width * height)
+  const r = bgr ? 2 : 0, b = bgr ? 0 : 2
+  for (let y = 0; y < height; y++)
+    for (let x = 0, i = plane.offset + y * plane.stride; x < width; x++, i += 4)
+      out[y * width + x] = ((47 * data[i + r] + 157 * data[i + 1] + 16 * data[i + b] + 128) >> 8) + 16
   return out
 }
 
@@ -297,6 +345,11 @@ async function decodeLuma(chunk: EncodedChunk, wanted: Set<number>) {
     try {
       const data = new Uint8Array(frame.allocationSize())
       const [plane] = await frame.copyTo(data)
+      // Firefox decodes to RGB (BGRX), even from 10-bit AV1: luma back from it, as the encoders' RGB import makes it.
+      if (frame.format && /^(RGB|BGR)[AX]$/.test(frame.format)) {
+        out.set(Math.round(frame.timestamp), lumaFromRgb(data, plane, frame.format.startsWith('B'), width, height))
+        continue
+      }
       if (frame.format?.endsWith('P10')) {
         out.set(Math.round(frame.timestamp),
           to8(new Uint16Array(data.buffer, plane.offset, (data.byteLength - plane.offset) >> 1), width, height, plane.stride / 2))
@@ -373,7 +426,8 @@ async function encodeChunk({ index, start, end, options: override, score }: Work
         if (!enc) {
           const options = x.stringToNewUTF8(text)
           tenBit = /input-depth=10/.test(text)
-          enc = x._enc_open(init.width, init.height, init.fpsNum, init.fpsDen, cspFor(sample, tenBit), options)
+          csp = cspFor(sample, tenBit)
+          enc = x._enc_open(init.width, init.height, init.fpsNum, init.fpsDen, csp, options)
           x._free(options)
           if (!enc) throw new Error(`x264 rejected the options "${text}".`)
           load = planInput(sample, enc)

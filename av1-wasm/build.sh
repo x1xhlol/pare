@@ -42,7 +42,7 @@ opts_st=(-DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DBUILD_APPS=OFF -DB
 [ "$isa" = neon ] && opts_st+=(-DSVT_WASM_NEON=ON)
 emcmake cmake -S . -B build-web "${opts_st[@]}" >/dev/null
 cmake --build build-web -j"$(nproc)" --target SvtAv1Enc
-exports=_enc_open,_enc_plane,_enc_stride,_enc_headers,_enc_headers_ptr,_enc_encode,_enc_flush,_enc_payload,_enc_out_pts,_enc_out_dts,_enc_out_keyframe,_enc_out_ssim,_enc_close,_enc_import_rgba,_enc_import_p16,_malloc,_free
+exports=_enc_open,_enc_plane,_enc_stride,_enc_headers,_enc_headers_ptr,_enc_encode,_enc_flush,_enc_payload,_enc_out_pts,_enc_out_dts,_enc_out_keyframe,_enc_out_ssim,_enc_close,_enc_import_rgba,_enc_import_p16,_scale_plane,_malloc,_free
 emcc "$here/pare_svtav1.c" -I Source/API Bin/Release/libSvtAv1Enc.a -O3 -msimd128 \
   -sMODULARIZE -sEXPORT_ES6 -sEXPORT_NAME=createAv1 -sENVIRONMENT=web,worker \
   -sALLOW_MEMORY_GROWTH -sINITIAL_MEMORY=64MB -sMAXIMUM_MEMORY=4GB -sSTACK_SIZE=4MB \

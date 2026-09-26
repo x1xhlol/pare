@@ -28,6 +28,23 @@ export type X264Module = {
     height: number,
     bits: number,
   ): void
+  /** Scales one plane into another (x264-wasm/pare_scale.h); 0 on success. */
+  _scale_plane(
+    src: number,
+    srcStride: number,
+    srcWidth: number,
+    srcHeight: number,
+    srcBytes: number,
+    channels: number,
+    dst: number,
+    dstStride: number,
+    dstWidth: number,
+    dstHeight: number,
+    dstBytes: number,
+    dstStep: number,
+    shift: number,
+    max: number,
+  ): number
 }
 
 type Options = {

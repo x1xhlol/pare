@@ -4,10 +4,10 @@
 //   URL=http://localhost:4173 OUT=/tmp/bench TAG=now node research/benchmark.mjs clip.mp4 ...
 //   CODEC=auto|avc|av1 (the Format setting; default Auto), ENGINE=fast (the browser's encoder), NOLIMIT=1 (no size
 //   target), CORES=n (pretend core count), CLICK_AFTER=seconds after the file loads (default 1), RES=720 (short side),
-//   BROWSER=webkit (Playwright's WebKit build instead of Chrome)
+//   BROWSER=webkit|firefox (Playwright's WebKit or Firefox build instead of Chrome)
 //
 // Prints one JSON line per video: seconds, sizes, the app's quality line, and the encoder log.
-import { chromium, webkit } from 'playwright-core'
+import { chromium, firefox, webkit } from 'playwright-core'
 import fs from 'node:fs'
 import path from 'node:path'
 
@@ -20,7 +20,9 @@ fs.mkdirSync(out, { recursive: true })
 
 const browser = process.env.BROWSER === 'webkit'
   ? await webkit.launch({ headless: true })
-  : await chromium.launch({ executablePath: chrome, headless: true })
+  : process.env.BROWSER === 'firefox'
+    ? await firefox.launch({ headless: true })
+    : await chromium.launch({ executablePath: chrome, headless: true })
 for (const file of process.argv.slice(2)) {
   const page = await browser.newPage({ viewport: { width: 1280, height: 900 } })
   if (process.env.CORES)

@@ -331,10 +331,10 @@ export function presetCrf(settings: Settings) {
  * tags. Frames drawn on an RGB canvas (resized, or in a format the encoders don't take) come out as BT.709 SDR.
  */
 function outputColor(probe: Probe, settings: Settings): Color {
-  if (!copiesFrames(probe, settings)) return { primaries: 'bt709', transfer: 'bt709', matrix: 'bt709', fullRange: false }
+  if (!copiesFrames(probe)) return { primaries: 'bt709', transfer: 'bt709', matrix: 'bt709', fullRange: false }
   const c = probe.colorSpace
   return { primaries: c.primaries ?? undefined, transfer: c.transfer ?? undefined, matrix: c.matrix ?? undefined,
-    fullRange: !!c.fullRange, depth: settings.codec === 'av1' && keepsHdr(probe, settings) ? 10 : undefined }
+    fullRange: !!c.fullRange, depth: settings.codec === 'av1' && keepsHdr(probe) ? 10 : undefined }
 }
 
 function encoderOptions(probe: Probe, settings: Settings, crf: number) {
@@ -927,7 +927,7 @@ export function encode(probe: Probe, settings: Settings, start: EncodeStart, onP
       const cores = Math.min(navigator.hardwareConcurrency || active, active * threads)
       const fps = probe.fps || 30
       const init = { file: probe.file, options, width: size.width, height: size.height, fpsNum: Math.round(fps * 1000), fpsDen: 1000,
-        direct: copiesFrames(probe, settings) }
+        direct: copiesFrames(probe) }
       pool = await createPool(profile, active, threads, init)
       let poolThreads = pool.threads
       if (canceled) throw new Canceled()
@@ -1336,7 +1336,7 @@ export async function plan(probe: Probe, settings: Settings, signal: AbortSignal
   const fps = probe.fps || 30
   const pool = await createPool(profile, count, threads, {
     file: probe.file, options, width: size.width, height: size.height, fpsNum: Math.round(fps * 1000), fpsDen: 1000,
-    direct: copiesFrames(probe, settings), scoring: measure || fastFirst,
+    direct: copiesFrames(probe), scoring: measure || fastFirst,
   })
   // A short run from a third of the way into each window: the first frame primes VMAF's motion feature, and a run
   // covers every layer of the encoders' hierarchical frame structures. Every 8th frame would land on their best ones.
@@ -1524,7 +1524,7 @@ function vmafAt(points: SizePlan['points'], bytes: number) {
  */
 export async function planAvc(probe: Probe, settings: Settings, signal: AbortSignal): Promise<SizePlan> {
   // An HDR video keeps its 10 bits in AV1 where this device plays that; H.264 here would round it to 8.
-  if (keepsHdr(probe, settings)) {
+  if (keepsHdr(probe)) {
     const av1 = await plan(probe, { ...settings, codec: 'av1' }, signal, false)
     return { ...av1, av1Plan: Promise.resolve(av1), hdr: true }
   }

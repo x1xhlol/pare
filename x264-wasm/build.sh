@@ -19,7 +19,7 @@ emcc -O2 -msimd128 -DHAVE_SIMD128=1 -DBIT_DEPTH=8 -DHIGH_BIT_DEPTH=0 -I. tools/c
   -sALLOW_MEMORY_GROWTH -sSTACK_SIZE=4MB -o checkasm.cjs
 node checkasm.cjs
 
-exports=_enc_import_rgba,_enc_import_p16,_enc_open,_enc_plane,_enc_stride,_enc_headers,_enc_headers_ptr,_enc_encode,_enc_flush,_enc_payload,_enc_out_pts,_enc_out_dts,_enc_out_keyframe,_enc_out_ssim,_enc_close,_malloc,_free
+exports=_enc_import_rgba,_enc_import_p16,_scale_plane,_enc_open,_enc_plane,_enc_stride,_enc_headers,_enc_headers_ptr,_enc_encode,_enc_flush,_enc_payload,_enc_out_pts,_enc_out_dts,_enc_out_keyframe,_enc_out_ssim,_enc_close,_malloc,_free
 out="$here/../src/lib/x264"
 emcc "$here/pare_x264.c" -I. libx264.a -O3 -msimd128 \
   -sMODULARIZE -sEXPORT_ES6 -sEXPORT_NAME=createX264 -sENVIRONMENT=web,worker,node \

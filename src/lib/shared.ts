@@ -92,15 +92,11 @@ export function outputSize(probe: Probe, shortSide: number | null) {
 const DIRECT_FORMATS: (VideoSamplePixelFormat | null)[] = ['NV12', 'I420', 'I420A', 'I420P10', 'I420P12']
 
 /**
- * Whether the source's frames go into the encoder as decoded, keeping their colours and bit depth: at the source's
- * own size and in a planar 4:2:0 format. Otherwise they're drawn on an RGB canvas at the output size, which makes them
- * 8-bit BT.709 SDR, and the output has to be tagged that way.
+ * Whether the source's frames go into the encoder as decoded, keeping their colours and bit depth: planar 4:2:0, copied
+ * in at the source's size or scaled plane by plane. Otherwise (RGB from Firefox's decoder, 4:2:2, 4:4:4) they're drawn
+ * on an RGB canvas at the output size, which makes them 8-bit BT.709 SDR, and the output has to be tagged that way.
  */
-export function copiesFrames(probe: Probe, settings: Settings) {
-  const { width, height } = outputSize(probe, settings.shortSide)
-  const frame = probe.frame
-  return !!frame && DIRECT_FORMATS.includes(frame.format) && frame.width === width && frame.height === height
-}
+export const copiesFrames = (probe: Probe) => DIRECT_FORMATS.includes(probe.frame?.format ?? null)
 
 /** Whether decoded frames of this format carry more than 8 bits. */
 export const deepFormat = (format: VideoSamplePixelFormat | null | undefined) => format === 'I420P10' || format === 'I420P12'
@@ -109,8 +105,8 @@ export const deepFormat = (format: VideoSamplePixelFormat | null | undefined) =>
  * Whether AV1 keeps this video HDR in 10 bits: PQ or HLG, decoded in 10 bits or more, copied in as it is, and
  * playable here. An 8-bit HDR source stays HDR in 8 bits, as it came.
  */
-export const keepsHdr = (probe: Probe, settings: Settings) =>
-  probe.hdr && probe.playsHdrAv1 && deepFormat(probe.frame?.format) && copiesFrames(probe, settings)
+export const keepsHdr = (probe: Probe) =>
+  probe.hdr && probe.playsHdrAv1 && deepFormat(probe.frame?.format) && copiesFrames(probe)
 
 /**
  * Whether this device decodes AV1 at this size smoothly, in 10 bits when asked. Not whether it shows HDR: Chrome

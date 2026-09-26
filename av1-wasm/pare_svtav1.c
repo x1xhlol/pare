@@ -14,6 +14,7 @@
 #include <string.h>
 #include <emscripten/emscripten.h>
 #include "EbSvtAv1Enc.h"
+#include "../x264-wasm/pare_scale.h"
 
 #define CSP_I420 0x0002
 #define CSP_NV12 0x0004
