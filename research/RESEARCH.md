@@ -1017,6 +1017,41 @@ held in the page until the end. On the 2-minute benchmark video the page's peak 
 way: eight encoders' WebAssembly memory is most of it, and the file is 189 MB). It's for long videos: an hour of
 1080p makes about 1 GB of output, which the page used to hold twice, and Chrome keeps large blobs on disk.
 
+## Sharing bits between scenes (not shipped)
+
+Pare gives every chunk about the same rate factor, and on footage whose scenes differ that spends bits badly. On the
+phone clips, the rate factor that fits half the size leaves park at a VMAF NEG nobody could tell from the source while
+ducks falls to 81. Netflix's dynamic optimizer instead measures every shot's size and quality at several settings and
+splits the budget where it buys the most. `research/allocation.py` measured how much that could give: the clip's
+eight chunks encoded natively with Pare's x264 settings at rate factors 16-34, every frame scored, then split at the
+same total size.
+
+| Split | Mean VMAF NEG | Worst chunk | Worst 1% of frames |
+| --- | --- | --- | --- |
+| One rate factor for all (what Pare does) | 85.63 | 80.76 | 74.95 |
+| Highest mean | 86.25 | 83.11 | 75.89 |
+| Highest worst chunk | 85.93 | 85.85 | 77.97 |
+
+With every chunk's true curve known, the worst part gains 5 points at the same size, and the mean a little too. The
+offsets are small: the best split moved no chunk more than 1.6 from the rest.
+
+In the browser the only curves available are the size plan's: 24-frame test windows, each with two frames scored,
+standing in for whole scenes. Given those, the same split moved park 2.7-3.0 coarser and ducks 2.3-2.4 finer, and the
+file got worse, not better, against the version without it:
+
+| Version | Mean VMAF NEG | Worst 1% of frames | Worst frame | Size |
+| --- | --- | --- | --- | --- |
+| One rate factor | 87.86-87.91 | 78.74-79.40 | 71.86 | 46.0% |
+| Split from the plan's two tests (15 and 25) | 86.79 | 77.02 | 73.31 | 44.9% |
+| Split with one more test at 28 | 87.29 | 77.98 | 74.67 | 45.9% |
+
+Two things went wrong. Quality against the rate factor is nowhere near a straight line (flat, then falling fast), so
+two tests 10 apart said park would hold 93 at 28, where it really scores 82. A third test at 28 fixed that, but the
+windows themselves are off by about 3 points against their scenes (park's read 85.7 at 28 against 82.4; ducks' 82.5
+at 25 against 84.0), and the gain lives in offsets of about 1.5. The encode moved park too far and park became the
+new worst part. Doing this well needs each chunk's own quality, which means measuring the first pass and encoding
+some chunks again: a different trade of time for quality, not tried yet.
+
 ## End to end in the browser
 
 Same headless Chrome, same files, production builds:
@@ -1051,7 +1086,8 @@ its spare room goes to speed ("Room to spare goes to speed").
 - `research/benchmark.mjs` takes `BROWSER=webkit|firefox` and `RES=720`.
 - `research/speed_sweep.py` and `research/av1_sweep.py` are the x264 and SVT-AV1 speed sweeps;
   `research/av1_chunks.py` and `research/x264_chunks.py` measure what chunk keyframes cost, and `research/av1_keyint.py`
-  what SVT-AV1's own keyframe interval costs a long chunk.
+  what SVT-AV1's own keyframe interval costs a long chunk. `research/allocation.py` measures what splitting the bits
+  between scenes could give.
 - `research/ffmpeg-wasm/` runs stock ffmpeg.wasm in Chrome for the comparison in `research/BENCHMARKS.md`.
 
 ## Licensing
