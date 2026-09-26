@@ -659,6 +659,36 @@ The size plan still counts keyframes as if there were 8 chunks. Counting 4 made 
 (a test window's keyframe is pricier than what one fewer keyframe saves in a real chunk: 3% at the same rate
 factor), it chose CRF 18.1 instead of 19.1, came out 9% over, and needed a second pass.
 
+## Deciding on AV1 from H.264's plan
+
+On the clips where Auto picks AV1, most of the time went into deciding. For town: H.264's first test round ended 8 s
+after the click, AV1's quality test (preset 8, two windows) then ran next to H.264's third round and scoring for 13 s,
+and only then did the 14 s AV1 encode start. Every clip that reached that test in the benchmark went to AV1, by 1.1 to
+7.7 VMAF NEG, and H.264's first round already showed why: a steep size curve (town, tree), or a rate factor at the edge
+of H.264's range (Jellyfish, park, ducks), or, for noisy, a rate factor far past the higher test with its windows
+scoring far from 1:1 (79.5 at the target, against AV1's 87.2).
+
+So Auto now commits to AV1 from H.264's first round when it shows one of those: the curve steeper than −0.18 per step
+with H.264 at CRF 19 or more (on the corpus AV1 was 1.0 to 2.9 points ahead there from x264 CRF 20 up, and 0.1 to 1.7
+below it), the edge, or H.264 past its higher test by 1.5 steps and predicted under VMAF NEG 85 at the target (the one
+corpus case near it where AV1 lost, rippling water at 86.0, was above it). H.264's third round and scoring stop, and
+AV1's size is planned at preset 10 on the two test windows, scaled by how H.264's same windows compare with all four,
+which takes about 5 s. At the edge the bracket starts at the mapped rate factor instead of 6 below it: H.264's rate
+factor is capped there, and AV1 landed at 42 to 48. Everywhere else, and on devices that can't play AV1, Auto measures
+as before.
+
+| Clip | Time, measured → predicted | VMAF NEG |
+| --- | --- | --- |
+| town | 37.0 → 29.3 s | 93.94 → 93.94 |
+| tree | 38.3 → 29.9 s | 91.94 → 92.14 |
+| noisy | 44.4 → 35.7 s | 87.84 → 87.50 |
+| park | 47.6 → 37.7 s | 84.80 → 84.03 |
+| ducks | 46.6 → 37.2 s | 70.69 → 70.69 |
+
+Jellyfish's first pass came out 1.5% over the size limit either way. Refits cut chunks into pieces so every encoder has
+work, but pieces had to be 30 frames, so its two 41- and 44-frame chunks went again whole on 2 of 8 encoders; at 20
+frames the second pass takes 1.5 s less.
+
 ## End to end in the browser
 
 Same headless Chrome, same files, production builds:

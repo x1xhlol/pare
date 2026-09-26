@@ -20,38 +20,42 @@ alternately with the current one on the same machine so load hits both the same 
 
 | Video | Original | Now: size | Format | Time, before → now | VMAF NEG, before → now | Worst frame, now |
 | --- | --- | --- | --- | --- | --- | --- |
-| Camera footage, 1080p30, 10 s | 77.9 MB | 23.89 MB (-69%) | H.264 | 29.5 → 10.2 s | 97.9 → 97.8 | 95.6 |
-| Screen recording, 1080p30, 8 s | 10.8 MB | 3.49 MB (-68%) | H.264 | 11.9 → 8.1 s | 99.0 → 99.0 | 95.6 |
-| Big Buck Bunny, 1080p30, 10 s | 30.7 MB | 13.42 MB (-56%) | H.264 | 35.6 → 24.9 s | 93.0 → 93.1 | 88.9 |
-| Phone clip with PCM audio, 1080p50, 10 s | 49.8 MB | 22.89 MB (-54%) | H.264 | 43.0 → 29.5 s | 92.4 → 92.0 | 83.0 |
-| Phone clips, 1080p50, 20 s | 65.5 MB | 30.16 MB (-54%) | H.264 | 56.0 → 41.8 s | 87.8 → 87.9 | 71.9 |
-| town, 25 Mbps re-encode, 1080p50, 5 s | 15.8 MB | 7.00 MB (-56%) | AV1 | 31.8 → 37.0 s | 90.3 → 93.9 | 90.0 |
-| tree, same, 5 s | 15.1 MB | 5.59 MB (-63%) | AV1 | 31.9 → 38.3 s | 88.2 → 91.9 | 88.4 |
-| noisy, same, 5 s | 15.8 MB | 7.40 MB (-53%) | AV1 | 38.7 → 44.4 s | 80.9 → 87.8 | 79.5 |
-| Jellyfish, already 4.2 Mbps, 1080p30, 10 s | 5.2 MB | 2.41 MB (-54%) | AV1 | 48.6 → 37.1 s | 82.8 → 82.7 | 75.1 |
-| park, 25 Mbps re-encode, 5 s | 16.2 MB | 7.98 MB (-51%) | AV1 | 68.9 → 47.6 s | 82.8 → 84.8 | 72.6 |
-| ducks (rippling water), same, 5 s | 17.2 MB | 7.04 MB (-59%) | AV1 | 63.2 → 46.6 s | 72.3 → 70.7 | 57.9 |
-| Phone clips, 1080p50, 2 min | 392.1 MB | 188.43 MB (-52%) | H.264 | 263.3 → 195.8 s | 88.3 → 88.4 | 67.1 |
+| Camera footage, 1080p30, 10 s | 77.9 MB | 23.89 MB (-69%) | H.264 | 29.4 → 10.8 s | 97.9 → 97.8 | 95.6 |
+| Screen recording, 1080p30, 8 s | 10.8 MB | 3.49 MB (-68%) | H.264 | 12.4 → 8.7 s | 99.0 → 99.0 | 95.6 |
+| Big Buck Bunny, 1080p30, 10 s | 30.7 MB | 13.42 MB (-56%) | H.264 | 36.0 → 23.9 s | 93.0 → 93.1 | 88.9 |
+| Phone clip with PCM audio, 1080p50, 10 s | 49.8 MB | 22.89 MB (-54%) | H.264 | 42.6 → 30.7 s | 92.4 → 92.0 | 83.0 |
+| Phone clips, 1080p50, 20 s | 65.5 MB | 30.23 MB (-54%) | H.264 | 57.2 → 42.3 s | 87.8 → 87.9 | 71.9 |
+| town, 25 Mbps re-encode, 1080p50, 5 s | 15.8 MB | 7.00 MB (-56%) | AV1 | 31.0 → 29.3 s | 90.3 → 93.9 | 90.0 |
+| tree, same, 5 s | 15.1 MB | 5.89 MB (-61%) | AV1 | 31.9 → 30.0 s | 88.2 → 92.1 | 88.5 |
+| noisy, same, 5 s | 15.8 MB | 6.84 MB (-57%) | AV1 | 38.5 → 35.0 s | 80.9 → 87.5 | 79.1 |
+| Jellyfish, already 4.2 Mbps, 1080p30, 10 s | 5.2 MB | 2.46 MB (-53%) | AV1 | 49.1 → 37.5 s | 82.8 → 82.9 | 73.6 |
+| park, 25 Mbps re-encode, 5 s | 16.2 MB | 7.62 MB (-53%) | AV1 | 67.7 → 36.9 s | 82.8 → 84.0 | 71.7 |
+| ducks (rippling water), same, 5 s | 17.2 MB | 7.04 MB (-59%) | AV1 | 61.6 → 35.9 s | 72.3 → 70.7 | 57.9 |
+| Phone clips, 1080p50, 2 min | 392.1 MB | 189.06 MB (-52%) | H.264 | 263.2 → 197.4 s | 88.4 → 88.5 | 67.1 |
 
-All videos together: 722 s before, 561 s now (22% less), for 223 s of video.
+All videos together: 721 s before, 518 s now (28% less), for 223 s of video.
 
-Every file is at least 50% smaller. Where the source has room, quality is at or near 1:1: the camera footage and
-screen recording score 97.8 and 99.0, and town, Big Buck Bunny, the PCM clip and tree 92 to 94.
+Every video is faster than before, and every file at least 50% smaller. Where the source has room, quality is at or
+near 1:1: the camera footage and screen recording score 97.8 and 99.0, and town, Big Buck Bunny, tree and the PCM clip
+92 to 94.
 
-The camera footage has so much room that Pare encodes it at x264's `superfast` preset, about half the work: 29.5 s
-became 10.2 s, at the same VMAF NEG (97.9 before, 97.8 now; the worst frame went from 93.9 to 95.6), in a file 69%
-smaller instead of 81%. The other H.264 videos got 25-32% faster: x264 settings that do a third less work at the same
+The camera footage has so much room that Pare encodes it at x264's `superfast` preset, about half the work: 29.4 s
+became 10.8 s, at the same VMAF NEG (97.9 before, 97.8 now; the worst frame went from 93.9 to 95.6), in a file 69%
+smaller instead of 81%. The other H.264 videos got 25-34% faster: x264 settings that do a third less work at the same
 quality per byte, fewer and longer chunks on short videos (Big Buck Bunny also scores a little higher, in a file 56%
-smaller instead of 54%), and less decoding before each chunk. On the noisy 25 Mbps re-encodes Auto's AV1 lifts noisy
-by 6.9 points and town and tree by 3.6 to 3.7, and that costs time: those three take 15-20% longer. The other AV1
-videos got 24-31% faster, and park 2 points better, from cheaper keyframes for AV1's short chunks, which also spared
-it a second pass. Ducks lost 1.6 points: its first pass landed at 87% of the size goal, which is left as it is.
+smaller instead of 54%), and less decoding before each chunk.
+
+The noisy 25 Mbps re-encodes now go to AV1, which lifts noisy by 6.6 points and town and tree by 3.6 to 3.9, and they
+still finish 5-9% sooner than H.264 did before: where H.264's first test round already shows that AV1 is the choice,
+Auto no longer tests AV1's quality, only its size. Jellyfish, park and ducks got 24-45% faster, and park 1.2 points
+better, with cheaper keyframes for AV1's short chunks as well. Two lost a little: ducks 1.6 points, its first pass
+landing at 87% of the size goal, and the PCM clip 0.4, from 8 chunks instead of 7.
 
 ## Where the time goes
 
-What happens between the click (a second after the file loads) and the file, from timestamps logged in the previous
-round's runs (since then Big Buck Bunny's encode got about 2 s shorter, and town's AV1 encode has 8 encoders instead
-of 7):
+What happens between the click (a second after the file loads) and the file, from timestamps logged in an earlier
+round's runs (since then Big Buck Bunny's encode got about 2 s shorter, and town decides on AV1 in about 15 s instead
+of 22 and encodes it on 8 encoders instead of 7):
 
 | Video | Plan and Auto, after the click | Encode | Frames encoded per second | Writing the MP4 |
 | --- | --- | --- | --- | --- |

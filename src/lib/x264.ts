@@ -976,10 +976,11 @@ export function encode(probe: Probe, settings: Settings, start: EncodeStart, onP
         const mean = encoded.reduce((t, c) => t + crfs[c.index] * chunkBytes(c), 0) / total
         const local = localSlope(start.points ?? [], mean, total, over, slope)
         // A few chunks to redo would leave most encoders idle, and AV1 has no threads to give them: cut each chunk
-        // into pieces so every encoder works (x264 keeps two threads per piece), and budget for the extra keyframes.
+        // into pieces of at least 20 frames so every encoder works (x264 keeps two threads per piece), and budget for
+        // the extra keyframes. With 30, Jellyfish's two 41- and 44-frame chunks went again whole, on 2 of 8 encoders.
         const share = profile.threaded && canThread ? 2 : 1
         const piecesFor = (count: number, index: number) =>
-          Math.max(1, Math.min(Math.floor(active / share / count), Math.floor(frameCounts[index] / 30)))
+          Math.max(1, Math.min(Math.floor(active / share / count), Math.floor(frameCounts[index] / 20)))
         const cuts = (list: { index: number }[]) => list.reduce((t, r) => t + piecesFor(list.length, r.index) - 1, 0)
         // Chunks already at the limit of the range would come out the same.
         const changing = (list: { index: number; crf: number }[]) => list.filter((r) => Math.abs(r.crf - crfs[r.index]) >= 0.05)
@@ -1099,6 +1100,14 @@ const AUTO_STEEP = -0.18
  * 28.3, came out over, and ended at 30 with VMAF NEG 78.9; AV1 had made 82.8 at the same size).
  */
 const AUTO_EDGE = 3
+/** ...and the rate factor from which a steep curve alone makes AV1 the choice (predictsAv1). */
+const AUTO_PREDICT_CRF = 19
+/**
+ * H.264 predicted this far below 1:1 at the target makes AV1 the choice too: all four benchmark clips under it went to
+ * AV1 once measured, by 1.1 to 7.7 points (noisy, Jellyfish, park, ducks). The one corpus case near it where AV1 lost
+ * (ducks at 86.0, by 1.8, on water) was above it.
+ */
+const AUTO_FAR = 85
 /**
  * How much better AV1 has to look before Auto picks it: it encodes slower and some older devices can't play it. Half a
  * point was tried: it put Big Buck Bunny on AV1 for +0.85 VMAF NEG (93.0 -> 93.8, 1:1 either way) at 1.9x the time.
@@ -1135,6 +1144,8 @@ export type SizePlan = {
   fast?: boolean
   /** Auto: AV1's test, when H.264's plan started it early, and how to stop it. */
   av1Test?: Promise<SizePlan | null>
+  /** Auto: AV1's size plan, when H.264's first round already made AV1 the choice (see predictsAv1). */
+  av1Plan?: Promise<SizePlan | null>
   stopAv1Test?: () => void
 }
 
@@ -1194,7 +1205,7 @@ function around<T extends { crf: number; bytes: number }>(points: T[], bytes: nu
 
 export async function plan(probe: Probe, settings: Settings, signal: AbortSignal, measure = false,
                            only?: number[], tests?: [number, number],
-                           onFirst?: (first: SizePlan) => void): Promise<SizePlan> {
+                           onFirst?: (first: SizePlan) => boolean | void | Promise<boolean | void>): Promise<SizePlan> {
   const began = performance.now()
   const { input, track } = await openTrack(probe.file)
   const rotation = await track.getRotation()
@@ -1253,6 +1264,7 @@ export async function plan(probe: Probe, settings: Settings, signal: AbortSignal
 
   let issued = 0
   let succeeded = false
+  let stopped = false
   /** Each test's encoded windows, by rate factor, for the encode to keep when they match its settings. */
   const tested = new Map<number, EncodedChunk[]>()
   /** VMAF NEG of each point, filled in as the workers score their windows after handing them over. */
@@ -1343,7 +1355,14 @@ export async function plan(probe: Probe, settings: Settings, signal: AbortSignal
     }
     const points = await videoAt([lo, hi])
     let planned = fit(probe, settings, points)
-    onFirst?.(planned)
+    // Auto can decide on AV1 from this round alone; the rest of H.264's plan would only take its cores.
+    const firstScored = Promise.all(scoring).then(() => undefined)
+    firstScored.catch(() => {})
+    if (await onFirst?.({ ...planned, scored: firstScored })) {
+      stopped = true
+      succeeded = true
+      return planned
+    }
     // Past the higher test, or far from both where size falls steeply, the straight line can be badly off: noisy
     // footage sheds bits once the noise stops being coded, and 5-second clips missed by 46-52%, which cost a second
     // encode. One more round of the same windows near the answer is much cheaper. Where size falls gently (Big Buck
@@ -1366,8 +1385,11 @@ export async function plan(probe: Probe, settings: Settings, signal: AbortSignal
       signal.removeEventListener('abort', stop)
       pool.terminate()
     }
-    if (succeeded) void Promise.allSettled(scoring).then(done)
-    else done()
+    if (succeeded && !stopped) void Promise.allSettled(scoring).then(done)
+    else {
+      for (const p of scoring) p.catch(() => {})
+      done()
+    }
   }
 }
 
@@ -1380,9 +1402,9 @@ export type Choice = {
   /**
    * unlimited: no size target to compare at. fits: H.264 already fits at its best quality. high: H.264 already scores
    * AUTO_HIGH. device: this device can't play AV1. size: only AV1 reaches the target. better: AV1 looks better by the
-   * margin. even: it doesn't.
+   * margin. even: it doesn't. predicted: H.264's plan alone made AV1 the choice (predictsAv1).
    */
-  reason: 'unlimited' | 'fits' | 'high' | 'device' | 'size' | 'better' | 'even'
+  reason: 'unlimited' | 'fits' | 'high' | 'device' | 'size' | 'better' | 'even' | 'predicted'
 }
 
 /** Predicted bytes at rate factor `crf`, log size straight through the plan's two tests. */
@@ -1423,16 +1445,66 @@ async function playsAv1(width: number, height: number, fps: number) {
  */
 export async function planAvc(probe: Probe, settings: Settings, signal: AbortSignal): Promise<SizePlan> {
   let early: Promise<SizePlan | null> | undefined
+  let predicted: Promise<SizePlan | null> | undefined
   const stop = new AbortController()
   const cancel = () => stop.abort()
   signal.addEventListener('abort', cancel)
+  const { width, height } = outputSize(probe, settings.shortSide)
+  const plays = playsAv1(width, height, probe.fps)
   const avc = await plan(probe, { ...settings, codec: 'avc' }, signal, settings.sizeTarget, undefined, undefined,
-    (first) => {
+    async (first) => {
+      if (!settings.sizeTarget || !first.bound) return
       const edge = first.crf >= X264.max - AUTO_EDGE
-      if (settings.sizeTarget && first.bound && ((first.slope ?? 0) <= AUTO_STEEP || edge))
-        early = testAv1(probe, settings, first, stop.signal)
+      const top = Math.max(...first.points!.map((p) => p.crf))
+      let predicts = predictsAv1(first)
+      if (!predicts && !edge && (first.slope ?? 0) > AUTO_STEEP) {
+        // Far past the higher test H.264 is compressing hard; if its windows already score far from 1:1 there, AV1
+        // is the choice (noisy: 79.5 against AV1's 87.2).
+        if (first.crf <= top + MID_TEST) return
+        await first.scored
+        predicts = (vmafAt(first.points, videoGoal(probe, settings)) ?? 100) < AUTO_FAR
+        if (!predicts) return
+      }
+      if (predicts && (await plays)) {
+        predicted = planAv1(probe, settings, first, stop.signal)
+        predicted.catch(() => {})
+        return true
+      }
+      early = testAv1(probe, settings, first, stop.signal)
     })
-  return { ...avc, av1Test: early, stopAv1Test: cancel }
+  return { ...avc, av1Test: early, av1Plan: predicted, stopAv1Test: cancel }
+}
+
+/**
+ * Whether H.264's plan alone makes AV1 the choice: fine noise (size falling steeply with the rate factor) where H.264
+ * is already well past its quality ceiling, or H.264 at the edge of its range. Every such case in the benchmark went
+ * to AV1 once measured, by 1.1 to 7.7 VMAF NEG (town, tree, noisy, Jellyfish, park, ducks), and on the corpus
+ * (research/codec_choice.py) AV1 was 1.0 to 2.9 points ahead on the steep clips from x264 CRF 20 up. So Auto skips
+ * AV1's quality test there, and H.264's own third round and scoring, and only plans AV1's size.
+ */
+function predictsAv1(avc: SizePlan) {
+  return (avc.crf >= AUTO_PREDICT_CRF && (avc.slope ?? 0) <= AUTO_STEEP) || avc.crf >= X264.max - AUTO_EDGE
+}
+
+/**
+ * AV1's size plan when it's already chosen: preset 10 (sizes within a few percent of preset 8's, at 0.43x the CPU
+ * time) on the two windows AV1's test uses, scaled by how H.264's same two windows compare with all four. At the edge of
+ * H.264's range its rate factor stops saying much (it's capped), and AV1 landed at 42-48 there (Jellyfish, ducks,
+ * park), so the bracket starts at the guess instead of below it.
+ */
+async function planAv1(probe: Probe, settings: Settings, avc: SizePlan, signal: AbortSignal) {
+  const guess = 1.88 * avc.crf - 10.7
+  const edge = avc.crf >= X264.max - AUTO_EDGE
+  const low = Math.round(Math.min(AV1.max - AV1_BRACKET * 2, Math.max(AV1.ceiling, edge ? guess : guess - AV1_BRACKET)))
+  const av1 = { ...settings, codec: 'av1' as const }
+  const tested = await plan(probe, av1, signal, false, AV1_TEST_WINDOWS, [low, low + AV1_BRACKET * 2])
+  return fit(probe, av1, tested.points!.map((p) => ({ ...p, bytes: p.bytes * subsetScale(avc) })))
+}
+
+/** How much bigger the whole video is than AV1's two test windows suggest, going by H.264's test of all four. */
+function subsetScale(avc: SizePlan) {
+  const ratios = avc.points!.flatMap((p) => (p.subset ? [Math.log(p.bytes / p.subset.bytes)] : []))
+  return ratios.length ? Math.exp(ratios.reduce((a, b) => a + b, 0) / ratios.length) : 1
 }
 
 /** AV1's test for Auto, bracketing where H.264's rate factor usually maps to, or null if this device can't play AV1. */
@@ -1456,7 +1528,7 @@ export const avcReaches = (probe: Probe, settings: Settings, avc: SizePlan) =>
  * the target and it's clear of its highest rate factor, otherwise once its windows are scored.
  */
 export async function quickStart(probe: Probe, settings: Settings, avc: SizePlan) {
-  if (!avcReaches(probe, settings, avc)) return false
+  if (avc.av1Plan || !avcReaches(probe, settings, avc)) return false
   if ((avc.slope ?? 0) > AUTO_STEEP && avc.crf < X264.max - AUTO_EDGE) return true
   await avc.scored
   return !testsAv1(probe, settings, avc) || (vmafAt(avc.points, videoGoal(probe, settings)) ?? 0) >= AUTO_QUICK
@@ -1478,6 +1550,15 @@ export function testsAv1(probe: Probe, settings: Settings, avc: SizePlan) {
 export async function settle(probe: Probe, settings: Settings, avc: SizePlan, signal: AbortSignal): Promise<Choice> {
   if (!settings.sizeTarget) return { codec: 'avc', plan: avc, reason: 'unlimited' }
   if (!avc.bound) return { codec: 'avc', plan: avc, reason: 'fits' }
+  // H.264's first round already chose AV1, or its third one does (noisy's curve only showed its steepness there).
+  const { width, height } = outputSize(probe, settings.shortSide)
+  const predicted = avc.av1Plan ??
+    (!avc.av1Test && predictsAv1(avc) && (await playsAv1(width, height, probe.fps))
+      ? planAv1(probe, settings, avc, signal) : undefined)
+  if (predicted) {
+    const av1 = await predicted.catch((err) => { if (signal.aborted) throw err; return null })
+    if (av1) return { codec: 'av1', plan: av1, reason: 'predicted' }
+  }
   // AV1's test starts while H.264's windows are still being scored (or earlier, from H.264's plan), and is dropped if
   // the scores make it unneeded. Two windows choose as well as four (research/codec_choice.py), and four test encodes
   // on four cores take about half as long as eight sharing them.
@@ -1497,8 +1578,7 @@ export async function settle(probe: Probe, settings: Settings, avc: SizePlan, si
     await tested.scored
     // Its size estimate is off by however those two windows differ from the video, which H.264's test on all four
     // measured: scale by that.
-    const ratios = avc.points!.flatMap((p) => (p.subset ? [Math.log(p.bytes / p.subset.bytes)] : []))
-    const scale = ratios.length ? Math.exp(ratios.reduce((a, b) => a + b, 0) / ratios.length) : 1
+    const scale = subsetScale(avc)
     const av1 = fit(probe, { ...settings, codec: 'av1' }, tested.points!.map((p) => ({ ...p, bytes: p.bytes * scale })))
     // Compare like with like: both encoders on the same two windows, at the size those windows' share of the target is.
     const same = avc.points!.map((p) => ({ crf: p.crf, bytes: p.subset?.bytes ?? p.bytes, vmaf: p.subset?.vmaf ?? p.vmaf }))

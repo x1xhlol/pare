@@ -37,7 +37,7 @@ type CalibrationEntry = {
    * Auto: H.264's plan, ready before AV1's test is, whether H.264 can reach the size target, and a way to stop the
    * test when the compression starts without it.
    */
-  first?: Promise<Calibration & { reaches: boolean }>
+  first?: Promise<Calibration & { reaches: boolean; predicted: boolean }>
   /** Whether a compression started before AV1's test ends may go ahead with H.264 (it's near 1:1 already). */
   quick?: Promise<boolean>
   skipTest?: () => void
@@ -221,7 +221,8 @@ export default function App() {
       : null
     const entry: CalibrationEntry = {
       controller,
-      first: first?.then(({ m, avc }) => ({ ...fromPlan(avc), codec: 'avc' as const, reaches: m.avcReaches(probe, settings, avc) })),
+      first: first?.then(({ m, avc }) => ({ ...fromPlan(avc), codec: 'avc' as const, reaches: m.avcReaches(probe, settings, avc),
+        predicted: !!avc.av1Plan })),
       quick: first?.then(({ m, avc }) => m.quickStart(probe, settings, avc)),
       // Stops H.264's scoring as well as AV1's test: neither may compete with the encode for the cores.
       skipTest: () => controller.abort(),
@@ -367,7 +368,8 @@ export default function App() {
             plan = first
           } else if (!waitFor.result) {
             const why = first?.reaches ? "H.264 isn't near 1:1 at this size" : "H.264 can't reach half the size"
-            setPhase((p) => (p.kind === 'running' ? { ...p, status: `Testing AV1: ${why}…` } : p))
+            const status = first?.predicted ? 'Planning AV1: H.264 is near its limit here…' : `Testing AV1: ${why}…`
+            setPhase((p) => (p.kind === 'running' ? { ...p, status } : p))
           }
         }
         plan ??= waitFor ? await waitFor.promise.catch(() => undefined) : undefined
@@ -727,6 +729,7 @@ function choiceDetail({ reason, vmaf }: NonNullable<Calibration['choice']>) {
   if (vmaf?.av1 === undefined && reason === 'even') return 'Measured on short test encodes'
   if (reason === 'device') return "H.264: this device can't play AV1"
   if (reason === 'size') return "AV1: H.264 can't reach half the size"
+  if (reason === 'predicted') return 'AV1: H.264 is near its limit at this size'
   if (reason === 'better') return `AV1: ${gain.toFixed(1)} VMAF above H.264 here`
   return gain > 0 ? `H.264: AV1 only ${gain.toFixed(1)} VMAF better` : `H.264: ${(-gain).toFixed(1)} VMAF above AV1 here`
 }

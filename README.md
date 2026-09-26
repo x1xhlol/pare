@@ -57,7 +57,9 @@ Pare now runs its own build of x264:
   point better at the target size and the device can play it, or when it's the only way to half the size. On the test
   corpus that picked the better encoder in 28 of 30 cases, where SSIM would have agreed with VMAF in 21. The AV1 test
   runs while you look at the settings; start sooner and Pare goes ahead with H.264 unless AV1 is likely to matter
-  (a steep size curve, the mark of fine noise, where AV1 added 4 to 6 points, or H.264 near its limit).
+  (a steep size curve, the mark of fine noise, where AV1 added 4 to 6 points, or H.264 near its limit). Where H.264's
+  first test already shows that, Auto commits to AV1 without testing its quality, and only sizes it: those clips got
+  5-45% faster than before this round while gaining up to 6.6 points.
 
 The encoder settings came out of a quality lab. Every candidate was swept over rate factors on a test corpus and
 scored with VMAF, VMAF NEG, SSIM and PSNR. `faster` with a 40-frame lookahead and weighted prediction needs about 30%
@@ -74,11 +76,11 @@ with native libvmaf over every frame; around 93 to 95 a re-encode stops looking 
 
 | Video | Original | Pare | Time | VMAF NEG (worst frame) |
 | --- | --- | --- | --- | --- |
-| Camera footage, 1080p30, 10 s | 77.9 MB | 23.9 MB (−69%) | 10 s | 97.8 (95.6) |
-| Screen recording, 1080p30, 8 s | 10.8 MB | 3.5 MB (−68%) | 8 s | 99.0 (95.6) |
-| Big Buck Bunny, 1080p30, 10 s | 30.7 MB | 13.4 MB (−56%) | 25 s | 93.1 (88.9) |
+| Camera footage, 1080p30, 10 s | 77.9 MB | 23.9 MB (−69%) | 11 s | 97.8 (95.6) |
+| Screen recording, 1080p30, 8 s | 10.8 MB | 3.5 MB (−68%) | 9 s | 99.0 (95.6) |
+| Big Buck Bunny, 1080p30, 10 s | 30.7 MB | 13.4 MB (−56%) | 24 s | 93.1 (88.9) |
 | Phone clips, 1080p50, 20 s | 65.5 MB | 30.2 MB (−54%) | 42 s | 87.9 (71.9) |
-| Phone clips, 1080p50, 2 min | 392 MB | 188 MB (−52%) | 3 min 16 s | 88.4 (67.1) |
+| Phone clips, 1080p50, 2 min | 392 MB | 189 MB (−52%) | 3 min 17 s | 88.5 (67.1) |
 
 Twelve videos, their before and after, and the noisy clips where AV1 takes over are in
 [research/BENCHMARKS.md](research/BENCHMARKS.md).
