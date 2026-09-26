@@ -979,6 +979,34 @@ H.264's 92.5), the camera footage to the superfast tier. Its RGB frames cost 3.4
 bit-exact, 13.2 → 4.3 ms a 1080p frame), but most of the time is Firefox's own `copyTo`, about 68 ms a frame here: its
 decoder hands over BGRX whether asked for hardware or software decoding.
 
+## A second review
+
+A review of this round's changes (four reviewers, each finding checked by a skeptic) confirmed nine problems, all
+fixed:
+
+- The check after muxing lowered the old limit instead of shrinking from the video actually muxed, so a file could
+  still come out over half, and when the audio alone was over half, the limit went negative and every chunk went to
+  the encoder's worst rate factor. Now it aims below what was muxed, and skips the retry when no video size can help.
+  Cancelling while the file was written could leave the job hanging at 99%.
+- Audio copied as it is could take most of the size target. With the target on, a track copied at more than twice
+  the rate encoding it would take, and over a quarter of the target, is now encoded: a clip with 8-channel 96 kHz
+  FLAC took 43 s and came out bigger than the original with the video at CRF 55; now 13 s, 42% of the size, the
+  video at SSIM 0.995 against 0.968. Where the audio rules out half the size anyway (a podcast: a still picture and
+  AAC), the video is no longer ruined trying; the settings say why.
+- Mediabunny mixes only 4 and 6 channels down properly and keeps the first two of any other count. A 5.0 or 7.1 track
+  with sound only in the centre came out silent. Pare now mixes 3, 5, 7 and 8 channels itself (centre and surrounds
+  at -3 dB); the same clips come out at -24.2 dB on both sides.
+- An untagged HD video resized to SD was written untagged, so players would show it with BT.601 colours. It's now
+  tagged with what its source would be shown as.
+- Frames that change layout within a chunk (NV12 after I420A in a video with alpha, or a new size) could write past
+  the encoder's planes. Every frame is checked now, and one of another size is scaled.
+- A file starting on an I-frame that isn't an IDR (a cut broadcast recording) was refused as undecodable in Chrome.
+  The probe now falls back to the first frame a decode produces, and the quality check pairs frames from the first
+  one actually encoded.
+- The fast engine's size estimate, the Repackage summary and the HDR note for H.264 disagreed with what would happen.
+
+## End to end in the browser
+
 Same headless Chrome, same files, production builds:
 
 | Clip | ffmpeg.wasm build | SIMD build, first size target | Now |

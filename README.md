@@ -156,8 +156,10 @@ The script clones x264 at the commit in `x264-wasm/X264_COMMIT`, applies `x264-s
 - The head start uses the CPU while the settings are on screen; changing a setting stops it.
 - Threads need a cross-origin isolated page (the site sends COOP and COEP headers). Without them, or if the threaded
   build fails to start, each encoder runs on one thread.
-- Audio an MP4 can't carry is converted to AAC or Opus, mixed down to stereo if the browser's encoder needs that. When
-  the browser can't decode or encode it at all, the settings say so before Compress and the copy has no audio.
+- Audio an MP4 can't carry is converted to AAC or Opus, mixed down to stereo if the browser's encoder needs that, and
+  so is audio that would take most of the size budget (lossless tracks). When the browser can't decode or encode it,
+  the settings say so before Compress and the copy has no audio. When the audio alone is more than half the file, it
+  can't be made half the size, and the video is compressed at the chosen quality instead.
 - Needs a browser with WebCodecs and WebAssembly SIMD. Tested in Chrome, in Firefox 155, and in WebKit 26.6 (Safari's
   engine) on Linux, where it works but plans about three times slower and can't decode AV1. Safari on a Mac hasn't
   been tried. Firefox decodes to RGB frames, so there an HDR video becomes SDR and frames take longer to bring in.
