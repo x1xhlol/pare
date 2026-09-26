@@ -97,9 +97,10 @@ The container allowance (a per-sample estimate instead of a flat 64 KB), and sec
 | Phone clip with PCM audio, 1080p25, 20 s | 36.6 → 36.1 s | 92.0 → 92.3 | 83.0 → 84.8 | 46.0% → 48.4% |
 | Phone clips, 1080p50, 20 s | 49.7 → 43.4 s | 88.0 → 87.9 | 71.9 → 71.9 | 46.6% → 46.2% |
 
-The whole benchmark set against the same commit, afterwards, with another job loading the machine: the nine videos
-these changes don't touch came out bit-identical (camera, screen, Big Buck Bunny, the phone clips, town, tree, noisy,
-park, ducks), and the four above improved as shown. Times between identical encodes varied by up to 25 s in that run,
+The whole benchmark set against the same commit, afterwards, with another job loading the machine: eight of the
+videos these changes don't touch came out with identical scores and sizes (camera, screen, Big Buck Bunny, town, tree,
+noisy, park, ducks). The phone clips, whose chunk cuts depend on timing, moved within run-to-run variation (VMAF NEG
+87.90 against 87.83, 46.3% against 45.9%), and the four above improved as shown. Times between identical encodes varied by up to 25 s in that run,
 so the times in the table above come from the earlier, calmer runs.
 
 SVT-AV1's 10-second GOPs, on a 60-second 30 fps clip (Big Buck Bunny looped six times, 1,800 frames, AV1 chosen):
