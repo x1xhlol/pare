@@ -50,14 +50,58 @@ export type Probe = {
 /** Audio codecs an MP4 can carry as they are. */
 export const MP4_AUDIO: AudioCodec[] = ['aac', 'opus', 'mp3', 'ac3', 'eac3', 'flac']
 
+/** How this browser can encode the audio: codec, and the channels and sample rate it takes. */
+export type AudioEncode = { codec: 'aac' | 'opus'; channels: number; sampleRate: number; bitrate: number }
+
 /**
  * What Pare's own encoders do with the audio, decided when the file is opened so a compression can't fail at the end:
- * copy it, encode it (mixed down or resampled where this browser's encoder needs that), or leave it out.
+ * copy it (with how it could be encoded instead, when it can), encode it (mixed down or resampled where this browser's
+ * encoder needs that), or leave it out.
  */
 export type AudioPlan =
-  | { kind: 'copy' }
-  | { kind: 'encode'; codec: 'aac' | 'opus'; channels: number; sampleRate: number; bitrate: number }
+  | { kind: 'copy'; encode?: AudioEncode }
+  | ({ kind: 'encode' } & AudioEncode)
   | { kind: 'drop'; reason: 'decode' | 'encode' }
+
+/** The size target: at most half the original. Steering aims a little lower to absorb its error at the very end. */
+export const SIZE_TARGET = 0.5
+export const SIZE_AIM = 0.47
+/** The least the video may be given, as a share of the original, however much the audio takes. */
+export const VIDEO_FLOOR = 0.05
+
+/**
+ * The audio plan for these settings, or null for none. With the size target, audio copied at more than twice what
+ * encoding it takes, and over a quarter of the target (a lossless track in a music video), is encoded instead: copied,
+ * it would leave the video little room or none.
+ */
+export function audioFor(probe: Probe, settings: Settings): AudioPlan | null {
+  const audio = probe.audio
+  if (!audio || !settings.keepAudio) return null
+  const plan = audio.plan
+  if (plan.kind === 'copy' && plan.encode && settings.sizeTarget && settings.preset !== 'copy' &&
+      audio.bitrate > 2 * plan.encode.bitrate && (audio.bitrate * probe.duration) / 8 > 0.25 * SIZE_TARGET * probe.file.size)
+    return { kind: 'encode', ...plan.encode }
+  return plan
+}
+
+/** Bytes of audio in the output: copied at the source's rate, encoded at the plan's. */
+export function audioBytes(probe: Probe, settings: Settings) {
+  const plan = audioFor(probe, settings)
+  if (!plan || plan.kind === 'drop') return 0
+  return ((plan.kind === 'copy' ? probe.audio!.bitrate : plan.bitrate) * probe.duration) / 8
+}
+
+/** Whether half the size can be reached at all: the audio and container leave the video its floor. */
+export const halvable = (probe: Probe, settings: Settings) =>
+  probe.file.size * SIZE_AIM - audioBytes(probe, settings) >= probe.file.size * VIDEO_FLOOR
+
+/**
+ * The settings the encoders get. Where the audio alone rules out half the size, squeezing the video to its floor would
+ * only ruin it (a music video with lossless 8-channel audio came out at CRF 55 and still bigger than the original), so
+ * it's encoded at the chosen quality instead.
+ */
+export const forEngine = (probe: Probe, settings: Settings): Settings =>
+  settings.sizeTarget && !halvable(probe, settings) ? { ...settings, sizeTarget: false } : settings
 
 export const CODEC_LABEL: Record<string, string> = {
   avc: 'H.264',

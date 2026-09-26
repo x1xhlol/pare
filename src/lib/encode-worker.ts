@@ -175,9 +175,17 @@ async function copyFrame(frame: VideoSample, planes: Plane[] | null, base = 0, s
         : await frame.copyTo(new Uint8Array(x.HEAPU8.buffer, base, size))
     } catch (err) {
       if (!(err instanceof TypeError)) throw err
+      // Only a refusal the plain buffer gets past switches over; any other error stands.
+      const layout = await bounced(frame, planes, base, size).catch(() => Promise.reject(err))
       bounce = true
+      return layout
     }
   }
+  return bounced(frame, planes, base, size)
+}
+
+/** copyFrame by way of a plain buffer. */
+async function bounced(frame: VideoSample, planes: Plane[] | null, base: number, size: number): Promise<PlaneLayout[]> {
   if (!planes) {
     const plain = new Uint8Array(size)
     const layout = await frame.copyTo(plain)
@@ -208,26 +216,15 @@ function planInput(sample: VideoSample, enc: number): Loader {
     // colour or, into a 10-bit encoder, as noise.
     if ((tenBit && !deep) || !(deep || sample.format === 'NV12' || sample.format === 'I420' || sample.format === 'I420A'))
       throw new Error(`The video decoded as ${sample.format ?? 'an unnamed format'}, not as planned.`)
-    if (!fits(sample)) return scaledInput(sample, enc)
-    if (sample.format === 'NV12')
-      return async (s) => void (await copyFrame(s, [plane(0), plane(1)]))
-    if (sample.format === 'I420' || sample.format === 'I420A')
-      return async (s) => {
-        const layout = [plane(0), plane(1), plane(2)]
-        if (s.format === 'I420A') layout.push({ offset: scratch(width * height), stride: width })
-        await copyFrame(s, layout)
-      }
-    // A 10-bit encoder (AV1 for HDR sources) takes 10-bit frames as they are: its planes hold 16-bit samples.
-    if (sample.format === 'I420P10' && tenBit)
-      return async (s) => void (await copyFrame(s, [plane(0), plane(1), plane(2)]))
-    const bits = sample.format === 'I420P10' ? 10 : 12
+    const copy = copyInput(sample, enc, plane)
+    const scale = scaledInput(sample, enc)
+    // The encoder's layout was set by the chunk's first frame, so every frame has to match it (a video with alpha can
+    // mix I420 and I420A). Each one is copied or scaled on its own: a video can change size partway.
+    const kind = (format: VideoSample['format']) => (format === 'I420A' ? 'I420' : format)
     return async (s) => {
-      const size = s.allocationSize()
-      const base = scratch(size)
-      const layout = await copyFrame(s, null, base, size)
-      const [ly, lu, lv] = layout
-      x._enc_import_p16(enc, base + ly.offset, base + lu.offset, base + lv.offset,
-        ly.stride / 2, lu.stride / 2, lv.stride / 2, width, height, bits)
+      if (kind(s.format) !== kind(sample.format))
+        throw new Error(`The video's frames changed from ${sample.format} to ${s.format ?? 'an unnamed format'} partway.`)
+      await (fits(s) ? copy(s) : scale(s))
     }
   }
   // Anything else (resizing, 4:2:2/4:4:4, formats WebCodecs doesn't name, RGB) goes through an RGB frame at the
@@ -248,6 +245,29 @@ function planInput(sample: VideoSample, enc: number): Loader {
     } finally {
       if (resized !== s) resized.close()
     }
+  }
+}
+
+/** Frames at the encoder's size, copied into its planes as they are (10- and 12-bit rounded for an 8-bit encoder). */
+function copyInput(sample: VideoSample, enc: number, plane: (i: number) => Plane): Loader {
+  const { width, height } = init
+  if (sample.format === 'NV12') return async (s) => void (await copyFrame(s, [plane(0), plane(1)]))
+  if (sample.format === 'I420' || sample.format === 'I420A')
+    return async (s) => {
+      const layout = [plane(0), plane(1), plane(2)]
+      if (s.format === 'I420A') layout.push({ offset: scratch(width * height), stride: width })
+      await copyFrame(s, layout)
+    }
+  // A 10-bit encoder (AV1 for HDR sources) takes 10-bit frames as they are: its planes hold 16-bit samples.
+  if (sample.format === 'I420P10' && tenBit) return async (s) => void (await copyFrame(s, [plane(0), plane(1), plane(2)]))
+  const bits = sample.format === 'I420P10' ? 10 : 12
+  return async (s) => {
+    const size = s.allocationSize()
+    const base = scratch(size)
+    const layout = await copyFrame(s, null, base, size)
+    const [ly, lu, lv] = layout
+    x._enc_import_p16(enc, base + ly.offset, base + lu.offset, base + lv.offset,
+      ly.stride / 2, lu.stride / 2, lv.stride / 2, width, height, bits)
   }
 }
 

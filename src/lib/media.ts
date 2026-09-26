@@ -9,7 +9,6 @@ import {
   MP4,
   Mp4OutputFormat,
   Output,
-  PCM_AUDIO_CODECS,
   QTFF,
   Quality,
   StreamTarget,
@@ -23,9 +22,11 @@ import {
   type InputAudioTrack,
   type InputVideoTrack,
 } from 'mediabunny'
+import { ownDownmix, stereoDownmix } from './downmix'
 import { lumaOf, psnr, ssim } from './metrics'
 import {
-  deepFormat, even, MP4_AUDIO, outputSize, playsAv1, type AudioPlan, type OutputCodec, type Preset, type Probe, type Settings,
+  audioBytes as plannedAudioBytes, audioFor, deepFormat, even, MP4_AUDIO, outputSize, playsAv1, type AudioEncode,
+  type AudioPlan, type OutputCodec, type Preset, type Probe, type Settings,
 } from './shared'
 
 type EncodingPreset = Exclude<Preset, 'copy'>
@@ -51,7 +52,6 @@ const MEASURE_MAX_SIDE = 1920
 
 const openInput = (file: Blob) => new Input({ source: new BlobSource(file), formats: [MP4, QTFF, WEBM, MATROSKA] })
 
-const isPcm = (codec: AudioCodec | null) => !!codec && (PCM_AUDIO_CODECS as readonly string[]).includes(codec)
 
 export async function probeFile(file: File): Promise<Probe> {
   const input = openInput(file)
@@ -132,22 +132,36 @@ async function describeAudio(track: InputAudioTrack) {
  */
 async function planAudio(track: InputAudioTrack, codec: AudioCodec | null, channels: number, sampleRate: number):
   Promise<AudioPlan> {
-  if (codec && MP4_AUDIO.includes(codec)) return { kind: 'copy' }
-  if (!(await track.canDecode().catch(() => false))) return { kind: 'drop', reason: 'decode' }
+  const decodes = await track.canDecode().catch(() => false)
+  const encode = decodes ? await encoding(channels, sampleRate) : null
+  if (codec && MP4_AUDIO.includes(codec)) return { kind: 'copy', encode: encode ?? undefined }
+  if (!decodes) return { kind: 'drop', reason: 'decode' }
+  return encode ? { kind: 'encode', ...encode } : { kind: 'drop', reason: 'encode' }
+}
+
+/** How this browser can encode audio with this many channels at this rate, if it can. */
+async function encoding(channels: number, sampleRate: number): Promise<AudioEncode | null> {
   const stereo = Math.min(2, channels)
   for (const [ch, rate] of [[channels, sampleRate], [stereo, sampleRate], [stereo, 48000]])
     for (const out of ['aac', 'opus'] as const) {
       // 96 kbps per channel is transparent for AAC and Opus alike.
       const bitrate = Math.min(256_000, 96_000 * ch)
       if (await canEncodeAudio(out, { numberOfChannels: ch, sampleRate: rate, bitrate }).catch(() => false))
-        return { kind: 'encode', codec: out, channels: ch, sampleRate: rate, bitrate }
+        return { codec: out, channels: ch, sampleRate: rate, bitrate }
     }
-  return { kind: 'drop', reason: 'encode' }
+  return null
 }
 
 /** The first frame's pixel format, visible size (turned to display orientation) and colour space. */
 async function firstFrame(track: InputVideoTrack, timestamp: number) {
-  const sample = await new VideoSampleSink(track).getSample(timestamp).catch(() => null)
+  const sink = new VideoSampleSink(track)
+  // A file can start on an I-frame that isn't an IDR, which Chrome won't start decoding from: there the first sample
+  // comes from the first IDR, as it will in the encode.
+  const first = async () => {
+    for await (const sample of sink.samples()) return sample
+    return null
+  }
+  const sample = (await sink.getSample(timestamp).catch(() => null)) ?? (await first().catch(() => null))
   if (!sample) return null
   try {
     const { width, height } = sample.visibleRect
@@ -184,17 +198,20 @@ function videoOptions(probe: Probe, settings: Settings, bitrate: number): Conver
 
 async function audioOptions(probe: Probe, settings: Settings): Promise<ConversionAudioOptions> {
   if (!settings.keepAudio) return { discard: true }
-  const plan = probe.audio?.plan
+  const plan = audioFor(probe, settings)
   if (settings.preset === 'copy' || !plan || plan.kind === 'copy') return {}
   if (plan.kind === 'drop') return { discard: true }
-  return { codec: plan.codec, numberOfChannels: plan.channels, sampleRate: plan.sampleRate,
-    quality: new Quality({ bitrate: plan.bitrate }) }
+  const quality = new Quality({ bitrate: plan.bitrate })
+  if (plan.channels === 2 && ownDownmix(probe.audio!.channels))
+    return { codec: plan.codec, sampleRate: plan.sampleRate, process: stereoDownmix(probe.audio!.channels),
+      processedNumberOfChannels: 2, quality }
+  return { codec: plan.codec, numberOfChannels: plan.channels, sampleRate: plan.sampleRate, quality }
 }
 
 function audioBytes(probe: Probe, settings: Settings) {
-  if (!settings.keepAudio || !probe.audio) return 0
-  const bps = settings.preset !== 'copy' && isPcm(probe.audio.codec) ? 128_000 * probe.audio.channels : probe.audio.bitrate
-  return (bps * probe.duration) / 8
+  // Repackaging copies the audio whatever Pare's encoders could do with it.
+  if (settings.preset === 'copy') return settings.keepAudio && probe.audio ? (probe.audio.bitrate * probe.duration) / 8 : 0
+  return plannedAudioBytes(probe, settings)
 }
 
 function outputFormat(probe: Probe, settings: Settings) {
@@ -542,8 +559,11 @@ export async function measureQuality(
     const size = measureSize(await b.getDisplayWidth(), await b.getDisplayHeight())
     const sinkA = new CanvasSink(a, size)
     const sinkB = new CanvasSink(b, size)
-    // The conversion trims to the first timestamp, so encoded time = source time − offset.
-    const offset = probe.firstTimestamp - Math.max(0, await b.getFirstTimestamp())
+    // Encoded time = source time − offset. The browser's encoder (a Mediabunny conversion) trims to the source's first
+    // timestamp. Pare's encoders keep source timestamps from the first frame they encoded, which is later when the
+    // file's first frames can't be decoded (it starts on an I-frame that isn't an IDR).
+    const encodedFirst = scores?.times.length ? scores.times.reduce((a, t) => Math.min(a, t), Infinity) : probe.firstTimestamp
+    const offset = encodedFirst - Math.max(0, await b.getFirstTimestamp())
 
     const frames: FramePair[] = []
     /** Source timestamp of each frame pair, to find the encoder's score for it. */

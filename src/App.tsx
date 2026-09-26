@@ -6,7 +6,7 @@ import * as fmt from './lib/format'
 import type { Calibration, Job, QualityReport } from './lib/media'
 import type { Progress, SizePlan } from './lib/x264'
 import {
-  CODEC_LABEL, codecName, copiesFrames, deepFormat, keepsHdr, outputSize, type Engine, type OutputCodec, type Preset, type Probe,
+  audioFor, CODEC_LABEL, codecName, copiesFrames, deepFormat, forEngine, halvable, keepsHdr, outputSize, type Engine, type OutputCodec, type Preset, type Probe,
   type Settings,
 } from './lib/shared'
 
@@ -205,8 +205,9 @@ export default function App() {
 
   const key = settingsKey(settings)
 
-  const ensureCalibration = (probe: Probe, settings: Settings) => {
-    const key = settingsKey(settings)
+  const ensureCalibration = (probe: Probe, chosen: Settings) => {
+    const key = settingsKey(chosen)
+    const settings = forEngine(probe, chosen)
     const existing = calibrations.current.get(key)
     if (existing) return existing
     const controller = new AbortController()
@@ -303,7 +304,7 @@ export default function App() {
       const start = { crf: settled.crf, slope: settled.slope, points: settled.points,
         reuse: codec === 'avc' ? settled.reuse : undefined, fast: codec === 'avc' && settled.fast }
       const spec: HeadStart = { key, codec, progress: null, job: null as unknown as Job }
-      spec.job = engine.encode(probe, { ...settings, codec }, start, (p) => {
+      spec.job = engine.encode(probe, { ...forEngine(probe, settings), codec }, start, (p) => {
         spec.progress = p
         spec.watch?.(p)
       })
@@ -338,7 +339,8 @@ export default function App() {
     }
     // With the size target, x264 starts from the size plan's rate factor and steers from there while it encodes.
     // Without it there is nothing to plan, and the browser's encoders need their tuned bitrate up front.
-    const planned = usesX264(settings) && settings.sizeTarget && !adopted
+    const engine = forEngine(probe, settings)
+    const planned = usesX264(settings) && engine.sizeTarget && !adopted
     const waitFor = !adopted && (!usesX264(settings) || planned) ? ensureCalibration(probe, settings) : null
     if (waitFor) waitFor.needed = true
     setPhase({
@@ -361,7 +363,7 @@ export default function App() {
         run.job = adopted.job
         codec = adopted.codec
       } else if (usesX264(settings)) {
-        const engine = await x264()
+        const x264Engine = await x264()
         let plan: Calibration | undefined
         if (waitFor?.first && !waitFor.result) {
           const first = await waitFor.first.catch(() => undefined)
@@ -380,13 +382,13 @@ export default function App() {
         setPhase((p) => (p.kind === 'running' ? { ...p, status: 'Starting encoders…' } : p))
         // Auto without a size target has nothing to compare, and only an HDR video it keeps in 10 bits goes to AV1.
         codec = settings.autoCodec ? plan?.codec ?? (keepsHdr(probe) ? 'av1' : 'avc') : thoroughCodec(settings)
-        run.job = engine.encode(probe, { ...settings, codec },
+        run.job = x264Engine.encode(probe, { ...engine, codec },
           { crf: plan?.crf, slope: plan?.slope, points: plan?.points, reuse: codec === 'avc' ? plan?.reuse : undefined,
             fast: codec === 'avc' && plan?.fast }, onProgress)
       } else {
         const { bitrate } = await ensureCalibration(probe, settings).promise
         if (run.canceled) return
-        run.job = (await media()).compress(probe, settings, bitrate, onProgress)
+        run.job = (await media()).compress(probe, engine, bitrate, onProgress)
       }
       const { measureQuality } = await media()
       const { blob, scores } = await run.job.promise
@@ -778,8 +780,8 @@ function Ready(props: {
   const audioNote = () => {
     const audio = probe.audio
     if (!audio) return 'This video has no audio.'
-    const plan = audio.plan
-    if (copy || !settings.keepAudio || plan.kind === 'copy') return undefined
+    const plan = audioFor(probe, settings)
+    if (copy || !plan || plan.kind === 'copy') return undefined
     const name = audio.codec ? `${codecName(audio.codec)} audio` : 'this video’s audio'
     if (plan.kind === 'drop')
       return plan.reason === 'decode'
@@ -800,7 +802,10 @@ function Ready(props: {
     if (!deepFormat(probe.frame?.format)) return 'This is an HDR video in 8 bits. The copy stays HDR.'
     const codec = settings.autoCodec ? (keepsHdr(probe) ? 'av1' : null) : thoroughCodec(settings)
     if (codec === 'av1' && keepsHdr(probe)) return 'This is an HDR video. It stays HDR, as 10-bit AV1.'
-    if (codec === 'avc') return 'This is an HDR video. H.264 here is 8-bit, so smooth gradients may band; AV1 keeps it in 10 bits.'
+    if (codec === 'avc')
+      return keepsHdr(probe)
+        ? 'This is an HDR video. H.264 here is 8-bit, so smooth gradients may band; AV1 keeps it in 10 bits.'
+        : 'This is an HDR video. H.264 here is 8-bit, and this device can’t play 10-bit AV1, so smooth gradients may band.'
     return 'This is an HDR video. This device can’t play 10-bit AV1, so the copy is 8-bit and smooth gradients may band.'
   }
   const summary = [
@@ -812,7 +817,8 @@ function Ready(props: {
           : thoroughName(thoroughCodec(settings))
         : `Browser ${CODEC_LABEL[settings.codec]}`,
     copy || !settings.shortSide ? 'Original resolution' : `${settings.shortSide}p`,
-    !probe.audio ? 'No audio' : settings.keepAudio && probe.audio.plan.kind !== 'drop' ? 'Audio kept' : 'Audio removed',
+    // Repackaging copies the audio whatever the plan says Pare's own encoders could do with it.
+    !probe.audio ? 'No audio' : settings.keepAudio && (copy || audioFor(probe, settings)?.kind !== 'drop') ? 'Audio kept' : 'Audio removed',
   ].join(' · ')
 
   return (
@@ -902,6 +908,12 @@ function Ready(props: {
           </div>
         </details>
         {probe.hdr && !copy && <p className="note">{hdrNote()}</p>}
+        {settings.sizeTarget && !copy && !halvable(probe, settings) && (
+          <p className="note">
+            The audio takes up most of this file, so no video size makes it half as big. The video is compressed at the
+            quality you chose instead.
+          </p>
+        )}
       </div>
 
       <div className="action-bar">

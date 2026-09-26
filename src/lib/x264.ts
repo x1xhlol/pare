@@ -26,7 +26,11 @@ import vmafScript from './vmaf/vmaf.mjs?url'
 import vmafWasm from './vmaf/vmaf.wasm?url'
 import type { EncodedChunk, FrameStat, WorkerChunk, WorkerInit, WorkerMessage, WorkerSplit } from './encode-worker'
 import { av1Config, avcConfig } from './codec-config'
-import { copiesFrames, keepsHdr, outputSize, playsAv1, type Preset, type Probe, type Settings } from './shared'
+import { ownDownmix, stereoDownmix } from './downmix'
+import {
+  audioBytes, audioFor, copiesFrames, keepsHdr, outputSize, playsAv1, SIZE_AIM, SIZE_TARGET, VIDEO_FLOOR, type Preset, type Probe,
+  type Settings,
+} from './shared'
 
 type EncodingPreset = Exclude<Preset, 'copy'>
 
@@ -313,8 +317,9 @@ async function audioPackets(file: Blob) {
  * 1.3-1.9% off a 3-5 MB file's limit, which sent every small AV1 encode to a second pass.
  */
 function besidesVideo(probe: Probe, settings: Settings, frames: number, audio: { bytes: number; count: number }) {
-  const kept = settings.keepAudio && !!probe.audio && probe.audio.plan.kind !== 'drop'
-  const copied = kept && probe.audio!.plan.kind === 'copy'
+  const plan = audioFor(probe, settings)
+  const kept = !!plan && plan.kind !== 'drop'
+  const copied = plan?.kind === 'copy'
   const audioOut = !kept ? 0 : copied ? audio.bytes : audioBytes(probe, settings) * 1.1
   // AAC and Opus both make about 50 packets a second.
   const packets = !kept ? 0 : copied ? audio.count : Math.ceil(probe.duration * 50)
@@ -333,8 +338,16 @@ export function presetCrf(settings: Settings) {
 function outputColor(probe: Probe, settings: Settings): Color {
   if (!copiesFrames(probe)) return { primaries: 'bt709', transfer: 'bt709', matrix: 'bt709', fullRange: false }
   const c = probe.colorSpace
+  const depth = settings.codec === 'av1' && keepsHdr(probe) ? 10 : undefined
+  // Players show an untagged video with BT.709 colours when it's HD and BT.601 when it isn't. Resized across that line,
+  // the copy would be shown with the other, so it says which the source's are.
+  const { width, height } = outputSize(probe, settings.shortSide)
+  if (!c.primaries && !c.transfer && !c.matrix && (width !== probe.width || height !== probe.height)) {
+    const guess = probe.width > 1024 || probe.height > 576 ? 'bt709' : 'smpte170m'
+    return { primaries: guess, transfer: guess, matrix: guess, fullRange: !!c.fullRange, depth }
+  }
   return { primaries: c.primaries ?? undefined, transfer: c.transfer ?? undefined, matrix: c.matrix ?? undefined,
-    fullRange: !!c.fullRange, depth: settings.codec === 'av1' && keepsHdr(probe) ? 10 : undefined }
+    fullRange: !!c.fullRange, depth }
 }
 
 function encoderOptions(probe: Probe, settings: Settings, crf: number) {
@@ -661,15 +674,18 @@ async function mux(probe: Probe, settings: Settings, chunks: EncodedChunk[], siz
 
   const input = new Input({ source: new BlobSource(probe.file), formats: [MP4, QTFF, WEBM, MATROSKA] })
   try {
-    const plan = settings.keepAudio ? probe.audio?.plan : undefined
+    const plan = audioFor(probe, settings)
     const audioTrack = plan && plan.kind !== 'drop' ? await input.getPrimaryAudioTrack() : null
     const audioCodec = audioTrack ? await audioTrack.getCodec() : null
     const audioCopy = audioTrack && plan?.kind === 'copy' ? new EncodedAudioPacketSource(audioCodec!) : null
+    const channels = probe.audio?.channels ?? 2
     const audioEncode = audioTrack && plan?.kind === 'encode'
       ? new AudioSampleSource({
           codec: plan.codec,
           quality: new Quality({ bitrate: plan.bitrate }),
-          transform: { numberOfChannels: plan.channels, sampleRate: plan.sampleRate },
+          transform: plan.channels === 2 && ownDownmix(channels)
+            ? { sampleRate: plan.sampleRate, process: stereoDownmix(channels) }
+            : { numberOfChannels: plan.channels, sampleRate: plan.sampleRate },
         })
       : null
     if (audioCopy) output.addAudioTrack(audioCopy)
@@ -863,11 +879,6 @@ function localSlope(points: { crf: number; bytes: number }[], crf: number, total
   return Number.isFinite(slope) ? Math.min(-0.05, Math.max(-0.6, slope)) : fallback
 }
 
-function audioBytes(probe: Probe, settings: Settings) {
-  const plan = probe.audio?.plan
-  if (!settings.keepAudio || !plan || plan.kind === 'drop') return 0
-  return ((plan.kind === 'copy' ? probe.audio!.bitrate : plan.bitrate) * probe.duration) / 8
-}
 
 /** The rate factor an encode starts from, and the lowest it may go: the quality ceiling or the preset's own. */
 export function floorCrf(settings: Settings) {
@@ -933,7 +944,7 @@ export function encode(probe: Probe, settings: Settings, start: EncodeStart, onP
       if (canceled) throw new Canceled()
       const goal = videoGoal(probe, settings)
       const target = probe.file.size * SIZE_TARGET
-      let limit = Math.max(target - besidesVideo(probe, settings, times.length, sound), probe.file.size * 0.05)
+      const limit = Math.max(target - besidesVideo(probe, settings, times.length, sound), probe.file.size * VIDEO_FLOOR)
       // A steeper slope than measured keeps the budget from overreaching when it lowers the rate factor: near the
       // sizes it lands on, noisy footage grows much faster than the plan's two distant tests suggest.
       const budget = settings.sizeTarget
@@ -1025,6 +1036,7 @@ export function encode(probe: Probe, settings: Settings, start: EncodeStart, onP
       let total = encoded.reduce((t, c) => t + chunkBytes(c), 0)
       const fitTo = async (limit: number) => {
         for (let round = 0; budget && round < 3; round++) {
+          if (canceled) throw new Canceled()
           const over = total > limit
           if (!over && !(total < goal * UNDER_GOAL && crfs.some((c) => c > floor + 0.25))) break
           const mean = encoded.reduce((t, c) => t + crfs[c.index] * chunkBytes(c), 0) / total
@@ -1076,12 +1088,17 @@ export function encode(probe: Probe, settings: Settings, start: EncodeStart, onP
       // Chunks split off during the encode come last by index; the file needs them in time order.
       const inOrder = () => [...encoded].sort((a, b) => a.times[0] - b.times[0])
       let blob = await mux(probe, settings, inOrder(), size, turn)
-      // The allowance for everything but the video is an upper bound, so this shouldn't happen; if the file still came
-      // out over, the video makes up the difference.
-      if (budget && blob.size > target) {
+      // The allowance for everything but the video is an upper bound, so this shouldn't happen. If the file still came
+      // out over, the video makes up the difference, measured from what was actually muxed. When the audio and container
+      // alone leave the video less than the 5% floor, no video size keeps the promise, and the floor stands.
+      for (let again = 0; budget && blob.size > target && again < 2; again++) {
+        if (canceled) throw new Canceled()
+        const room = target - (blob.size - total)
+        if (room < probe.file.size * VIDEO_FLOOR) break
         console.warn(`[pare] ${blob.size - target} bytes over after muxing; encoding again`)
-        limit -= blob.size - target
-        await fitTo(limit)
+        const before = total
+        await fitTo(room)
+        if (total === before) break
         blob = await mux(probe, settings, inOrder(), size, turn)
       }
       pool.terminate()
@@ -1106,9 +1123,6 @@ export function encode(probe: Probe, settings: Settings, start: EncodeStart, onP
   return { promise, cancel }
 }
 
-/** The size target: at most half the original. Steering aims a little lower to absorb its error at the very end. */
-export const SIZE_TARGET = 0.5
-const SIZE_AIM = 0.47
 /** A first pass landing under this share of the goal is encoded again at a lower rate factor. */
 const UNDER_GOAL = 0.75
 /**
@@ -1201,7 +1215,7 @@ const AUTO_MARGIN = 1
 
 /** Video bytes the size target leaves once the audio is paid for. */
 function videoGoal(probe: Probe, settings: Settings) {
-  return Math.max(probe.file.size * SIZE_AIM - audioBytes(probe, settings), probe.file.size * 0.05)
+  return Math.max(probe.file.size * SIZE_AIM - audioBytes(probe, settings), probe.file.size * VIDEO_FLOOR)
 }
 
 export type SizePlan = {
