@@ -473,9 +473,10 @@ From the whole-clip sweeps above, this is the file size each encoder needs to ge
 | tree | 99% | 134% | 50% | 107% |
 | park | over the tested range | 100% | 84% | 99% |
 | ducks (rippling water) | 124% | 142% | 171% | 204% |
+| noisy (sensor noise) | 161% | 198% | 177% | 291% |
 
-So half the size at about 1:1 is out of reach for park and ducks with any encoder here: the source's noise is the
-detail, and it needs more bits than the source already spends. On town and tree it's within reach, but only with AV1,
+So half the size at about 1:1 is out of reach for park, ducks and noisy with any encoder here: the source's noise is
+the detail, and it needs more bits than the source already spends (noisy's row uses the current x264 settings). On town and tree it's within reach, but only with AV1,
 which is why Auto's shortcut changed: a compression started before AV1's test ends waits for it when H.264 is predicted
 under 93 and its size falls steeply near the target, as it does on town and tree. Town went from 90.3 to 94.0 at the
 same size, its worst frame from 84.2 to 90.6; tree from 88.2 to 92.3.

@@ -64,9 +64,13 @@ half the size can get"), against the 50% budget:
 | tree | 99% | 134% | 50% | 107% |
 | park | over the tested range | 100% | 84% | 99% |
 | ducks | 124% | 142% | 171% | 204% |
+| noisy | 161% | 198% | 177% | 291% |
 
-Park and ducks can't be halved at about 1:1 by x264 or SVT-AV1: their noise is the detail, and it takes more bits than
-the source spends. Town and tree can, with AV1, and that's where Auto sends them.
+Park, ducks and noisy can't be halved at about 1:1 by x264 or SVT-AV1: their noise is the detail, and it takes more
+bits than the source spends (noisy would need 1.6 to 2.9 times its own size). At half the size Pare's AV1 gets noisy to
+87.3, about what either encoder can do there. Town and tree can be halved at about 1:1, with AV1, and that's where
+Auto sends them. (Noisy's row uses Pare's current x264 settings; the others its previous ones, which have the same
+quality per byte.)
 
 ## Speed in context
 
