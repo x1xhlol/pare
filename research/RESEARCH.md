@@ -1057,8 +1057,25 @@ the first pass leaves under the limit (typically 3-4% of the source) went to the
 median chunk's 1 − SSIM, encoded again up to 3 finer. On the phone clips it picked two tree chunks, spent the room
 (46.5% → 48.8% of the source) and 32 s, and the file got slightly worse (VMAF NEG 87.94 → 87.76, worst 1% of frames
 79.19 → 78.37). SSIM ranks the chunks differently from VMAF NEG: tree's fine detail costs SSIM, ducks' water costs
-VMAF. On Big Buck Bunny, town and ducks the chunks' SSIM was too even for it to start. Not shipped either; the next
-thing to try would be scoring a few frames of every finished chunk with VMAF, which the workers can do.
+VMAF. On Big Buck Bunny, town and ducks the chunks' SSIM was too even for it to start.
+
+With VMAF instead (each worker scores four frames of every chunk it finishes, as the plan does for its windows) the
+fill found the right parts: the phone clips' ducks scene, and in ducks itself the four chunks where the water splashes
+(66-69 against 77 elsewhere). Old build against new, one after the other:
+
+| Video | Version | Mean VMAF NEG | Worst 1% | Worst frame | Size | Time |
+| --- | --- | --- | --- | --- | --- | --- |
+| Phone clips | without | 87.89 | 79.40 | 71.86 | 46.3% | 77 s |
+| | fill | 88.38 | 79.77 | 77.13 | 48.2% | 98 s |
+| | fill, at most a third of the video | 88.33 | 80.21 | 76.31 | 48.2% | 93 s |
+| Ducks | without | 71.06 | 58.66 | 58.12 | 41.6% | 87-97 s |
+| | fill | 73.15 | 63.12 | 63.11 | 47.2% | 136 s |
+| | fill, at most a third of the video | 72.60 | 58.85 | 58.12 | 46.0% | 140 s |
+
+Where nothing needed filling (town, Jellyfish, Big Buck Bunny, the HLG clip) the scoring still cost time. The worst
+moments get about 5 points better, the mean 0.4-2, for 20-45% more time where it runs: not shipped as the default,
+since Pare's time on hard footage is already its weak side. The measurement is the right one; what's missing is a
+cheaper way to act on it.
 
 ## End to end in the browser
 
