@@ -612,6 +612,11 @@ smaller (13.14 → 12.32 MB) for 0.06 less VMAF NEG (95.31 → 95.25). Also trie
 filtering off (+1.8% to +6.0%, worse), and a smaller first mini-GOP after the keyframe (`--startup-mg-size 3`: −2.9%
 on town, +0.2% on Big Buck Bunny, and no better on top of the keyframe offset).
 
+AV1's size estimate still lands 10-20% either side on some clips (two test windows sample less of the video than
+x264's four). Tree's first pass came to 78% of the size goal, and the rule then was to encode again at a lower rate
+factor under 80%: that bought VMAF NEG 91.94 → 92.46 for 54.8 s instead of 38.3. The second pass now runs only under
+75%.
+
 ## Every encoder from the start
 
 The chunk planner looks for the smallest per-chunk cost that covers the video in as many chunks as there are

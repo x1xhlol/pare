@@ -967,11 +967,12 @@ export function encode(probe: Probe, settings: Settings, start: EncodeStart, onP
       const passes = [chunks.map((c) => crfs[c.index].toFixed(1)).join(' ')]
 
       // The size limit is a promise, so check the real total and encode chunks again until it holds. A total far
-      // under the goal means the plan was pessimistic, and the room is spent on quality instead.
+      // under the goal means the plan was pessimistic, and the room is spent on quality instead. Far means under
+      // UNDER_GOAL: at 78% of it, tree's AV1 encode went again for +0.5 VMAF NEG in 40% more time.
       let total = encoded.reduce((t, c) => t + chunkBytes(c), 0)
       for (let round = 0; budget && round < 3; round++) {
         const over = total > limit
-        if (!over && !(total < goal * 0.8 && crfs.some((c) => c > floor + 0.25))) break
+        if (!over && !(total < goal * UNDER_GOAL && crfs.some((c) => c > floor + 0.25))) break
         const mean = encoded.reduce((t, c) => t + crfs[c.index] * chunkBytes(c), 0) / total
         const local = localSlope(start.points ?? [], mean, total, over, slope)
         // A few chunks to redo would leave most encoders idle, and AV1 has no threads to give them: cut each chunk
@@ -1038,6 +1039,8 @@ export function encode(probe: Probe, settings: Settings, start: EncodeStart, onP
 /** The size target: at most half the original. Steering aims a little lower to absorb its error at the very end. */
 export const SIZE_TARGET = 0.5
 const SIZE_AIM = 0.47
+/** A first pass landing under this share of the goal is encoded again at a lower rate factor. */
+const UNDER_GOAL = 0.75
 /** Frames per test window: enough for x264's rate control to settle after the window's opening keyframe. */
 const WINDOW_FRAMES = 24
 /** Test-window estimates came in 3-11% under the finished files (median ~7%); scale them to match. */

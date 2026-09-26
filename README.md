@@ -40,7 +40,7 @@ Pare now runs its own build of x264:
   ready 0.1 s after the click instead of 16.9 s: it had finished while the settings were on screen.
 - **Room to spare goes to speed.** When a high-bitrate source would fit in half its size even at x264's `superfast`
   preset, which does about half the work, Pare test-encodes that first and uses it if its VMAF NEG is still 95 or
-  more. Camera footage went from 28.7 s to 10.0 s at the same VMAF NEG (97.8), in a file 69% smaller instead of 79%.
+  more. Camera footage went from 29.5 s to 10.2 s at the same VMAF NEG (97.8), in a file 69% smaller instead of 81%.
 - **A size promise that gets checked.** Short test encodes estimate how size falls as quality drops. Each chunk gets
   its quality setting from what the finished chunks actually cost, and the final file is weighed. If it isn't at
   least 50% smaller, the busiest chunks are encoded again.
@@ -72,10 +72,10 @@ with native libvmaf over every frame; around 93 to 95 a re-encode stops looking 
 
 | Video | Original | Pare | Time | VMAF NEG (worst frame) |
 | --- | --- | --- | --- | --- |
-| Camera footage, 1080p30, 10 s | 77.9 MB | 24.4 MB (−69%) | 10 s | 97.8 (95.6) |
-| Screen recording, 1080p30, 8 s | 10.8 MB | 4.1 MB (−62%) | 9 s | 99.0 (95.6) |
-| Big Buck Bunny, 1080p30, 10 s | 30.7 MB | 14.0 MB (−54%) | 27 s | 92.8 (89.4) |
-| Phone clips, 1080p50, 20 s | 65.5 MB | 30.1 MB (−54%) | 42 s | 87.9 (71.9) |
+| Camera footage, 1080p30, 10 s | 77.9 MB | 23.9 MB (−69%) | 10 s | 97.8 (95.6) |
+| Screen recording, 1080p30, 8 s | 10.8 MB | 3.5 MB (−68%) | 8 s | 99.0 (95.6) |
+| Big Buck Bunny, 1080p30, 10 s | 30.7 MB | 13.4 MB (−56%) | 25 s | 93.1 (88.9) |
+| Phone clips, 1080p50, 20 s | 65.5 MB | 30.2 MB (−54%) | 42 s | 87.9 (71.9) |
 | Phone clips, 1080p50, 2 min | 392 MB | 188 MB (−52%) | 3 min 16 s | 88.4 (67.1) |
 
 Twelve videos, their before and after, and the noisy clips where AV1 takes over are in
