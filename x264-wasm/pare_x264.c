@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <emscripten/emscripten.h>
 #include "x264.h"
+#include "pare_rgb.h"
 #include "pare_scale.h"
 
 typedef struct {
@@ -129,27 +130,11 @@ EMSCRIPTEN_KEEPALIVE void enc_close(Encoder *e) {
   free(e);
 }
 
-// RGBA/RGBX (or BGRA/BGRX when bgr != 0) to the NV12 input planes, BT.709 limited range.
+// RGBA/RGBX (or BGRA/BGRX when bgr != 0) to the NV12 input planes, BT.709 limited range (pare_rgb.h).
 EMSCRIPTEN_KEEPALIVE void enc_import_rgba(Encoder *e, const uint8_t *rgba, int stride, int width, int height, int bgr) {
-  const int ri = bgr ? 2 : 0, bi = bgr ? 0 : 2;
-  uint8_t *py = e->in.img.plane[0], *puv = e->in.img.plane[1];
-  const int sy = e->in.img.i_stride[0], suv = e->in.img.i_stride[1];
-  for (int y = 0; y < height; y++) {
-    const uint8_t *s = rgba + y * stride;
-    for (int x = 0; x < width; x++, s += 4)
-      py[y * sy + x] = (uint8_t)(((47 * s[ri] + 157 * s[1] + 16 * s[bi] + 128) >> 8) + 16);
-  }
-  for (int y = 0; y < height / 2; y++) {
-    const uint8_t *a = rgba + 2 * y * stride, *b = a + stride;
-    uint8_t *d = puv + y * suv;
-    for (int x = 0; x < width / 2; x++, a += 8, b += 8) {
-      int r = a[ri] + a[ri + 4] + b[ri] + b[ri + 4];
-      int g = a[1] + a[5] + b[1] + b[5];
-      int bl = a[bi] + a[bi + 4] + b[bi] + b[bi + 4];
-      d[2 * x] = (uint8_t)(((-26 * r - 86 * g + 112 * bl + 512) >> 10) + 128);
-      d[2 * x + 1] = (uint8_t)(((112 * r - 102 * g - 10 * bl + 512) >> 10) + 128);
-    }
-  }
+  uint8_t *uv = e->in.img.plane[1];
+  rgb_to_yuv(rgba, stride, width, height, bgr, e->in.img.plane[0], e->in.img.i_stride[0], uv, uv + 1,
+             e->in.img.i_stride[1], 2);
 }
 
 // 16-bit planar 4:2:0 (10- or 12-bit samples) to the NV12 input planes, rounding to 8 bits.

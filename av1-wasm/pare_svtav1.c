@@ -14,6 +14,7 @@
 #include <string.h>
 #include <emscripten/emscripten.h>
 #include "EbSvtAv1Enc.h"
+#include "../x264-wasm/pare_rgb.h"
 #include "../x264-wasm/pare_scale.h"
 
 #define CSP_I420 0x0002
@@ -204,26 +205,9 @@ EMSCRIPTEN_KEEPALIVE void enc_close(Encoder *e) {
 static void widen(Encoder *e);
 
 EMSCRIPTEN_KEEPALIVE void enc_import_rgba(Encoder *e, const uint8_t *rgba, int stride, int width, int height, int bgr) {
-  const int ri = bgr ? 2 : 0, bi = bgr ? 0 : 2;
-  for (int y = 0; y < height; y++) {
-    const uint8_t *s = rgba + y * stride;
-    for (int x = 0; x < width; x++, s += 4)
-      e->y[y * e->width + x] = (uint8_t)(((47 * s[ri] + 157 * s[1] + 16 * s[bi] + 128) >> 8) + 16);
-  }
-  uint8_t *uvp = e->csp == CSP_NV12 ? e->uv : NULL;
   const int cw = (e->width + 1) / 2;
-  for (int y = 0; y < height / 2; y++) {
-    const uint8_t *a = rgba + 2 * y * stride, *b = a + stride;
-    for (int x = 0; x < width / 2; x++, a += 8, b += 8) {
-      int r = a[ri] + a[ri + 4] + b[ri] + b[ri + 4];
-      int g = a[1] + a[5] + b[1] + b[5];
-      int bl = a[bi] + a[bi + 4] + b[bi] + b[bi + 4];
-      uint8_t cb = (uint8_t)(((-26 * r - 86 * g + 112 * bl + 512) >> 10) + 128);
-      uint8_t cr = (uint8_t)(((112 * r - 102 * g - 10 * bl + 512) >> 10) + 128);
-      if (uvp) uvp[y * 2 * cw + 2 * x] = cb, uvp[y * 2 * cw + 2 * x + 1] = cr;
-      else e->u[y * cw + x] = cb, e->v[y * cw + x] = cr;
-    }
-  }
+  if (e->csp == CSP_NV12) rgb_to_yuv(rgba, stride, width, height, bgr, e->y, e->width, e->uv, e->uv + 1, 2 * cw, 2);
+  else rgb_to_yuv(rgba, stride, width, height, bgr, e->y, e->width, e->u, e->v, cw, 1);
   if (e->bytes == 2) widen(e);
 }
 
