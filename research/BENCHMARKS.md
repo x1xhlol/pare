@@ -71,6 +71,29 @@ its decoders work through many frames before their chunks start. The faster sett
 same size: x264's `veryfast` needs 40% more bits for the same VMAF NEG, and SVT-AV1's preset 9 needs 19% more for
 0.67 times the CPU time (`research/RESEARCH.md`).
 
+## Hard footage: AV1 or a faster H.264
+
+On the six clips Auto sends to AV1, the only faster path is H.264. Forced to H.264 (format setting), same build:
+
+| Video | H.264: time, VMAF NEG, size | Auto (AV1): time, VMAF NEG, size |
+| --- | --- | --- |
+| town, 5 s | 21.3 s, 91.0, −58% | 29.3 s, 93.9, −56% |
+| tree, 5 s | 21.3 s, 88.8, −61% | 30.0 s, 92.1, −61% |
+| noisy, 5 s | 22.4 s, 80.6, −58% | 35.0 s, 87.5, −57% |
+| Jellyfish, 10 s | 31.0 s, 78.5, −32% (misses half) | 37.5 s, 82.9, −53% |
+| park, 5 s | 27.5 s, 79.1, −53% | 36.9 s, 84.0, −53% |
+| ducks, 5 s | 29.4 s, 65.6, −54% | 35.9 s, 70.7, −59% |
+
+H.264 saves 6 to 13 s there and gives up 3.0 to 6.9 points, and on Jellyfish it can't reach half the size at all.
+AV1's own encode (14-18 s for these clips) is the floor: its preset 9 takes 0.75-0.86x the CPU time for 1-17% more
+bits depending on the footage (noisy +9.3%), and its target-bitrate mode overshot by 59% on 32-frame chunks.
+
+## On a smaller machine
+
+The same build with Chrome limited to half this machine (2 cores, 4 threads, `taskset` and 4 reported cores): town
+took 54.2 s instead of 29.3 (1.85x) and Big Buck Bunny 46.4 s instead of 23.9 (1.94x). Pare's time scales almost
+linearly with cores, so these times are this machine's: a 4-core, 8-thread Xeon Platinum 8259CL at 2.5 GHz from 2019.
+
 ## Starting before Compress
 
 Once the size plan and the format are settled, Pare starts compressing while the settings are still on screen.
