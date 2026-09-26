@@ -23,7 +23,7 @@ What Pare does instead:
   and whole encodes come out byte-identical to the plain C build. Encoding is 2.0–2.3× faster per core, and the
   result runs at 54% of native x264 with the same settings.
 - **The browser decodes.** WebCodecs decodes the source, in hardware when there's a GPU, and frames are copied
-  straight into x264's input planes. The encoder module is 824 KB; ffmpeg.wasm is 32 MB. Each chunk's decoder starts
+  straight into x264's input planes. The encoder module is 832 KB; ffmpeg.wasm is 32 MB. Each chunk's decoder starts
   at the source keyframe before the chunk, which can be hundreds of frames early in a file with a keyframe every 250.
   H.264 frames that nothing refers to are skipped on the way, about half of them when the source uses B-frames.
 - **Every core busy to the end.** The video is split into chunks of equal cost, counting the frames each decoder has
@@ -36,7 +36,8 @@ What Pare does instead:
   5-second clip into 8 chunks costs town 42% and tree 25% more bits than one encode at the same quality (park only
   6%). Short videos now get fewer, longer x264 chunks with more threads each, and that turned out faster too: Big Buck
   Bunny encodes sooner and scores 93.1 instead of 92.8, in a smaller file. AV1 can't take more threads, so its chunk
-  keyframes are made coarser instead, which saves 1.9–6.1% of the bits.
+  keyframes are made coarser instead, which saves 1.9–6.1% of the bits, and SVT-AV1's own keyframe every 160 frames
+  is gone from longer chunks, which saved 8–12% on 240-frame chunks at 30 fps.
 - **Resizing without a canvas.** Taking a video down to 720p used to mean drawing every frame on an RGB canvas, about
   170 ms a frame from 4K on the test machine. Pare now scales the decoded planes itself, with a bicubic filter in
   WebAssembly SIMD, straight into the encoder: a 4K phone clip went from 35.8 s to 15.8 s and from 81.1 to 85.9 VMAF
