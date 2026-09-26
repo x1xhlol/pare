@@ -454,6 +454,13 @@ The three that ship give the same quality per byte on average (animation +6.2%, 
 clips even or better) for two thirds of the CPU time. In the WebAssembly build the partition change alone took 28% off
 (80 frames of park: 35.4 → 25.7 s of CPU).
 
+SVT-AV1 got the same treatment (`research/av1_sweep.py`, preset 8, CRF 22 to 40). Natively, some switches look
+almost free: `--fast-decode 1` took 12% off the CPU time for +0.2% BD-rate, and turning off motion-field motion
+vectors 12% for +0.7%; loop restoration off saved 12% for +6.1%. In the WebAssembly build none of them moved the CPU
+time beyond noise (40 frames of park: 26.4-27.7 s against 27.0-28.1 s), and two produced byte-identical files, since
+preset 8 already sets them that way at 1080p. The native savings come from paths that are cheap in AVX-512 and not in
+WebAssembly, so AV1 stays at plain preset 8. Faster presets were ruled out earlier (preset 10: +74% bits).
+
 ## How close to 1:1 half the size can get
 
 VMAF NEG 93 to 95 is about where a re-encode stops looking different from its source at normal viewing distance.

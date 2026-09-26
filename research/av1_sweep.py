@@ -22,6 +22,8 @@ CONFIGS = {
     'no dynamic gop': ['--enable-dg', '0'],
     'no keyframe tf': ['--enable-kf-tf', '0'],
     '4 hierarchy levels': ['--hierarchical-levels', '4'],
+    'fast-decode 2': ['--fast-decode', '2'],
+    'fast-decode 1, no mfmv': ['--fast-decode', '1', '--enable-mfmv', '0'],
 }
 
 
