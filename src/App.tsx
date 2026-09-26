@@ -64,7 +64,7 @@ const PRESETS: { value: Preset; label: string; hint: string }[] = [
     hint: 'Looks the same as the original at any normal viewing size. Every result is checked frame by frame.',
   },
   { value: 'high', label: 'High', hint: 'Smaller. Differences only show up when you pause and zoom in.' },
-  { value: 'compact', label: 'Compact', hint: 'Smallest. Fine texture softens, which is fine for chats and uploads.' },
+  { value: 'compact', label: 'Compact', hint: 'Smallest. Fine texture softens, which suits chats and uploads.' },
   {
     value: 'copy',
     label: 'Exact copy',
@@ -570,7 +570,7 @@ function Benchmarks() {
   return (
     <section className="section" aria-labelledby="benchmarks">
       <div className="section-head">
-        <h2 id="benchmarks">Measured, not promised</h2>
+        <h2 id="benchmarks">Measured on four videos</h2>
         <p className="note">{BENCHMARK_SETUP}</p>
       </div>
       <div className="table-scroll">
@@ -630,16 +630,16 @@ const STEPS = [
     body: 'x264’s speed comes from hand-written x86 and ARM assembly, which a browser can’t run. Pare replaces it with about 1,500 lines of WebAssembly SIMD, bit-exact with x264’s own code and about twice as fast.',
   },
   {
-    title: 'One encoder per core',
-    body: 'The video is split into chunks of equal work and each core encodes its own, starting while you’re still looking at the settings. A chunk that turns out slow hands its last frames to whichever core will be free first.',
+    title: 'Every core busy',
+    body: 'The video is split into chunks of equal work, one per encoder, and the encoding starts while you’re still looking at the settings. Short videos get fewer, longer chunks with more threads each, since every chunk begins with a costly keyframe. A chunk that turns out slow hands its last frames to whichever encoder will be free first.',
   },
   {
     title: 'Held to half the size',
-    body: 'Short test encodes measure how size falls as quality drops, and each chunk gets its setting from what the finished ones really cost. The file is weighed at the end, and if it isn’t at least 50% smaller, the busiest chunks are encoded again. Room to spare goes to speed: an x264 preset with half the work, kept only if VMAF still scores it visually identical.',
+    body: 'Short test encodes measure how size falls as quality drops, and each chunk gets its setting from what the finished ones really cost. The file is weighed at the end, and if it isn’t at least 50% smaller, the busiest chunks are encoded again. A video with room to spare gets an x264 preset that does half the work, kept only if VMAF still scores it visually identical.',
   },
   {
     title: 'H.264 or AV1, by measuring',
-    body: 'Netflix’s VMAF, compiled to WebAssembly too, scores test encodes in both formats. AV1 is used when it looks better at the target size and your device plays it; otherwise H.264, which is faster and plays everywhere.',
+    body: 'Netflix’s VMAF, compiled to WebAssembly too, scores the test encodes. AV1 is used when it looks better at the target size and your device plays it, or when H.264’s test already shows noise it can’t keep. Otherwise it’s H.264, which is faster and plays everywhere.',
   },
   {
     title: 'Checked frame by frame',
@@ -894,7 +894,7 @@ function Ready(props: {
               : !result && usesX264(settings) && settings.autoCodec && settings.sizeTarget && !(tuning && 'error' in tuning)
               ? 'Test-encoding to pick the format'
               : result?.fast
-              ? 'Fits easily, so it encodes at top speed'
+              ? 'Fits easily, so it uses a faster preset'
               : result?.fitted === false
               ? 'Highest quality already fits in half the size'
               : result?.fitted

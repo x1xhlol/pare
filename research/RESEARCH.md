@@ -1,6 +1,8 @@
-# Faster, better x264 in the browser
+# Pare: research notes
 
-Goal: keep Pare's output sizes, raise quality, and cut encode time. Everything runs client-side.
+What was tried to make Pare's files look better and come out faster, in the order it happened, with the measurements
+behind each decision. Everything here runs in the browser. Later sections sometimes overturn earlier ones; where that
+happens, the earlier section says so.
 
 ## Where the time went
 
@@ -28,12 +30,12 @@ averaging, the 6-tap half-pel filter, chroma MC, lookahead downscaling, NV12 (de
 - Every kernel passes x264's `checkasm` against the C reference (patched with a WebAssembly timer), and full
   encodes are byte-identical to the scalar build at every preset tested.
 
-Result: **2.0–2.3× faster encoding per core**, identical output.
+Encoding got 2.0–2.3× faster per core, with identical output.
 
 **A new pipeline** (`src/lib/x264.ts`, `src/lib/encode-worker.ts`): decoding moves to WebCodecs (usually hardware)
 inside each worker, frames are copied straight into x264's input planes (NV12/I420, no conversion), one worker per
 core within a memory budget, frame-exact chunks stitched at source timestamps, audio copied or transcoded with
-Mediabunny. The encoder module is 821 KB (vs. 32 MB for ffmpeg.wasm), compiled once and shared by all workers.
+Mediabunny. The encoder module is 824 KB (vs. 32 MB for ffmpeg.wasm), compiled once and shared by all workers.
 
 ## Quality at equal size
 
@@ -55,12 +57,13 @@ equal quality, using monotone (PCHIP) interpolation because VMAF saturates near 
 | faster + rc-lookahead 40 | −31.6% | −29.2% | −18.4% | −18.5% |
 | faster + ref 3 | −30.5% | −28.3% | −18.8% | −18.2% |
 | faster + weightp 2 | −30.1% | −28.0% | −18.5% | −18.0% |
-| **faster + lookahead 40 + ref 3 + weightp 2 (shipped)** | **−32.3%** | **−29.7%** | **−18.8%** | **−19.2%** |
+| **faster + lookahead 40 + ref 3 + weightp 2 (shipped then)** | **−32.3%** | **−29.7%** | **−18.8%** | **−19.2%** |
 | slow | −39.1% | −35.4% | −17.4% | −21.8% |
 | faster + hqdn3d temporal denoise | −28.2% | −26.2% | −12.4% | −16.1% |
 
 `faster` gets most of `medium`'s gain at about half its cost; `fast` is no better than `faster` and slower. The film
-and grain tunes only win on the metric that rewards texture, and aq-mode 3 loses outright.
+and grain tunes only win on the metric that rewards texture, and aq-mode 3 loses outright. (The shipped setting
+changed again later, for speed: see "A third less work for x264".)
 
 CRFs were then recalibrated so `faster` lands on the file sizes `veryfast` produced (CRF 18/22/26 → 18.3/22.4/26.4).
 At those sizes VMAF NEG rises on every clip, by 1–5.5 points (e.g. ducks 93.4 → 96.6 at the visually lossless level).
@@ -72,7 +75,7 @@ longer lookahead raises memory to ~400 MB per 1080p encoder, so it is only used 
 
 hqdn3d (ported to WebAssembly, bit-exact with FFmpeg's filter) was tested as an "auto-enhance" step. At a fixed file
 size it changed nothing measurable, against either the noisy source or, on a clip with synthetic sensor noise, the
-clean original: once bits are constrained, x264's quantizer already discards the noise. Over the corpus it lowered
+clean original. Once bits are constrained, x264's quantizer already discards the noise. Over the corpus it lowered
 efficiency slightly (above). It is not used.
 
 ## At least 50% smaller
@@ -81,7 +84,8 @@ A fixed "visually lossless" rate factor has no size discipline: on a noisy 25 Mb
 comes out 63% *larger*. So with the size target on, Pare treats "at least 50% smaller" as a promise and checks it.
 
 **Plan.** While the settings screen is open, 4 windows of 24 frames are encoded at the quality ceiling (CRF 15) and at
-CRF 25, on half the cores each. Windows start on source keyframes, so no decoder works through frames it won't use.
+CRF 25, on half the cores each. Windows start on a source keyframe when one is close, so decoders work through few
+frames they won't use.
 Keyframes and scene cuts are priced separately, and log size is interpolated in the rate factor to hit 47% of the
 original. If CRF 15 already fits, that's the answer.
 
@@ -129,22 +133,26 @@ short clips pay for it. Native x264, same settings, same CRF, the whole clip vs.
 | park (5 s) | +1.7% | +3.9% |
 | screen recording (8 s) | +10% | +45% |
 
+That's size at the same rate factor, and it undersold the problem. Measured at equal quality, short chunks cost far
+more (up to 42% on town for 32-frame chunks), which only came out much later: see "Cheaper keyframes for AV1's
+chunks" and "Fewer, longer x264 chunks for short videos".
+
 ## Keeping every encoder busy
 
 Every encoder waits for the slowest chunk, and the chunks weren't even. On the 20-second phone clip the encode's
 wall time was 36% longer than the average chunk's working time with AV1, and 18% longer with x264. Three changes
 brought that to 6% and 5%.
 
-**Chunks of equal cost, not chunks that start on keyframes.** Boundaries used to move to the nearest source keyframe
-within a third of a chunk, so each decoder started exactly on its chunk's first frame. Phones write a keyframe every
-50 frames, and the phone clip came out as 100- and 150-frame chunks for 8 encoders. Now every chunk costs the same,
-counting its frames plus the frames its decoder has to work through from the previous source keyframe, at a tenth of
-a frame each (30 ms to decode against about 310 ms to encode with every core busy; `decodeShare` in the codec
-profiles). A binary search finds the smallest cost that covers the video, and each chunk reaches as far as that cost
-allows. That greedy fill is optimal here, because moving a frame into a chunk costs a whole frame, while starting the
-next chunk later costs at most a tenth of one in decoding. Big Buck Bunny, with a keyframe every 250 frames, gains
-the other way. Its later chunks spent up to 8 s decoding frames they never encoded, and now they get fewer frames to
-make up for it.
+**Chunks of equal cost.** Boundaries used to move to the nearest source keyframe within a third of a chunk, so each
+decoder started exactly on its chunk's first frame. Phones write a keyframe every 50 frames, and the phone clip came
+out as 100- and 150-frame chunks for 8 encoders. Now every chunk costs the same, counting its frames plus the frames
+its decoder has to work through from the previous source keyframe, at a tenth of a frame each (30 ms to decode against
+about 310 ms to encode with every core busy; `decodeShare` in the codec profiles). The planner finds the smallest cost
+that covers the video, and each chunk reaches as far as that cost allows. (It bisected for that cost until a bug
+turned up: see "Every encoder from the start".) That greedy fill is optimal here, because moving a frame into a chunk
+costs a whole frame, while starting the next chunk later costs at most a tenth of one in decoding. Big Buck Bunny,
+with a keyframe every 250 frames, gains the other way. Its later chunks spent up to 8 s decoding frames they never
+encoded, and now they get fewer frames to make up for it.
 
 **Cutting chunks that will finish late.** Equal cost on paper isn't equal time. At one rate factor, busy footage took
 up to 1.5× longer per frame than calm footage: 38 s against 58 s for two 124-frame AV1 chunks of the phone clip.
@@ -161,7 +169,8 @@ Pare cuts only when it saves at least a second.
 **Refits in pieces.** When the first pass misses the size limit, the biggest chunks are encoded again. x264 gives
 them the idle cores as threads, but SVT-AV1 runs one thread per encoder, so a two-chunk refit used 2 of 7 encoders
 and took as long as the first pass. Refit chunks are now cut into pieces of at least 30 frames, so every encoder
-works, and the refit budgets for the extra keyframes. Shorter pieces were slower. At a high-quality rate factor an
+works, and the refit budgets for the extra keyframes. Shorter pieces were slower here (the minimum later came down
+to 20 frames for a different case: see "Deciding on AV1 from H.264's plan"). At a high-quality rate factor an
 AV1 keyframe costs about 250 KB, and budgeting for four more of them pulled a third chunk into the refit. On a
 10-second phone clip with PCM audio, AV1 went from 50 s to 41 s.
 
@@ -193,7 +202,7 @@ x264's psychovisual tuning keeps. None of SVT-AV1's tuning switches fixed ducks 
 variance boost: +31% to +40%). SVT-AV1 had only been compiled to WebAssembly as plain C before (its own merge
 request !2571 notes the "lack of simd"). `av1-wasm/` builds it with SIMD:
 
-- **Translate, don't port.** SVT-AV1 writes its speed-critical code as C intrinsics: 108 files of SSE2 to AVX2 and
+- **Translate the intrinsics.** SVT-AV1 writes its speed-critical code as C intrinsics: 108 files of SSE2 to AVX2 and
   63 of Arm Neon. Emscripten translates x86 intrinsics to WebAssembly SIMD (AVX2 as pairs of 128-bit operations), and
   its `arm_neon.h` is SIMDe, which does the same for Neon. Every one of those 171 files compiles; the only exception
   is a CRC32 hash with no WebAssembly instruction, which keeps its C version.
@@ -209,7 +218,7 @@ request !2571 notes the "lack of simd"). `av1-wasm/` builds it with SIMD:
   `av1-wasm/include/` replaces both with SIMD versions, checked against the originals on a million random inputs
   and 1.6× and 1.7× faster on their own. A version of `_mm_sad_epu8` with fewer WebAssembly instructions (pairwise
   widening adds) turned out 18% slower, since V8 lowers those adds to several x86 instructions, so it was dropped.
-  The two that help are being offered to Emscripten.
+  The two that help could go upstream to Emscripten; they haven't been submitted.
 - **Write WebAssembly kernels where emulation still loses.** Full-search SAD (hierarchical motion estimation) and the
   8x8/16x16 all-position SAD were 3.4% and 2.0% of native encode time but 20% and 8% in WebAssembly. Both are
   rewritten around WebAssembly's own strengths (eight shifted loads per source chunk, saturating subtractions,
@@ -274,13 +283,14 @@ On the 4-core, 8-thread test machine, the same 240 frames split different ways:
 | 4 encoders × 2 threads | 18.4 fps | 24.43 MB |
 | 2 encoders × 4 threads | 17.7 fps | 24.07 MB |
 
-Fewer chunks compress a little better (fewer keyframes) but run slower, so there's still one encoder per core. What
-does pay is giving each of those encoders two threads anyway, on the same 8 hardware threads: the 20-second mix clip
-encodes in 41.1 s instead of 47.0 s (13% faster), with the same size and quality, and 3 or 4 threads per encoder add
-nothing more. With one thread, a core sits idle whenever its worker waits for the decoder or copies a frame in; the
-second thread keeps x264 busy through those gaps. Beyond that, threads take cores the 8 encoders memory allows can't,
-and refits, which usually redo fewer chunks than there are cores (the phone clip's one-chunk refit went from 18 s on
-one core to 7 s on four).
+Fewer chunks compress a little better (fewer keyframes) but ran slower here, so Pare kept one encoder per core. (With
+two threads per encoder and videos under 500 frames, that later turned around: see "Fewer, longer x264 chunks for
+short videos".) What does pay is giving each of those encoders two threads anyway, on the same 8 hardware threads: the
+20-second mix clip encodes in 41.1 s instead of 47.0 s (13% faster), with the same size and quality, and 3 or 4
+threads per encoder add nothing more. With one thread, a core sits idle whenever its worker waits for the decoder or
+copies a frame in; the second thread keeps x264 busy through those gaps. Beyond that, threads take cores the 8
+encoders memory allows can't, and refits, which usually redo fewer chunks than there are cores (the phone clip's
+one-chunk refit went from 18 s on one core to 7 s on four).
 
 One stream with no chunks at all would need size control without chunks. x264's one-pass average bitrate mode was
 tested on the mix clip, whose four scenes differ a lot: it spent early (VMAF NEG by scene: 92.8, 86.7, 89.5, 77.6),
@@ -303,8 +313,8 @@ WebAssembly build (park, one encoder):
 | `me umh` | +0.1% | −0.5% | |
 | `b-adapt 2` | −1.1% | −0.4% | |
 
-`subme 7` is the interesting one: at the same size it scores up to 0.8 VMAF NEG higher on noisy footage (town at CRF
-20: 92.73 → 93.51) while SSIM dips, which is psychovisual RD keeping grain that SSIM counts as error. It costs a third
+`subme 7` is the interesting one. At the same size it scores up to 0.8 VMAF NEG higher on noisy footage (town at CRF
+20: 92.73 → 93.51) while SSIM dips, because psychovisual RD keeps grain that SSIM counts as error. It costs a third
 of the speed, so it isn't the default; it's the obvious candidate for a "best quality" setting.
 
 ## Where the time goes now
@@ -320,7 +330,7 @@ Profile of the SIMD build (park, 1080p, shipped settings), top functions by self
 | `quant_4x4_trellis` and helpers | ~6% | scalar in x264's C; the x86-64 assembly for it is a specialised rewrite |
 | CABAC | ~3.3% | scalar by nature |
 
-Two more kernels since the first round: per-frame SSIM (`ssim_4x4x2_core`, `ssim_end4`) and explicit weighted
+Two more kernels since the first version: per-frame SSIM (`ssim_4x4x2_core`, `ssim_end4`) and explicit weighted
 prediction (`mc_weight`, whose chroma scales reach 255, so products use unsigned 16-bit lanes and saturate before the
 offset). SSIM went from 2.3–3.2% of the time to 0.4%, and encodes got ~4% faster, byte-identical as before. Link-time
 optimisation (`-flto`) changed nothing (4.05 vs. 4.07 fps). The single-thread WebAssembly build runs at 54% of native
@@ -388,7 +398,8 @@ a scalar loop of logarithms and 64-bit divisions that SIMD translation doesn't t
 window get scored. Each plan worker decodes its own test encode with WebCodecs and scores it against source frames it
 copied on the way into the encoder.
 
-In the app, Auto (the default format) works like this:
+In the app, Auto (the default format) first worked like this. "Deciding on AV1 from H.264's plan", further down,
+shortens the AV1 path.
 
 - H.264's size plan runs with VMAF. If it already fits at its highest quality, or scores 95 at the target, H.264 is
   the answer: in the simulation AV1 never came out a point ahead there, and nothing else is tested.
@@ -477,11 +488,12 @@ From the whole-clip sweeps above, this is the file size each encoder needs to ge
 | ducks (rippling water) | 124% | 142% | 171% | 204% |
 | noisy (sensor noise) | 161% | 198% | 177% | 291% |
 
-So half the size at about 1:1 is out of reach for park, ducks and noisy with any encoder here: the source's noise is
-the detail, and it needs more bits than the source already spends (noisy's row uses the current x264 settings). On town and tree it's within reach, but only with AV1,
-which is why Auto's shortcut changed: a compression started before AV1's test ends waits for it when H.264 is predicted
-under 93 and its size falls steeply near the target, as it does on town and tree. Town went from 90.3 to 94.0 at the
-same size, its worst frame from 84.2 to 90.6; tree from 88.2 to 92.3.
+So half the size at about 1:1 is out of reach for park, ducks and noisy with any encoder here. The source's noise is
+the detail, and it needs more bits than the source already spends (noisy's row uses the current x264 settings). On
+town and tree it's within reach, but only with AV1, which is why Auto's shortcut changed: a compression started before
+AV1's test ends waits for it when H.264 is predicted under 93 and its size falls steeply near the target, as it does
+on town and tree. Town went from 90.3 to 94.0 at the same size, its worst frame from 84.2 to 90.6; tree from 88.2 to
+92.3.
 
 The same data says where AV1 usually lands: at equal size its rate factor is about 1.88 times x264's minus 10.7 (5.6
 spread across clips). AV1's test now brackets that guess, 6 either side, instead of starting at its quality ceiling,
@@ -513,7 +525,7 @@ compress the same thing twice. Clicking 15 s after the file loads (reading the s
 | Phone clips, 20 s | 43.2 s | 33.0 s |
 | Big Buck Bunny, 10 s | 21.9 s | 14.8 s |
 
-(Measured again after the next two sections; the camera footage had finished before the click.)
+These numbers were measured after the next two sections' changes. The camera footage had finished before the click.
 
 Two smaller changes shorten the AV1 path. When H.264's first plan round already shows a steep curve, or a rate factor
 within 3 of its highest, AV1 will be tested anyway, so its test starts right then, alongside H.264's third round on the
@@ -572,8 +584,9 @@ as before.
 
 ## Cheaper keyframes for AV1's chunks
 
-Every chunk Pare encodes in parallel starts with a keyframe, so the decoder can start there. For x264 that costs a
-few percent. For SVT-AV1 it costs far more. `research/av1_chunks.py` encodes the first 192 frames of a clip as
+Every chunk Pare encodes in parallel starts with a keyframe, so the decoder can start there. "What chunking costs"
+put that at a few percent, measured at the same rate factor. Measured at equal quality it's far more, and this was the
+biggest surprise of the project. `research/av1_chunks.py` encodes the first 192 frames of a clip as
 back-to-back chunks of L frames with native SVT-AV1 (preset 8, one thread, as in Pare), joins them, and scores the
 result against the source:
 
@@ -587,15 +600,15 @@ result against the source:
 | 96 | +4.1% | +0.4% | −0.4% |
 | 192 (one chunk) | 0 | 0 | 0 |
 
-(BD-rate on VMAF NEG against one 192-frame encode, CRF 22-38.) A 5-second 1080p50 clip on 8 encoders gets
-31-frame chunks, so AV1 spends about a quarter more bits than it would in one piece on footage like town, and a
-third more on animation, which is most of its advantage over x264. Park barely notices: its inter frames are nearly
-as expensive as a keyframe. One frame past a whole 32-frame mini-GOP costs extra too (33 against 32, 49 against 48,
-65 against 64), a small effect next to the keyframes.
+(BD-rate on VMAF NEG against one 192-frame encode, CRF 22-38.) A 5-second 1080p50 clip on 8 encoders gets 31-frame
+chunks, so AV1 spends about a quarter more bits than it would in one piece on footage like town, and a third more on
+animation, which is most of its advantage over x264. Park barely notices, because its inter frames cost nearly as much
+as a keyframe. One frame past a whole 32-frame mini-GOP costs extra too (33 against 32, 49 against 48, 65 against 64),
+a small effect next to the keyframes.
 
 SVT-AV1 sets keyframe quality for GOPs of about five seconds, where a keyframe is referenced for a long time. In a
-32-frame chunk it isn't, so a coarser keyframe should pay. SVT's `--key-frame-qindex-offset` does nothing on its own;
-with `--use-fixed-qindex-offsets 2` it adds to the rate control's own choice instead of replacing it:
+32-frame chunk it isn't, so a coarser keyframe should pay off. SVT's `--key-frame-qindex-offset` does nothing on its
+own; with `--use-fixed-qindex-offsets 2` it adds to the rate control's own choice instead of replacing it:
 
 | Keyframe qindex offset | town | park | Big Buck Bunny | tree |
 | --- | --- | --- | --- | --- |
@@ -636,8 +649,8 @@ for AV1 (192 frames, CRF 18-26, BD-rate on VMAF NEG against one encode):
 | 32 | +41.8% | +24.9% | +5.7% | +34.4% |
 | 96 | +7.9% | +4.8% | +1.0% | +6.4% |
 
-x264's `--ipratio` (how much better keyframes are than P-frames) changed nothing at any setting: with the
-macroblock tree on, keyframe quality comes from how much the following frames use it. So the lever is the number of
+x264's `--ipratio` (how much better keyframes are than P-frames) changed nothing at any setting. With the
+macroblock tree on, keyframe quality comes from how much the following frames use it, so the lever is the number of
 chunks. On a 10-second clip, 8 encoders get 37-frame chunks; x264's own frame threads can use the cores instead.
 Each layout at the same rate factor, no size target (encode time, file, VMAF NEG):
 
@@ -685,9 +698,10 @@ as before.
 | park | 47.6 → 37.7 s | 84.80 → 84.03 |
 | ducks | 46.6 → 37.2 s | 70.69 → 70.69 |
 
-Jellyfish's first pass came out 1.5% over the size limit either way. Refits cut chunks into pieces so every encoder has
-work, but pieces had to be 30 frames, so its two 41- and 44-frame chunks went again whole on 2 of 8 encoders; at 20
-frames the second pass takes 1.5 s less.
+Jellyfish's first pass came out 1.5% over the size limit either way. Refits cut chunks into pieces so every encoder
+has work, but pieces had to be at least 30 frames, so its two 41- and 44-frame chunks went again whole, on 2 of 8
+encoders. With a 20-frame minimum the second pass takes 1.5 s less. (An earlier test had found shorter pieces slower,
+on a phone clip where the extra keyframes pulled another chunk into the refit; here there was nothing to pull in.)
 
 ## End to end in the browser
 
@@ -695,14 +709,15 @@ Same headless Chrome, same files, production builds:
 
 | Clip | ffmpeg.wasm build | SIMD build, first size target | Now |
 | --- | --- | --- | --- |
-| 20 s 1080p50 phone-style (65.5 MB) | 105.2 s, no size target | 75 s, −61%, SSIM 0.943 | 53 s, −55%, SSIM 0.951 |
-| 10 s 1080p30 camera (77.9 MB) | 27.3 s | 31 s, −80% | 26 s, −80%, SSIM 0.994 |
-| 10 s Big Buck Bunny (30.7 MB) | | 41 s, −60%, SSIM 0.980 | 33 s, −55%, SSIM 0.983 |
-| 2 min 1080p50 phone-style (392 MB) | | | 260 s, −51%, SSIM 0.954 |
+| 20 s 1080p50 phone-style (65.5 MB) | 105.2 s, no size target | 75 s, −61%, SSIM 0.943 | 42 s, −54%, SSIM 0.951 |
+| 10 s 1080p30 camera (77.9 MB) | 27.3 s | 31 s, −80% | 11 s, −69%, SSIM 0.994 |
+| 10 s Big Buck Bunny (30.7 MB) | | 41 s, −60%, SSIM 0.980 | 24 s, −56%, SSIM 0.983 |
+| 2 min 1080p50 phone-style (392 MB) | | | 197 s, −52%, SSIM 0.952 |
 
 "Now" includes the size plan when Compress is clicked a second after the file loads. The ffmpeg.wasm build had no
-size target, and the middle column aimed at 44% of the original and often landed far below it; aiming at 47% and
-checking the result spends the allowance on quality.
+size target. The middle column aimed at 44% of the original and often landed far below it; aiming at 47% and checking
+the result spends the allowance on quality. The camera footage now comes out bigger than before on purpose, because
+its spare room goes to speed ("Room to spare goes to speed").
 
 ## Reproducing
 
@@ -718,6 +733,10 @@ checking the result spends the allowance on quality.
   its results are in `codec_choice*.jsonl`.
 - `research/wasm-bench.mjs` times the WebAssembly encoder on raw frames in Node; `research/browser-ab.mjs` times a
   full compression in the browser against any deployment.
+- `research/benchmark.mjs`, `score.py` and `report.py` produce the tables in `research/BENCHMARKS.md`.
+- `research/speed_sweep.py` and `research/av1_sweep.py` are the x264 and SVT-AV1 speed sweeps;
+  `research/av1_chunks.py` and `research/x264_chunks.py` measure what chunk keyframes cost.
+- `research/ffmpeg-wasm/` runs stock ffmpeg.wasm in Chrome for the comparison in `research/BENCHMARKS.md`.
 
 ## Licensing
 

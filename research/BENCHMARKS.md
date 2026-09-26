@@ -5,18 +5,19 @@ visually lossless, at least 50% smaller, format Auto) and `research/score.py` (n
 output against the decoded source). Compress is clicked a second after the file loads, so the time includes the size
 plan and Auto's tests, and runs from that click to the finished file.
 
-The machine is a 4-core, 8-thread cloud VM with no GPU, shared with other work. Decoding is in software here; a
-laptop decodes H.264 in hardware and has more cores, so it will be faster.
+The machine is a 4-core, 8-thread cloud VM with no GPU, shared with other work. Decoding is in software here. A
+laptop usually decodes H.264 in hardware and may have more cores; "On a smaller machine" below shows how the time
+scales with cores.
 
 VMAF NEG is Netflix's VMAF without the enhancement gain, so sharpening can't raise it. Around 93 to 95 a re-encode
-stops looking different from its source at normal viewing distance; 1st percentile and worst frame show how the
-weakest moments hold up.
+stops looking different from its source at normal viewing distance. The worst frame shows how the weakest moment holds
+up.
 
 ## Results
 
 Twelve videos, from footage with plenty of room (camera, screen recording) to noisy 25 Mbps re-encodes where no
-current encoder reaches 1:1 at half the size. "Before" is the build from before this round (commit `b34f83a`), run
-alternately with the current one on the same machine so load hits both the same way.
+current encoder reaches 1:1 at half the size. "Before" is the build from 25 September, before this work (commit
+`b34f83a`), run alternately with the current one on the same machine so load hits both the same way.
 
 | Video | Original | Now: size | Format | Time, before → now | VMAF NEG, before → now | Worst frame, now |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -45,17 +46,19 @@ smaller instead of 81%. The other H.264 videos got 25-34% faster: x264 settings 
 quality per byte, fewer and longer chunks on short videos (Big Buck Bunny also scores a little higher, in a file 56%
 smaller instead of 54%), and less decoding before each chunk.
 
-The noisy 25 Mbps re-encodes now go to AV1, which lifts noisy by 6.6 points and town and tree by 3.6 to 3.9, and they
-still finish 5-9% sooner than H.264 did before: where H.264's first test round already shows that AV1 is the choice,
-Auto no longer tests AV1's quality, only its size. Jellyfish, park and ducks got 24-45% faster, and park 1.2 points
-better, with cheaper keyframes for AV1's short chunks as well. Two lost a little: ducks 1.6 points, its first pass
-landing at 87% of the size goal, and the PCM clip 0.4, from 8 chunks instead of 7.
+The noisy 25 Mbps re-encodes now go to AV1, which lifts noisy by 6.6 points and town and tree by 3.6 to 3.9. They
+still finish 5-9% sooner than H.264 did before, because where H.264's first test round already shows that AV1 is the
+choice, Auto no longer tests AV1's quality, only its size. Jellyfish, park and ducks got 24-45% faster, and park 1.2
+points better, helped by cheaper keyframes for AV1's short chunks.
+
+Two videos lost a little. Ducks lost 1.6 points because its first pass landed at 87% of the size goal and Pare left
+the room unused. The PCM clip lost 0.4, from being split into 8 chunks instead of 7.
 
 ## Where the time goes
 
-What happens between the click (a second after the file loads) and the file, from timestamps logged in an earlier
-round's runs (since then Big Buck Bunny's encode got about 2 s shorter, and town decides on AV1 in about 15 s instead
-of 22 and encodes it on 8 encoders instead of 7):
+What happens between the click (a second after the file loads) and the file, from timestamps logged in earlier runs.
+Since then Big Buck Bunny's encode got about 2 s shorter, and town decides on AV1 in about 15 s instead of 22 and
+encodes on 8 encoders instead of 7.
 
 | Video | Plan and Auto, after the click | Encode | Frames encoded per second | Writing the MP4 |
 | --- | --- | --- | --- | --- |
@@ -84,15 +87,17 @@ On the six clips Auto sends to AV1, the only faster path is H.264. Forced to H.2
 | park, 5 s | 27.5 s, 79.1, −53% | 36.9 s, 84.0, −53% |
 | ducks, 5 s | 29.4 s, 65.6, −54% | 35.9 s, 70.7, −59% |
 
-H.264 saves 6 to 13 s there and gives up 3.0 to 6.9 points, and on Jellyfish it can't reach half the size at all.
-AV1's own encode (14-18 s for these clips) is the floor: its preset 9 takes 0.75-0.86x the CPU time for 1-17% more
-bits depending on the footage (noisy +9.3%), and its target-bitrate mode overshot by 59% on 32-frame chunks.
+I expected H.264 to win back more time than this. It saves 6 to 13 s and gives up 2.9 to 6.9 points, and on
+Jellyfish it can't reach half the size at all. AV1's own encode (14-18 s for these clips) is the floor. Its preset 9
+takes 0.75-0.86x the CPU time for 1-17% more bits depending on the footage (noisy +9.3%), and its target-bitrate mode
+overshot by 59% on 32-frame chunks.
 
 ## On a smaller machine
 
-The same build with Chrome limited to half this machine (2 cores, 4 threads, `taskset` and 4 reported cores): town
-took 54.2 s instead of 29.3 (1.85x) and Big Buck Bunny 46.4 s instead of 23.9 (1.94x). Pare's time scales almost
-linearly with cores, so these times are this machine's: a 4-core, 8-thread Xeon Platinum 8259CL at 2.5 GHz from 2019.
+The same build with Chrome limited to half this machine (2 cores, 4 threads, via `taskset` and 4 reported cores):
+town took 54.2 s instead of 29.3 (1.85x), and Big Buck Bunny 46.4 s instead of 23.9 (1.94x). Pare's time scales
+almost linearly with cores, so every time here belongs to this machine, a 4-core, 8-thread Xeon Platinum 8259CL at
+2.5 GHz from 2019.
 
 ## Starting before Compress
 
@@ -105,7 +110,7 @@ Clicking 15 seconds after the file loads, as someone reading the settings might:
 | Phone clips, 20 s | 43.2 s | 33.0 s | 58.3 s | 48.0 s |
 | Big Buck Bunny, 10 s | 21.9 s | 14.8 s | 36.9 s | 29.8 s |
 
-The camera footage had finished before the click: the click only shows the result.
+The camera footage had finished before the click, so the click only showed the result.
 
 ## How far 1:1 is
 
@@ -121,9 +126,9 @@ half the size can get"), against the 50% budget:
 | ducks | 124% | 142% | 171% | 204% |
 | noisy | 161% | 198% | 177% | 291% |
 
-Park, ducks and noisy can't be halved at about 1:1 by x264 or SVT-AV1: their noise is the detail, and it takes more
+Park, ducks and noisy can't be halved at about 1:1 by x264 or SVT-AV1. Their noise is the detail, and it takes more
 bits than the source spends (noisy would need 1.6 to 2.9 times its own size). At half the size Pare's AV1 gets noisy to
-87.3, about what either encoder can do there. Town and tree can be halved at about 1:1, with AV1, and that's where
+87.5, about what either encoder can do there. Town and tree can be halved at about 1:1, with AV1, and that's where
 Auto sends them. (Noisy's row uses Pare's current x264 settings; the others its previous ones, which have the same
 quality per byte.)
 
@@ -142,11 +147,11 @@ Big Buck Bunny (10 s, 30.7 MB) on the same machine and browser, each file scored
 The ffmpeg.wasm runs were handed a rate factor; Pare finds its own for the size target, and that's in its time.
 At the same quality it's 6.4 times as fast as the single-threaded ffmpeg.wasm most in-browser compressors use, and
 1.7 times as fast as the multithreaded one (whose `veryfast` crashed). Its encode alone took 12.9 s, twice native x264
-on the same cores. One continuous encode is also about 9% smaller than Pare's four chunks at the same VMAF NEG: that
+on the same cores. One continuous encode is also about 9% smaller than Pare's four chunks at the same VMAF NEG, which
 is what splitting the video for speed costs on a clip this short.
 
 The first version of Pare ran ffmpeg.wasm too: 105 s for the 20-second phone clips without any size target, and 27 s
-for the camera footage. Now they take 42 s and 10 s, halved and checked, and with a head start the camera footage is
+for the camera footage. Now they take 42 s and 11 s, halved and checked, and with a head start the camera footage is
 ready when Compress is clicked. A browser's own encoder is faster still (1.1 to 2.7 times real time on this machine),
 but in software here it scored 93.4 VMAF NEG on the camera footage at the same budget, against Pare's 97.7, and
 couldn't halve the phone clips at all.
