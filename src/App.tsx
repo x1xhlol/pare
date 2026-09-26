@@ -1075,6 +1075,12 @@ function Done(props: {
             </>
           )}
         </p>
+        {quality !== 'pending' && quality !== 'failed' && quality.mismatch && (
+          <p className="note">
+            Played back, this copy looks less like the original than the encoder measured, so these numbers come from the
+            frames below. Compare them before keeping it.
+          </p>
+        )}
         {!smaller && (
           <p className="note">This video was already efficiently compressed. Keep the original, or try a lower quality.</p>
         )}

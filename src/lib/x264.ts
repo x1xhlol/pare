@@ -205,8 +205,12 @@ const AV1: Profile = {
     // tree, park and Big Buck Bunny (research/RESEARCH.md, "Cheaper keyframes for AV1's chunks").
     // Quantization matrices (SVT-AV1's default flatness range) took 3.0% off at the same VMAF NEG, 3.5% at the same
     // SSIM, with PSNR even, and 8% of the CPU time (research/av1_sweep.py).
+    // SVT-AV1's own keyframe interval is 160 frames at 24-30 fps (320 at 50-60), so a chunk longer than that, as on
+    // videos from about 43 s at 30 fps, paid for a second keyframe: 8.4% more bits for the same VMAF NEG on Big Buck
+    // Bunny as one 240-frame chunk, 12.2% on the screen recording (research/av1_keyint.py). Every chunk starts with a
+    // keyframe already; 10-second GOPs keep seeking quick on very long videos, whose chunks can run longer.
     const options = ['8', '', `crf=${crf.toFixed(2)}`, 'ssim=1', 'use-fixed-qindex-offsets=2', 'key-frame-qindex-offset=24',
-      'enable-qm=1']
+      'enable-qm=1', 'keyint=10s']
     if (color.depth === 10) options.push('input-depth=10')
     if (color.primaries && SVT_PRIMARIES[color.primaries]) options.push(`color-primaries=${SVT_PRIMARIES[color.primaries]}`)
     if (color.transfer && SVT_TRANSFER[color.transfer]) options.push(`transfer-characteristics=${SVT_TRANSFER[color.transfer]}`)
@@ -1327,7 +1331,8 @@ export async function plan(probe: Probe, settings: Settings, signal: AbortSignal
   const windows = picked ? picked.map((i) => all[i]) : all
   const subset = av1Windows(windows.length)
   const count = Math.min(encoders, windows.length * 2)
-  // The real encode starts a keyframe per chunk and roughly every 250 frames, plus one per scene cut.
+  // The real encode starts a keyframe per chunk and roughly every 250 frames, plus one per scene cut. (SVT-AV1's
+  // 10-second GOPs are longer than its chunks, but its estimates were calibrated with this count too.)
   // Counted for 8 chunks even when a short video is encoded in fewer: ESTIMATE_BIAS was calibrated there, and a test
   // window's keyframe overstates what one saves (4 chunks instead of 8 made Big Buck Bunny 3% smaller, not 12%).
   const encodeWith = workerCount(probe, settings, times.length).encoders

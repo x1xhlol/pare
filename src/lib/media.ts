@@ -466,7 +466,19 @@ export type QualityReport = {
   scored: number
   psnr: number
   frames: FramePair[]
+  /**
+   * The side-by-side frames scored well below what the encoder measured on the same frames, so the headline numbers
+   * are theirs: something between the source and the encoder's input went wrong (bit depth, colours, orientation).
+   */
+  mismatch?: boolean
 }
+
+/**
+ * How much more loss (1 − SSIM) the side-by-side frames may show than the encoder measured on the same frames: twice
+ * its loss plus this, as a median over the frames. They lose more on hard footage, from rendering and rounding: 0.2412
+ * against the encoder's 0.2081 on noisy, 0.0300 against 0.0194 on Jellyfish. A mirrored file showed 0.81 against 0.02.
+ */
+const MISMATCH = 0.02
 
 /** Frames to show side by side: the worst-scoring ones (kept apart from each other) plus an even spread. */
 function pickFrames(probe: Probe, scores: { times: number[]; ssim: number[] } | undefined, count: number) {
@@ -507,6 +519,8 @@ export async function measureQuality(
     const offset = probe.firstTimestamp - Math.max(0, await b.getFirstTimestamp())
 
     const frames: FramePair[] = []
+    /** Source timestamp of each frame pair, to find the encoder's score for it. */
+    const at: number[] = []
     for (const t of pickFrames(probe, scores, count)) {
       const original = await sinkA.getCanvas(t)
       if (!original) continue
@@ -515,6 +529,7 @@ export async function measureQuality(
       if (!compressed) continue
       const ya = lumaOf(original.canvas, size.width, size.height)
       const yb = lumaOf(compressed.canvas, size.width, size.height)
+      at.push(original.timestamp)
       frames.push({
         time: original.timestamp - probe.firstTimestamp,
         original: await createImageBitmap(original.canvas),
@@ -525,14 +540,25 @@ export async function measureQuality(
     }
     if (!frames.length) throw new Error('Could not decode frames to compare.')
     const mean = (xs: number[]) => xs.reduce((s, x) => s + x, 0) / xs.length
-    const all = scores?.ssim.length ? scores.ssim : frames.map((f) => f.ssim)
-    return {
-      ssim: mean(all),
-      min: Math.min(...all),
-      scored: all.length,
-      psnr: mean(frames.map((f) => Math.min(f.psnr, 99))),
-      frames,
-    }
+    const pairs = frames.map((f) => f.ssim)
+    const psnrMean = mean(frames.map((f) => Math.min(f.psnr, 99)))
+    if (!scores?.ssim.length) return { ssim: mean(pairs), min: Math.min(...pairs), scored: pairs.length, psnr: psnrMean, frames }
+    // The encoder's SSIM compares its output with its own input, so it can't see a frame that went in wrong. An 8-bit
+    // HLG clip once went into a 10-bit encoder as noise and still scored 0.94 there, against 0.01 as a player shows it.
+    // The side-by-side frames compare the two files as a player shows them.
+    const encoder = at.map((t) => {
+      let best = 0
+      for (let i = 1; i < scores.times.length; i++)
+        if (Math.abs(scores.times[i] - t) < Math.abs(scores.times[best] - t)) best = i
+      return scores.ssim[best]
+    })
+    const excess = encoder.map((e, i) => 1 - pairs[i] - 2 * (1 - e)).sort((a, b) => a - b)
+    const median = excess[Math.floor(excess.length / 2)]
+    console.info(`[pare] quality: side by side ${mean(pairs).toFixed(4)}, encoder ${mean(encoder).toFixed(4)} on the ` +
+      `same ${pairs.length} frames (median excess loss ${median.toFixed(4)})`)
+    if (median > MISMATCH)
+      return { ssim: mean(pairs), min: Math.min(...pairs), scored: pairs.length, psnr: psnrMean, frames, mismatch: true }
+    return { ssim: mean(scores.ssim), min: Math.min(...scores.ssim), scored: scores.ssim.length, psnr: psnrMean, frames }
   } finally {
     source.dispose()
     encoded.dispose()
