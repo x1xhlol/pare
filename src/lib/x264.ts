@@ -1223,6 +1223,12 @@ const AUTO_STEEP = -0.18
  * 28.3, came out over, and ended at 30 with VMAF NEG 78.9; AV1 had made 82.8 at the same size).
  */
 const AUTO_EDGE = 3
+/**
+ * ...and the highest rate factor at which a gentle curve alone lets H.264 start without AV1's test: the cases that
+ * rule was tuned on sat at 19-25 (Big Buck Bunny, the PCM clip, the phone clips at half size). Squeezed under 10 MB at
+ * 720p, the phone clips planned H.264 at 26.3 and came out at VMAF NEG 66, where AV1 made 75.6 at 1080p.
+ */
+const AUTO_QUICK_CRF = 25
 /** ...and the rate factor from which a steep curve alone makes AV1 the choice (predictsAv1). */
 const AUTO_PREDICT_CRF = 19
 /**
@@ -1655,7 +1661,7 @@ export const avcReaches = (probe: Probe, settings: Settings, avc: SizePlan) =>
  */
 export async function quickStart(probe: Probe, settings: Settings, avc: SizePlan) {
   if (avc.av1Plan || !avcReaches(probe, settings, avc)) return false
-  if ((avc.slope ?? 0) > AUTO_STEEP && avc.crf < X264.max - AUTO_EDGE) return true
+  if ((avc.slope ?? 0) > AUTO_STEEP && avc.crf <= AUTO_QUICK_CRF) return true
   await avc.scored
   return !testsAv1(probe, settings, avc) || (vmafAt(avc.points, videoGoal(probe, settings)) ?? 0) >= AUTO_QUICK
 }

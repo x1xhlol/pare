@@ -1077,6 +1077,37 @@ moments get about 5 points better, the mean 0.4-2, for 20-45% more time where it
 since Pare's time on hard footage is already its weak side. The measurement is the right one; what's missing is a
 cheaper way to act on it.
 
+## Fitting under a size, and choosing the resolution
+
+Besides half the original, the size target can now be any size ("Fit under": 10, 25, 50 or 100 MB, or typed). The
+same plan, budget, second passes and final weigh hold it; the video's floor became 10% of the target (5% of the
+original for half). Under 10 MB, Big Buck Bunny (30.7 MB) came out at 8.44 MB in H.264 at VMAF NEG 90.9, and the 20
+second phone clips (65.5 MB) at 9.80 MB in AV1 at CRF 53.7, VMAF NEG 75.6.
+
+Squeezed that hard, would a lower resolution look better? Per-title encoding (Netflix's convex hull) says it can:
+at low rates, fewer pixels coded well beat more pixels coded badly. `research/resolution.py` and
+`resolution_av1.py` encode each clip at 47% of its size at 1080p, 720p and 540p, and score each against the 1080p
+source after scaling it back up:
+
+| Clip | Bits per pixel at 1080p | H.264: 1080p / 720p / 540p | AV1: 1080p / 720p / 540p |
+| --- | --- | --- | --- |
+| Jellyfish | 0.03 | 71.5 / 76.6 / 78.2 | 83.2 / 82.8 / 82.7 |
+| ducks | 0.12 | 66.6 / 69.6 / 68.7 | 72.8 / 72.4 / 71.3 |
+| park | 0.11 | 80.4 / 80.9 / 75.7 | |
+| noisy | 0.11 | 82.4 / 82.9 / 78.3 | |
+| town | 0.10 | 92.3 / 88.6 / 82.0 | |
+| Big Buck Bunny | 0.17 | 93.5 / 85.3 / 77.4 | |
+
+H.264 does better smaller on the hardest clips, by up to 6.7 points. AV1 doesn't: its 1080p is as good as or better
+than a smaller picture at the same size, and better than any H.264. Under 10 MB the phone clips agreed: AV1 at 1080p
+75.6, AV1 at 720p 71.1, H.264 at 720p 66.1. Since Auto sends the tight cases to AV1, the resolution stays the
+source's; choosing it automatically would only help where AV1 can't be played.
+
+That last run also caught Auto starting H.264 at once, without AV1's test, when H.264's size fell gently and could
+reach the target, whatever the quality. The rule was tuned on clips at rate factors 19-25 at half size; under 10 MB
+at 720p H.264 planned 26.3 and scored 66. The quick start now needs a rate factor of 25 or less; above that it waits
+for H.264's scores, and there AV1 won (78.5 against 76.7 on the test windows) and made 71.1 instead of 66.1.
+
 ## End to end in the browser
 
 Same headless Chrome, same files, production builds:
@@ -1112,7 +1143,8 @@ its spare room goes to speed ("Room to spare goes to speed").
 - `research/speed_sweep.py` and `research/av1_sweep.py` are the x264 and SVT-AV1 speed sweeps;
   `research/av1_chunks.py` and `research/x264_chunks.py` measure what chunk keyframes cost, and `research/av1_keyint.py`
   what SVT-AV1's own keyframe interval costs a long chunk. `research/allocation.py` measures what splitting the bits
-  between scenes could give.
+  between scenes could give, and `research/resolution.py` / `resolution_av1.py` what a lower resolution gives at the
+  same size.
 - `research/ffmpeg-wasm/` runs stock ffmpeg.wasm in Chrome for the comparison in `research/BENCHMARKS.md`.
 
 ## Licensing
