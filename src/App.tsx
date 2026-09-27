@@ -1107,12 +1107,13 @@ function Ready(props: {
                   ? 'Same streams, new container'
                   : '\u00a0'}
           </span>
+          {canPreview && !shown?.frames && (
+            <button type="button" className="link estimate-preview" onClick={() => void runPreview()}
+                    disabled={!!shown && !shown.frames && !shown.error}>
+              {shown && !shown.error ? 'Encoding a preview…' : 'Preview frames at this size'}
+            </button>
+          )}
         </div>
-        {canPreview && (
-          <button type="button" className="button ghost" onClick={() => void runPreview()} disabled={!!shown && !shown.frames && !shown.error}>
-            {shown && !shown.frames && !shown.error ? 'Previewing…' : 'Preview'}
-          </button>
-        )}
         <button type="submit" className="button primary" disabled={noEncoder || (!!tuning && 'error' in tuning && !usesX264(settings))}>
           {copy ? 'Repackage video' : 'Compress video'}
         </button>

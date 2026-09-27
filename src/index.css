@@ -934,6 +934,17 @@ label {
   font-variant-numeric: tabular-nums;
 }
 
+.estimate-preview {
+  align-self: flex-start;
+  margin-top: 6px;
+  font-size: 13px;
+}
+
+.estimate-preview:disabled {
+  cursor: progress;
+  text-decoration: none;
+}
+
 .running-title {
   display: grid;
   gap: 8px;
