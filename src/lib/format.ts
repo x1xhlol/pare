@@ -47,9 +47,10 @@ export function clock(s: number, digits = 1) {
   return `${duration(Math.floor(parts / scale))}.${String(parts % scale).padStart(digits, '0')}`
 }
 
-/** Seconds from a typed time: 83.5, 1:23.5 or 1:01:23.5. Null when it isn't one. */
+/** Seconds from a typed time: 83.5, 1:23.5 or 1:01:23.5, with a decimal point or comma. Null when it isn't one. */
 export function parseClock(text: string) {
-  const parts = text.trim().split(':')
+  const t = text.trim()
+  const parts = (t.includes('.') ? t : t.replace(',', '.')).split(':')
   if (parts.length > 3 || parts.some((p) => !/^\d+(\.\d*)?$|^\.\d+$/.test(p.trim()))) return null
   return parts.reduce((total, p) => total * 60 + Number(p), 0)
 }

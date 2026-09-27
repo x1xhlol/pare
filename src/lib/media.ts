@@ -33,7 +33,7 @@ import { readsBack } from './readback'
 import { lumaOf, psnr, ssim } from './metrics'
 import {
   audioBytes as plannedAudioBytes, audioFor, deepFormat, DIRECT_FORMATS, even, MP4_AUDIO, outputSize, playsAv1, targetBytes, type AudioEncode,
-  type AudioPlan, type FrameIndex, type OutputCodec, type Preset, type Probe, type Settings,
+  framesIn, type AudioPlan, type FrameIndex, type OutputCodec, type Preset, type Probe, type Settings, type Trim,
 } from './shared'
 
 type EncodingPreset = Exclude<Preset, 'copy'>
@@ -134,6 +134,18 @@ export async function probeFile(file: File): Promise<Probe> {
   } finally {
     input.dispose()
   }
+}
+
+/**
+ * Video bytes in a repackaged part: Mediabunny copies from the keyframe before it (and an edit list hides the frames
+ * before the part), which with a 10-second keyframe interval was 9 times the part's own frames.
+ */
+function copiedVideo({ index }: Probe, trim: Trim) {
+  const { first, last } = framesIn(index, trim)
+  const key = index.keys.filter((k) => k <= first).at(-1) ?? 0
+  let bytes = 0
+  for (let i = key; i < last; i++) bytes += index.bytes[i]
+  return bytes
 }
 
 /**
@@ -364,7 +376,7 @@ export async function calibrate(
 ): Promise<Calibration> {
   const extra = audioBytes(probe, settings)
   if (settings.preset === 'copy') {
-    const size = (probe.videoBitrate * probe.duration) / 8 + extra
+    const size = (probe.trim ? copiedVideo(probe, probe.trim) : (probe.videoBitrate * probe.duration) / 8) + extra
     return { bitrate: probe.videoBitrate, size, ssim: 1, target: 1, reached: true }
   }
 

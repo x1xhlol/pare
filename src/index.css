@@ -798,7 +798,8 @@ label {
 }
 
 .trim-field input {
-  width: 96px;
+  /* Room for the longest time this video shows (1:02:05.00), and never less than the Fit under field. */
+  width: max(96px, calc(var(--chars, 7) * 1ch + 26px));
   min-height: 44px;
   padding: 0 12px;
   border: 1px solid var(--line-strong);

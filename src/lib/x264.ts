@@ -386,8 +386,24 @@ async function audioDelay(input: Input, track: InputAudioTrack) {
 }
 
 /**
- * The source's audio packets in a part: the one playing at its start, through the last one starting before its end.
- * All of them without a trim. `delay`: how late the track's timestamps run (audioDelay).
+ * The first packet of a part's audio: the one playing at its start, and before it what the decoder needs to be right
+ * by then. Opus asks for 80 ms of pre-roll (RFC 7845), AAC and MP3 for the frame before (overlapping transforms):
+ * without them a part's first 20-60 ms came out garbled or silent. The edit list hides what plays before the part.
+ * PCM and FLAC need nothing. Null when the track has no packets.
+ */
+async function firstAudioPacket(track: InputAudioTrack, trim: Trim, delay: number, metadataOnly: boolean) {
+  const sink = new EncodedPacketSink(track)
+  const at = (await sink.getPacket(trim.start + delay, { metadataOnly })) ?? (await sink.getFirstPacket({ metadataOnly }))
+  if (!at) return null
+  const codec = await track.getCodec()
+  if (!codec || codec.startsWith('pcm') || codec === 'ulaw' || codec === 'alaw' || codec === 'flac') return at
+  const back = codec === 'opus' ? 0.08 : 1e-4
+  return (await sink.getPacket(at.timestamp - back, { metadataOnly })) ?? at
+}
+
+/**
+ * The source's audio packets in a part (from firstAudioPacket, through the last one starting before its end), or all
+ * of them without a trim. `delay`: how late the track's timestamps run (audioDelay).
  */
 async function* audioIn(track: InputAudioTrack, trim: Trim | null, metadataOnly: boolean, delay = 0) {
   const sink = new EncodedPacketSink(track)
@@ -395,13 +411,10 @@ async function* audioIn(track: InputAudioTrack, trim: Trim | null, metadataOnly:
     yield* sink.packets(undefined, undefined, { metadataOnly })
     return
   }
-  const first = (await sink.getPacket(trim.start + delay, { metadataOnly })) ?? (await sink.getFirstPacket({ metadataOnly }))
+  const first = await firstAudioPacket(track, trim, delay, metadataOnly)
   if (!first) return
   for await (const packet of sink.packets(first, undefined, { metadataOnly })) {
-    const at = packet.timestamp - delay
-    if (at >= trim.end - 1e-6) break
-    // Before the part (a gap in the audio): nothing of it plays.
-    if (at + packet.duration <= trim.start + 1e-6) continue
+    if (packet.timestamp - delay >= trim.end - 1e-6) break
     yield packet
   }
 }
@@ -887,8 +900,16 @@ async function mux(probe: Probe, settings: Settings, chunks: EncodedChunk[], siz
     if (audioTrack && audioEncode) {
       const trim = probe.trim
       const delay = trim ? await audioDelay(input, audioTrack) : 0
-      for await (const decoded of new AudioSampleSink(audioTrack).samples(trim ? trim.start + delay : undefined, trim ? trim.end + delay : undefined)) {
-        if (delay) decoded.setTimestamp(decoded.timestamp - delay)
+      const first = trim && (await firstAudioPacket(audioTrack, trim, delay, true))
+      // Where the delay is, the browser's decoder may have taken it off already: Chromium and Firefox drop an Opus
+      // pre-skip at the start of every decode, which leaves their output on the true clock, and WebKit doesn't. Told
+      // apart by the first output, which is short by the pre-skip or isn't.
+      let shift: number | null = delay ? null : 0
+      for await (const decoded of new AudioSampleSink(audioTrack).samples(first ? first.timestamp : undefined,
+                                                                           trim ? trim.end + delay : undefined)) {
+        if (shift === null)
+          shift = first && decoded.numberOfFrames < (first.duration - delay / 2) * decoded.sampleRate ? 0 : delay
+        if (shift) decoded.setTimestamp(decoded.timestamp - shift)
         // Cut to the part, as a Mediabunny conversion does.
         const from = trim && decoded.timestamp < trim.start ? Math.round((trim.start - decoded.timestamp) * decoded.sampleRate) : 0
         const to = trim && decoded.timestamp + decoded.duration > trim.end

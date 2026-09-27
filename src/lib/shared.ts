@@ -272,6 +272,9 @@ export const endOf = (probe: Probe) => probe.start + probe.duration
 /** The shortest part Pare compresses, in seconds. */
 export const MIN_PART = 1
 
+/** The frame shown at `t`: the last one starting at or before it. */
+export const frameAt = (index: FrameIndex, t: number) => Math.max(0, firstAtOrAfter(index.times, t + 2e-6) - 1)
+
 /**
  * A part from `from` to `to` (seconds on the source's clock) snapped to frames: it starts with the frame shown at
  * `from` and ends where the first frame at or after `to` starts, or where the video does. A part's own end snaps to
@@ -280,7 +283,7 @@ export const MIN_PART = 1
 export function snapTrim(probe: Probe, from: number, to: number): Trim | null {
   const { times } = probe.index
   if (!times.length) return null
-  const first = Math.max(0, firstAtOrAfter(times, from + 2e-6) - 1)
+  const first = frameAt(probe.index, from)
   const after = firstAtOrAfter(times, to)
   if (first === 0 && after >= times.length) return null
   return { start: times[first], end: after < times.length ? times[after] : endOf(probe) }
