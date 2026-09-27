@@ -7,7 +7,8 @@ export function bytes(n: number) {
     v /= 1000
     u++
   } while (v >= 1000 && u < units.length - 1)
-  return `${v >= 100 ? v.toFixed(0) : v >= 10 ? v.toFixed(1) : v.toFixed(2)} ${units[u]}`
+  // Three figures at most, without trailing zeros: a typed 0.05 MB reads back as 50 KB, not 50.0 KB.
+  return `${Number(v.toFixed(v >= 100 ? 0 : v >= 10 ? 1 : 2))} ${units[u]}`
 }
 
 export function duration(s: number) {
@@ -28,8 +29,8 @@ export function fps(n: number) {
 }
 
 export function eta(seconds: number) {
-  if (!Number.isFinite(seconds)) return 'Estimating time left…'
-  if (seconds < 5) return 'Almost done'
+  if (!Number.isFinite(seconds)) return '—'
+  if (seconds < 5) return 'A few seconds'
   if (seconds < 60) return `About ${Math.ceil(seconds / 5) * 5} s left`
   return `About ${Math.ceil(seconds / 60)} min left`
 }

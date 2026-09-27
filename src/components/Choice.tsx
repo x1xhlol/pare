@@ -20,8 +20,10 @@ type Props<T extends string> = {
 
 export function Choice<T extends string>({ legend, value, options, onChange, hint, disabled, children }: Props<T>) {
   const name = useId()
+  const hintId = useId()
+  // The hint says what the choice does; tied to the group, a screen reader reads it with the options.
   return (
-    <fieldset className="choice" disabled={disabled}>
+    <fieldset className="choice" disabled={disabled} aria-describedby={hint ? hintId : undefined}>
       <legend className="choice-legend">{legend}</legend>
       <div className="segmented" data-count={options.length}>
         {options.map((o) => (
@@ -39,7 +41,11 @@ export function Choice<T extends string>({ legend, value, options, onChange, hin
         ))}
       </div>
       {children && <div className="choice-extra">{children}</div>}
-      {hint && <p className="choice-hint">{hint}</p>}
+      {hint && (
+        <p className="choice-hint" id={hintId}>
+          {hint}
+        </p>
+      )}
     </fieldset>
   )
 }

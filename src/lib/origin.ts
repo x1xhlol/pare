@@ -31,7 +31,7 @@ export function placeLabel(place: string) {
   const m = /^([+-]\d{1,2}(?:\.\d+)?)([+-]\d{1,3}(?:\.\d+)?)/.exec(place)
   if (!m) return null
   const [lat, lon] = [Number(m[1]), Number(m[2])]
-  return `${Math.abs(lat).toFixed(4)}° ${lat < 0 ? 'S' : 'N'}, ${Math.abs(lon).toFixed(4)}° ${lon < 0 ? 'W' : 'E'}`
+  return `${Math.abs(lat).toFixed(4)}°\u00a0${lat < 0 ? 'S' : 'N'}, ${Math.abs(lon).toFixed(4)}°\u00a0${lon < 0 ? 'W' : 'E'}`
 }
 
 /** Dates from before digital video or after tomorrow are unset or wrong clocks (a header of 0 is 1904). */

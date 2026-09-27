@@ -1237,7 +1237,8 @@ export function encode(probe: Probe, settings: Settings, start: EncodeStart, onP
       pool.terminate()
       if (canceled) throw new Canceled()
       const ordered = inOrder()
-      onProgress({ fraction: 1, processed: probe.duration, elapsed: (performance.now() - started) / 1000 })
+      onProgress({ fraction: 1, processed: probe.duration, elapsed: (performance.now() - started) / 1000,
+        workers: cores, stage: 'finishing' })
       const scores: FrameScores = { times: [], ssim: [] }
       for (const chunk of ordered)
         for (const p of chunk.packets) {

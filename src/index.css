@@ -161,6 +161,12 @@ label {
   margin: 0 auto;
 }
 
+/* Focused by script when the view changes or the preview opens, for screen readers and the keyboard: no ring. */
+.main:focus,
+[tabindex='-1']:is(h1, h2):focus {
+  outline: none;
+}
+
 .main[data-enter] {
   animation: enter 280ms var(--ease-out);
 }
@@ -223,6 +229,7 @@ label {
 
 .error::before {
   content: '!';
+  content: '!' / '';
   flex: none;
   display: inline-grid;
   place-items: center;
@@ -362,7 +369,7 @@ label {
   cursor: default;
   color: var(--text-muted);
   background: var(--surface-sunken);
-  box-shadow: none;
+  box-shadow: var(--elevation-control);
 }
 
 @media (hover: hover) and (pointer: fine) {
@@ -609,6 +616,7 @@ label {
 }
 
 .filename {
+  font-size: inherit;
   font-weight: 500;
   white-space: nowrap;
   overflow: hidden;
@@ -685,6 +693,11 @@ label {
   flex-basis: 100%;
 }
 
+/* Empty, it would still take a line and a gap in the wrapping row; out of the flow, it stays a live region. */
+.fit-problem:empty {
+  position: absolute;
+}
+
 .fit-field {
   display: inline-flex;
   align-items: center;
@@ -724,9 +737,19 @@ label {
   cursor: pointer;
 }
 
-.fit-preset:hover {
-  background: var(--control-hover);
-  color: var(--text);
+@media (hover: hover) and (pointer: fine) {
+  .fit-preset:hover {
+    background: var(--control-hover);
+    color: var(--text);
+  }
+}
+
+.fit-field input[aria-invalid='true'] {
+  border-color: var(--danger);
+}
+
+.fit-field input[aria-invalid='true']:focus-visible {
+  outline-color: var(--danger);
 }
 
 .fit-preset[aria-pressed='true'] {
@@ -944,7 +967,7 @@ label {
   font-size: 13px;
 }
 
-.estimate-preview:disabled {
+.estimate-preview[aria-disabled='true'] {
   cursor: progress;
   text-decoration: none;
 }
@@ -969,6 +992,11 @@ label {
 
 .delta.bad {
   color: var(--danger);
+}
+
+/* Smaller than the original, but over the size chosen: green would say the size was met. */
+.delta.muted {
+  color: var(--text-muted);
 }
 
 .pending {
@@ -1042,6 +1070,7 @@ label {
 
 .result-kicker {
   font-size: 14px;
+  font-weight: 400;
   color: var(--text-muted);
 }
 
@@ -1416,6 +1445,10 @@ label {
     min-height: 67px;
     align-content: flex-start;
   }
+  /* Checked at the original's size (a resolution Pare chose), the line is the verdict and one figure. */
+  .result-quality[data-short] {
+    min-height: 24px;
+  }
   .segmented {
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -1451,12 +1484,17 @@ label {
   .choice {
     grid-template-columns: 1fr;
   }
-  .choice-hint {
+  .choice-hint,
+  .choice-extra {
     grid-column: 1;
   }
   /* The detail line wraps to two lines here; keep room for both while the estimate is still coming. */
   .estimate-detail {
     min-height: 2lh;
+  }
+  /* A control scrolled into view by the keyboard lands above the sticky action bar, not under it. */
+  html {
+    scroll-padding-bottom: 160px;
   }
   .action-bar {
     position: sticky;
@@ -1484,6 +1522,21 @@ label {
     margin-left: 0;
     flex-basis: 100%;
     margin-top: 8px;
+    text-align: start;
+  }
+  .result-actions:has(.share) {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  /* Two to a row on the narrowest phones: a label wraps rather than pushing past the panel. */
+  .result-actions:has(.share) .button {
+    padding-inline: 12px;
+    white-space: normal;
+    text-align: center;
+  }
+  .result-actions:has(.share) > :first-child,
+  .result-actions:has(.share) .push {
+    grid-column: 1 / -1;
   }
 }
 
@@ -1499,4 +1552,19 @@ label {
   .bar-fill {
     transition: none;
   }
+}
+
+/* The preview scrolls into view clear of the page's top edge. */
+.preview-panel {
+  scroll-margin-top: 24px;
+}
+
+/* Read by screen readers, not shown. */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
 }

@@ -37,6 +37,8 @@ type Phase =
         lower: boolean
         /** H.264 because this browser can't play AV1, which would have got further. */
         noAv1: boolean
+        /** The encoder, as the note names it: the browser's own when it did the work. */
+        label: string
       }
       /** The short side Pare went down to because the size target was out of reach at the source's. */
       shortSide?: number
@@ -105,24 +107,31 @@ const SIZE_OPTIONS: Option<SizeMode>[] = [
   { value: 'any', label: 'No limit' },
 ]
 
+/** Fit under with Pare's own encoders from the original resolution, which step the resolution down too (fitSide). */
+const FIT_HINT_LOWERS = 'Keeps the chosen quality when that already fits. If it doesn’t, compression is raised just enough to get under the size, and if even that isn’t enough, the resolution is lowered too, down to 360p.'
+
 const SIZE_HINT: Record<SizeMode, string> = {
-  half: "Keeps the chosen quality when that already halves the file. If it wouldn't, compression is raised just enough to get there, and the quality check shows how close it stayed.",
-  fit: 'Keeps the chosen quality when that already fits. If it wouldn’t, compression is raised just enough to get under the size. For much smaller files, a lower resolution usually looks better.',
+  half: 'Keeps the chosen quality when that already halves the file. If it doesn’t, compression is raised just enough to get there, and the quality check shows how close it stayed.',
+  fit: 'Keeps the chosen quality when that already fits. If it doesn’t, compression is raised just enough to get under the size.',
   any: 'Always encodes at the chosen quality, even if the file barely shrinks.',
 }
 
 /** Common upload limits, in MB: Discord's free tier, email attachments, and two larger ones. */
 const FIT_PRESETS = [10, 25, 50, 100]
 
-/** Where "Fit under" starts: 10 MB, or a quarter of a smaller file. */
-const defaultFit = (size: number) => (size > 20e6 ? 10e6 : Math.max(1e6, Math.round(size / 4 / 1e5) * 1e5))
+/** Where "Fit under" starts: 10 MB, or a quarter of a smaller file (1 MB for files of 2-4 MB), rounded. */
+const defaultFit = (size: number) =>
+  size > 20e6 ? 10e6
+    : size > 4e6 ? Math.round(size / 4 / 1e5) * 1e5
+    : size > 2e6 ? 1e6
+    : Math.round(Number((size / 4 / 1e6).toPrecision(2)) * 1e6)
 
 /** Phones record where a video was taken. Left out by default, since a compressed copy is often one to share. */
-const placeHint = (place: string, keep: boolean) => {
+const placeHint = (place: string, keep: boolean, dated: boolean) => {
   const where = placeLabel(place)
   return keep
     ? `The copy says it was recorded at ${where ?? 'the same place'}, as the original does.`
-    : `The original says where it was recorded${where ? ` (${where})` : ''}. The copy leaves that out and keeps the recording date.`
+    : `The original says where it was recorded${where ? ` (${where})` : ''}. The copy leaves that out${dated ? ' and keeps the recording date' : ''}.`
 }
 
 const ENGINES: Option<Engine>[] = [
@@ -209,19 +218,21 @@ export default function App() {
       const probe = await (await media()).probeFile(file)
       if (!probe.canDecode) {
         const codec = probe.videoCodec ? CODEC_LABEL[probe.videoCodec] ?? probe.videoCodec : 'this codec'
-        throw new Error(`This browser can't decode ${codec} video. Try Chrome or Edge.`)
+        throw new Error(`This browser can’t decode ${codec} video. Try Chrome or Edge.`)
       }
       // The browser's own encoders need browser support; Pare's WebAssembly ones work everywhere.
       setSettings((s) => ({
         ...s,
         codec: s.engine === 'thorough' || probe.encodable[s.codec] ? s.codec : firstEncodable(probe),
         shortSide: null,
+        // A Fit under size carried over from a bigger file starts again from this one's.
+        targetBytes: s.targetBytes && s.targetBytes >= probe.file.size ? defaultFit(probe.file.size) : s.targetBytes,
         // Where a video was recorded is kept only when asked, for that video.
         keepPlace: false,
       }))
       setPhase({ kind: 'ready', probe })
     } catch (err) {
-      setPhase({ kind: 'empty', error: `Couldn't open ${file.name}. ${message(err)}` })
+      setPhase({ kind: 'empty', error: `Couldn’t open ${file.name}. ${message(err)}` })
     }
   }, [])
 
@@ -466,7 +477,9 @@ export default function App() {
             waitFor.skipTest?.()
             plan = first
           } else if (!waitFor.result) {
-            const why = first?.reaches ? "H.264 isn't near 1:1 at this size" : "H.264 can't reach half the size"
+            const why = first?.reaches
+              ? 'H.264 isn’t near 1:1 at this size'
+              : `H.264 can’t get ${settings.targetBytes ? `under ${fmt.bytes(settings.targetBytes)}` : 'to half the size'}`
             const status = first?.predicted ? 'Planning AV1: H.264 is near its limit here…' : `Testing AV1: ${why}…`
             setPhase((p) => (p.kind === 'running' ? { ...p, status } : p))
           }
@@ -493,7 +506,8 @@ export default function App() {
       const missed = engine.sizeTarget && settings.preset !== 'copy' && blob.size > targetBytes(probe, settings)
         ? { target: settings.targetBytes ?? null,
             lower: Math.min(probe.width, probe.height, shortSide ?? engine.shortSide ?? Infinity) > 360,
-            noAv1: codec === 'avc' && reason === 'device' }
+            noAv1: codec === 'avc' && reason === 'device',
+            label: codec ? (codec === 'av1' ? 'AV1' : 'H.264') : `The browser’s ${CODEC_LABEL[engine.codec]} encoder` }
         : undefined
       setPhase({ kind: 'done', probe, blob, url, quality: settings.preset === 'copy' ? 'failed' : 'pending', codec, missed,
         shortSide })
@@ -524,6 +538,22 @@ export default function App() {
 
   // The first screen appears without motion; later views fade in because the user caused them.
   const view = phase.kind === 'probing' ? 'empty' : phase.kind
+  // Each view replaces the last, taking the focused control with it: focus moves to the new view's heading (or the view)
+  // instead of the page.
+  const main = useRef<HTMLElement>(null)
+  const shownView = useRef(view)
+  useEffect(() => {
+    if (shownView.current === view) return
+    shownView.current = view
+    const heading = main.current?.querySelector<HTMLElement>('h1[tabindex]')
+    ;(heading ?? main.current)?.focus()
+  }, [view])
+  // Said once per change, from a region that stays on the page.
+  const announcement = phase.kind === 'running'
+    ? 'Compressing.'
+    : phase.kind === 'done'
+      ? `Done: ${fmt.bytes(phase.probe.file.size)} to ${fmt.bytes(phase.blob.size)}, ${fmt.change(phase.probe.file.size, phase.blob.size)}.`
+      : ''
 
   return (
     <div
@@ -561,7 +591,10 @@ export default function App() {
         }}
       />
 
-      <main className="main" key={view} data-enter={view !== 'empty' || undefined}>
+      <p className="sr-only" aria-live="polite">
+        {announcement}
+      </p>
+      <main className="main" key={view} ref={main} tabIndex={-1} data-enter={view !== 'empty' || undefined}>
         {!supported ? (
           <Unsupported />
         ) : phase.kind === 'empty' || phase.kind === 'probing' ? (
@@ -586,6 +619,7 @@ export default function App() {
             probe={phase.probe}
             progress={phase.progress}
             status={phase.status}
+            target={settings.sizeTarget ? settings.targetBytes : null}
             onCancel={() => cancelRun.current?.()}
           />
         ) : (
@@ -626,7 +660,7 @@ function message(err: unknown) {
 function Unsupported() {
   return (
     <section className="panel empty">
-      <h1 className="display">This browser can't encode video.</h1>
+      <h1 className="display">This browser can’t encode video.</h1>
       <p className="lede">Pare uses the WebCodecs API. Open it in a current Chrome, Edge, Safari (17+), or Firefox (130+).</p>
     </section>
   )
@@ -636,10 +670,10 @@ function Empty(props: { dragging: boolean; probing: string | null; error?: strin
   return (
     <section className="stack intro">
       <div className="intro-head">
-        <h1 className="display">Make a video smaller without making it worse.</h1>
+        <h1 className="display" tabIndex={-1}>Make a video smaller without making it worse.</h1>
         <p className="lede">
-          Pare cuts a video to half its size or less and keeps it looking like the original. It encodes on every core of
-          your computer, in this tab, and the file never leaves your device.
+          Pare cuts a video to half its size or less and keeps it looking like the original. It encodes across your
+          computer’s cores, in this tab, and the file never leaves your device.
         </p>
       </div>
       <div className="drop" data-active={props.dragging || undefined} onClick={props.onPick}>
@@ -792,9 +826,9 @@ function FileSummary({ probe, onReplace }: { probe: Probe; onReplace?: () => voi
         {probe.poster && <img src={probe.poster} alt="" width={probe.width} height={probe.height} />}
       </div>
       <div className="summary-body">
-        <p className="filename" title={probe.file.name}>
+        <h1 className="filename" title={probe.file.name} tabIndex={-1}>
           {probe.file.name}
-        </p>
+        </h1>
         <p className="size">{fmt.bytes(probe.file.size)}</p>
         <dl className="facts">
           <div>
@@ -835,13 +869,13 @@ function FileSummary({ probe, onReplace }: { probe: Probe; onReplace?: () => voi
 }
 
 /** What Auto picked and why, as "format: reason" in one line on wide screens (two on phones). */
-function choiceDetail({ reason, vmaf }: NonNullable<Calibration['choice']>, fit: boolean) {
+function choiceDetail({ reason, vmaf }: NonNullable<Calibration['choice']>, target: number | null | undefined) {
   const gain = vmaf?.av1 !== undefined ? vmaf.av1 - vmaf.avc : 0
   if (reason === 'testing') return 'H.264 so far, testing AV1'
   if (reason === 'high' && vmaf) return `H.264: already ${Math.round(vmaf.avc)} VMAF here`
   if (vmaf?.av1 === undefined && reason === 'even') return 'Measured on short test encodes'
-  if (reason === 'device') return "H.264: this device can't play AV1"
-  if (reason === 'size') return `AV1: H.264 can't get ${fit ? 'under that size' : 'to half the size'}`
+  if (reason === 'device') return 'H.264: this device can’t play AV1'
+  if (reason === 'size') return `AV1: H.264 can’t get ${target ? `under ${fmt.bytes(target)}` : 'to half the size'}`
   if (reason === 'predicted') return 'AV1: H.264 is near its limit at this size'
   if (reason === 'hdr') return 'AV1: keeps this HDR video in 10 bits'
   if (reason === 'better') return `AV1: ${gain.toFixed(1)} VMAF above H.264 here`
@@ -861,11 +895,20 @@ function Ready(props: {
   const copy = settings.preset === 'copy'
   const short = Math.min(probe.width, probe.height)
   const target = outputSize(probe, settings.shortSide)
-  const fitted = outputSize(probe, (tuning && 'result' in tuning && tuning.result.shortSide) || null)
   const noEncoder = !copy && settings.engine === 'fast' && !probe.encodable[settings.codec]
+  const sizeMode: SizeMode = !settings.sizeTarget ? 'any' : settings.targetBytes ? 'fit' : 'half'
+  // A typed Fit under size the field rejects (empty, zero, not below the original) holds Compress back.
+  const [fitProblem, setFitProblem] = useState<FitProblem>(null)
+  // So does a size that isn't below this file's.
+  const fitBad = sizeMode === 'fit' && !copy &&
+    (!!fitProblem || (settings.targetBytes ?? defaultFit(probe.file.size)) >= probe.file.size)
+  const result = tuning && 'result' in tuning && !fitBad ? tuning.result : null
 
+  // A resolution Pare lowered to itself, for a size the source's can't reach, shows on the choice that asked for it.
+  const chosenSide = result?.shortSide || null
+  const fitted = outputSize(probe, chosenSide)
   const resolutions: Option<string>[] = [
-    { value: 'original', label: `Original` },
+    { value: 'original', label: chosenSide && !settings.shortSide && !copy ? `Auto · ${chosenSide}p` : 'Original' },
     ...[1080, 720, 480].filter((r) => r < short).map((r) => ({ value: String(r), label: `${r}p` })),
   ]
 
@@ -873,23 +916,39 @@ function Ready(props: {
     value: c,
     label: CODEC_LABEL[c],
     disabled: !probe.encodable[c],
-    title: probe.encodable[c] ? undefined : `This browser can't encode ${CODEC_LABEL[c]}`,
+    title: probe.encodable[c] ? undefined : `This browser can’t encode ${CODEC_LABEL[c]}`,
   }))
 
   const unavailable = (['avc', 'hevc', 'av1'] as const).filter((c) => !probe.encodable[c]).map((c) => CODEC_LABEL[c])
-  const result = tuning && 'result' in tuning ? tuning.result : null
+  // Over the size asked for (what "reached" means differs between the engines; the size doesn't).
+  const over = !!result && settings.sizeTarget && result.size > targetBytes(probe, settings)
+  // The size target in the estimate's words.
+  const goal = settings.targetBytes ? `under ${fmt.bytes(settings.targetBytes)}` : 'in half the size'
   // A few frames encoded as the compression will encode them, on request, for a look before it runs.
   const [preview, setPreview] = useState<{ key: string; frames?: FramePair[]; error?: string } | null>(null)
   const previewing = useRef<AbortController | null>(null)
   const previewKey = result ? `${settingsKey(settings)}|${result.codec}|${result.crf}|${result.shortSide}|${result.fast}` : ''
   const shown = preview && preview.key === previewKey ? preview : null
-  const canPreview = usesX264(settings) && !copy && result?.crf !== undefined && result.choice?.reason !== 'testing'
+  const encodingPreview = !!shown && !shown.frames && !shown.error
+  const canPreview = usesX264(settings) && !copy && !fitBad && result?.crf !== undefined && result.choice?.reason !== 'testing'
   useEffect(() => {
     previewing.current?.abort()
     setPreview(null)
   }, [previewKey])
   // Compressing leaves this screen; a preview still encoding would take cores from it.
   useEffect(() => () => previewing.current?.abort(), [])
+  // The preview opens under the action bar, which on a phone is where the tap happened: bring it into view when it
+  // opened out of sight, and take the focus the preview link had.
+  const previewPanel = useRef<HTMLDivElement>(null)
+  const previewShown = !!shown?.frames
+  useEffect(() => {
+    const panel = previewPanel.current
+    if (!previewShown || !panel) return
+    if (document.activeElement === document.body) panel.querySelector<HTMLElement>('h2')?.focus({ preventScroll: true })
+    if (panel.getBoundingClientRect().top < innerHeight * 0.6) return
+    const still = matchMedia('(prefers-reduced-motion: reduce)').matches
+    panel.scrollIntoView({ block: 'start', behavior: still ? 'auto' : 'smooth' })
+  }, [previewShown])
   useEffect(() => () => preview?.frames?.forEach((f) => (f.original.close(), f.compressed.close())), [preview])
   const runPreview = async () => {
     if (!result?.crf) return
@@ -918,9 +977,6 @@ function Ready(props: {
   )
   const thoroughName = (c: 'avc' | 'av1') => (c === 'av1' ? 'SVT-AV1' : 'x264')
   const outOfReach = `${short}p can’t get ${settings.targetBytes ? `under ${fmt.bytes(settings.targetBytes)}` : 'to half the size'}`
-  const sizeMode: SizeMode = !settings.sizeTarget ? 'any' : settings.targetBytes ? 'fit' : 'half'
-  // A typed Fit under size the field rejects (empty, zero, not below the original) holds Compress back.
-  const [fitValid, setFitValid] = useState(true)
   const audioNote = () => {
     const audio = probe.audio
     if (!audio) return 'This video has no audio.'
@@ -935,9 +991,11 @@ function Ready(props: {
       plan.channels < audio.channels && `mixed down to ${plan.channels === 1 ? 'mono' : 'stereo'}`,
       plan.sampleRate !== audio.sampleRate && `at ${plan.sampleRate / 1000} kHz`,
       // The compact rate for a tight Fit under size (audioFor).
-      plan.reduced && `at ${plan.bitrate / 1000} kbps to fit`,
-    ].filter(Boolean)
-    const converted = `is converted to ${CODEC_LABEL[plan.codec]}${changes.length ? `, ${changes.join(' and ')}` : ''}.`
+      plan.reduced && `at ${plan.bitrate / 1000} kbps to leave room for the video`,
+    ].filter((c): c is string => !!c)
+    const listed = changes.length > 1 ? `${changes.slice(0, -1).join(', ')} and ${changes.at(-1)}` : changes[0]
+    const verb = plan.codec === audio.codec ? 'is re-encoded' : `is converted to ${CODEC_LABEL[plan.codec]}`
+    const converted = `${verb}${listed ? `, ${listed}` : ''}.`
     return audio.codec ? `${name} ${converted}` : `This video’s audio ${converted}`
   }
   const hdrNote = () => {
@@ -962,7 +1020,7 @@ function Ready(props: {
           ? result?.codec ? `Auto: ${thoroughName(result.codec)}` : 'Auto'
           : thoroughName(thoroughCodec(settings))
         : `Browser ${CODEC_LABEL[settings.codec]}`,
-    copy || !settings.shortSide ? (result?.shortSide && !copy ? `${result.shortSide}p to fit` : 'Original resolution')
+    copy || !settings.shortSide ? (chosenSide && !copy ? `${chosenSide}p${over ? '' : ' to fit'}` : 'Original resolution')
       : `${settings.shortSide}p`,
     // Repackaging copies the audio whatever the plan says Pare's own encoders could do with it.
     !probe.audio ? 'No audio' : settings.keepAudio && (copy || audioFor(probe, settings)?.kind !== 'drop') ? 'Audio kept' : 'Audio removed',
@@ -974,7 +1032,7 @@ function Ready(props: {
       className="stack"
       onSubmit={(e) => {
         e.preventDefault()
-        if (sizeMode === 'fit' && !fitValid) return
+        if (fitBad) return
         props.onStart()
       }}
     >
@@ -994,19 +1052,20 @@ function Ready(props: {
           options={SIZE_OPTIONS}
           disabled={copy}
           onChange={(v) => {
-            // The field comes back showing the last size it accepted.
-            setFitValid(true)
-            setSettings((s) => ({ ...s, sizeTarget: v !== 'any',
-              targetBytes: v === 'fit' ? (s.targetBytes ?? defaultFit(probe.file.size)) : null }))
+            // The field comes back at the size it starts from, which it accepts.
+            setFitProblem(null)
+            setSettings((s) => ({ ...s, sizeTarget: v !== 'any', targetBytes: v === 'fit' ? defaultFit(probe.file.size) : null }))
           }}
-          hint={copy ? 'Unchanged.' : SIZE_HINT[sizeMode]}
+          hint={copy
+            ? 'Unchanged.'
+            : sizeMode === 'fit' && usesX264(settings) && !settings.shortSide ? FIT_HINT_LOWERS : SIZE_HINT[sizeMode]}
         >
           {sizeMode === 'fit' && !copy && (
             <FitSize
               bytes={settings.targetBytes ?? defaultFit(probe.file.size)}
               limit={probe.file.size}
               onChange={(targetBytes) => setSettings((s) => ({ ...s, targetBytes }))}
-              onValid={setFitValid}
+              onProblem={setFitProblem}
             />
           )}
         </Choice>
@@ -1044,7 +1103,7 @@ function Ready(props: {
                 value={settings.codec}
                 options={codecs}
                 onChange={(codec) => setSettings((s) => ({ ...s, codec }))}
-                hint={[CODEC_HINT[settings.codec], unavailable.length ? `${unavailable.join(' and ')} can't be encoded in this browser.` : '']
+                hint={[CODEC_HINT[settings.codec], unavailable.length ? `${unavailable.join(' and ')} can’t be encoded in this browser.` : '']
                   .filter(Boolean)
                   .join(' ')}
               />
@@ -1057,8 +1116,8 @@ function Ready(props: {
               onChange={(v) => setSettings((s) => ({ ...s, shortSide: v === 'original' ? null : Number(v) }))}
               hint={copy
                 ? 'Unchanged.'
-                : result?.shortSide && !settings.shortSide
-                  ? `${fitted.width}×${fitted.height}: ${outOfReach}, at any quality.`
+                : chosenSide && !settings.shortSide
+                  ? `${fitted.width}×${fitted.height}, ${over ? 'the lowest Pare goes' : 'lowered to fit'}`
                   : `${target.width}×${target.height}`}
             />
             <Choice
@@ -1081,27 +1140,74 @@ function Ready(props: {
                   { value: 'remove', label: 'Remove' },
                 ]}
                 onChange={(v) => setSettings((s) => ({ ...s, keepPlace: v === 'keep' }))}
-                hint={placeHint(probe.origin.place, !!settings.keepPlace)}
+                hint={placeHint(probe.origin.place, !!settings.keepPlace, !!probe.origin.date)}
               />
             )}
           </div>
         </details>
         {probe.hdr && !copy && <p className="note">{hdrNote()}</p>}
-        {settings.sizeTarget && !copy && !reachable(probe, settings) && (
+        {settings.sizeTarget && !copy && !fitBad && !reachable(probe, settings) && (
           <p className="note">
             The audio alone takes up most of {settings.targetBytes ? 'that size' : 'half this file'}, so no video size
             gets under it. The video is compressed at the quality you chose instead.
           </p>
         )}
+        {result && !result.reached && !copy && usesX264(settings) && settings.targetBytes && (
+          <p className="note">
+            {(result.codec ?? thoroughCodec(settings)) === 'av1' ? 'AV1' : 'H.264'} can’t get this video under{' '}
+            {fmt.bytes(settings.targetBytes)}, even at its lowest quality{result.shortSide ? ` and ${result.shortSide}p` : ''}:
+            the smallest it gets is about {fmt.bytes(result.size)}, so the copy will come out over.{' '}
+            {(result.codec ?? thoroughCodec(settings)) === 'avc' && result.choice?.reason === 'device'
+              ? 'AV1 would get further, but this browser can’t play it.'
+              : 'A larger size will fit.'}
+          </p>
+        )}
+        {result && !result.reached && !copy && !usesX264(settings) && (
+          <p className="note">
+            {CODEC_LABEL[settings.codec]} in this browser can’t reach {presetLabel} quality on this video{' '}
+            {settings.sizeTarget
+              ? settings.targetBytes ? `under ${fmt.bytes(settings.targetBytes)}` : 'at half the original size'
+              : 'without growing past the original’s bitrate'}, so this is
+            as close as it gets.{' '}
+            {better.length
+              ? `${better.map((c) => CODEC_LABEL[c]).join(' or ')} should do better.`
+              : 'A lower quality setting will make it smaller.'}
+          </p>
+        )}
+        {result?.crf && !settings.sizeTarget && result.size > probe.file.size * 0.95 && (
+          <p className="note">
+            This video is already compressed about as tightly as x264 manages at {presetLabel} quality. Compact or a
+            smaller resolution will shrink it.
+          </p>
+        )}
+        {tuning && 'error' in tuning && (
+          <p className="error" role="alert">
+            Couldn’t test this setting. {tuning.error}
+          </p>
+        )}
+        {props.error && (
+          <p className="error" role="alert">
+            {props.error}
+          </p>
+        )}
+        {shown?.error && (
+          <p className="error" role="alert">
+            Couldn’t make a preview. {shown.error}
+          </p>
+        )}
       </div>
 
       <div className="action-bar">
-        <div className="estimate" aria-live="polite">
+        <div className="estimate">
           <span className="estimate-label">Estimated size</span>
-          {result ? (
+          {fitBad ? (
+            <span className="estimate-value unavailable">—</span>
+          ) : result ? (
             <span className="estimate-value">
               ~{fmt.bytes(result.size)}
-              <span className="delta">{fmt.change(probe.file.size, result.size)}</span>
+              <span className={result.size >= probe.file.size ? 'delta bad' : over ? 'delta muted' : 'delta'}>
+                {fmt.change(probe.file.size, result.size)}
+              </span>
             </span>
           ) : tuning && 'error' in tuning ? (
             <span className="estimate-value unavailable">Not available</span>
@@ -1110,25 +1216,29 @@ function Ready(props: {
               {settings.engine === 'thorough' && !copy ? 'Estimating…' : 'Tuning to this video…'}
             </span>
           )}
-          <span className="estimate-detail">
-            {tuning && 'side' in tuning && tuning.side
+          <span className="estimate-detail" id="estimate-detail">
+            {fitBad
+              ? fitProblem === 'empty' || fitProblem === 'zero' ? 'Enter a size to see the estimate' : 'Enter a size below the original'
+              : tuning && 'side' in tuning && tuning.side
               ? `Trying ${tuning.side}p: ${outOfReach}`
               : result?.shortSide
-              ? `${result.codec === 'av1' ? 'AV1' : result.codec === 'avc' ? 'H.264' : 'Encoding'} at ${result.shortSide}p: ${outOfReach}`
+              ? `${result.codec === 'av1' ? 'AV1' : result.codec === 'avc' ? 'H.264' : 'Encoding'}${result.reached === false
+                ? ` at ${result.shortSide}p: still over ${fmt.bytes(targetBytes(probe, settings))}`
+                : `, lowered to ${result.shortSide}p to fit`}`
               : result?.choice && result.choice.reason !== 'unlimited' && result.choice.reason !== 'fits'
               ? result.choice.reason === 'device' && result.size > targetBytes(probe, settings)
-                ? `H.264 can’t get this one ${settings.targetBytes ? 'under that size' : 'to half'}, and this device can’t play AV1`
-                : choiceDetail(result.choice, !!settings.targetBytes)
+                ? `H.264 can’t get this one ${settings.targetBytes ? `under ${fmt.bytes(settings.targetBytes)}` : 'to half the size'}, and this device can’t play AV1`
+                : choiceDetail(result.choice, settings.targetBytes)
               : !result && usesX264(settings) && settings.autoCodec && settings.sizeTarget && !(tuning && 'error' in tuning)
               ? 'Test-encoding to pick the format'
               : result?.fast
               ? 'Fits easily, so it uses a faster preset'
               : result?.fitted === false
-              ? 'Highest quality already fits in half the size'
+              ? `Highest quality already fits ${goal}`
               : result?.fitted
-              ? 'Best quality that fits in half the size'
+              ? `Best quality that fits ${goal}`
               : result?.raised
-              ? 'Compression raised to reach 50% smaller'
+              ? settings.targetBytes ? `Compression raised to fit ${goal}` : 'Compression raised to reach 50% smaller'
               : result?.crf
               ? 'Measured on short test encodes'
               : result && !copy
@@ -1139,73 +1249,51 @@ function Ready(props: {
                   ? 'Same streams, new container'
                   : '\u00a0'}
           </span>
+          {/* Announced once the estimate settles, not at every step on the way. */}
+          <span className="sr-only" aria-live="polite">
+            {result
+              ? `Estimated size about ${fmt.bytes(result.size)}, ${fmt.change(probe.file.size, result.size)}${over
+                ? `, still over ${fmt.bytes(targetBytes(probe, settings))}` : ''}.`
+              : ''}
+          </span>
+          <span className="sr-only" aria-live="polite">
+            {encodingPreview ? 'Encoding a preview.' : shown?.frames ? 'Preview ready, below.' : ''}
+          </span>
           {canPreview && !shown?.frames && (
-            <button type="button" className="link estimate-preview" onClick={() => void runPreview()}
-                    disabled={!!shown && !shown.frames && !shown.error}>
-              {shown && !shown.error ? 'Encoding a preview…' : 'Preview frames at this size'}
+            // Not disabled while it works: a disabled button drops the keyboard focus to the page.
+            <button type="button" className={`link estimate-preview${encodingPreview ? ' pending' : ''}`}
+                    onClick={() => encodingPreview || void runPreview()}
+                    aria-disabled={encodingPreview || undefined}>
+              {encodingPreview ? 'Encoding a preview…' : 'Preview frames at this size'}
             </button>
           )}
         </div>
-        <button type="submit" className="button primary"
-                disabled={noEncoder || (!!tuning && 'error' in tuning && !usesX264(settings)) || (sizeMode === 'fit' && !fitValid)}>
+        <button type="submit" className="button primary" aria-describedby={fitBad ? 'estimate-detail' : undefined}
+                disabled={noEncoder || (!!tuning && 'error' in tuning && !usesX264(settings)) || fitBad}>
           {copy ? 'Repackage video' : 'Compress video'}
         </button>
       </div>
-      {result && !result.reached && !copy && usesX264(settings) && settings.targetBytes && (
-        <p className="note">
-          {(result.codec ?? thoroughCodec(settings)) === 'av1' ? 'AV1' : 'H.264'} can’t get this video under{' '}
-          {fmt.bytes(settings.targetBytes)} even at its lowest quality{result.shortSide ? ` and ${result.shortSide}p` : ''},
-          so the copy will come out over it.{' '}
-          {(result.codec ?? thoroughCodec(settings)) === 'avc' && result.choice?.reason === 'device'
-            ? 'AV1 would get further, but this browser can’t play it.'
-            : 'A larger size will get there.'}
-        </p>
-      )}
-      {result && !result.reached && !copy && !usesX264(settings) && (
-        <p className="note">
-          {CODEC_LABEL[settings.codec]} in this browser can't reach {presetLabel} quality on this video{' '}
-          {settings.sizeTarget
-            ? settings.targetBytes ? `under ${fmt.bytes(settings.targetBytes)}` : 'at half the original size'
-            : "without growing past the original's bitrate"}, so this is
-          as close as it gets.{' '}
-          {better.length
-            ? `${better.map((c) => CODEC_LABEL[c]).join(' or ')} should do better.`
-            : 'A lower quality setting will make it smaller.'}
-        </p>
-      )}
-      {result?.crf && !settings.sizeTarget && result.size > probe.file.size * 0.95 && (
-        <p className="note">
-          This video is already compressed about as tightly as x264 manages at {presetLabel} quality. Compact or a
-          smaller resolution will shrink it.
-        </p>
-      )}
-      {tuning && 'error' in tuning && (
-        <p className="error" role="alert">
-          Couldn't test this setting. {tuning.error}
-        </p>
-      )}
-      {props.error && (
-        <p className="error" role="alert">
-          {props.error}
-        </p>
-      )}
-      {shown?.error && (
-        <p className="error" role="alert">
-          Couldn't make a preview. {shown.error}
-        </p>
-      )}
       {shown?.frames && (
-        <Compare
-          frames={shown.frames}
-          title="Preview"
-          note={`${['One moment', 'Two moments', 'Three moments'][shown.frames.length - 1] ?? 'Moments'} of this video, encoded with the settings the compression will use${result?.shortSide ? `, at ${result.shortSide}p` : ''}. SSIM of 1.000 means identical.`}
-        />
+        <div ref={previewPanel} className="preview-panel">
+          <Compare
+            frames={shown.frames}
+            title="Preview"
+            note={`${['One moment', 'Two moments', 'Three moments'][shown.frames.length - 1] ?? 'Moments'} of this video, encoded with the settings the compression will use${result?.shortSide ? `, at ${result.shortSide}p` : ''}. SSIM of 1.000 means identical; from 0.98 it looks the same, and under 0.90 the loss is visible.`}
+          />
+        </div>
       )}
     </form>
   )
 }
 
-function Running(props: { probe: Probe; progress: Progress | null; status: string; onCancel: () => void }) {
+function Running(props: {
+  probe: Probe
+  progress: Progress | null
+  status: string
+  /** The size chosen with Fit under, for what a refit is for; half the original otherwise. */
+  target?: number | null
+  onCancel: () => void
+}) {
   const { probe, progress, onCancel } = props
   const fraction = progress?.fraction ?? 0
   const speed = progress && progress.elapsed > 0.5 ? progress.processed / progress.elapsed : null
@@ -1216,9 +1304,9 @@ function Running(props: { probe: Probe; progress: Progress | null; status: strin
     : progress.stage === 'finishing'
       ? 'Writing the file…'
       : progress.stage === 'refitting'
-        ? 'Encoding the busiest parts again to reach 50% smaller'
-        : progress.workers
-        ? `Encoding on ${progress.workers} ${progress.workers === 1 ? 'core' : 'cores'}`
+        ? `Encoding the busiest parts again to ${props.target ? `fit under ${fmt.bytes(props.target)}` : 'reach 50% smaller'}`
+        : progress.workers && progress.workers > 1
+        ? `Encoding on ${progress.workers} cores`
         : 'Encoding'
   return (
     <section className="stack">
@@ -1254,7 +1342,7 @@ function Running(props: { probe: Probe; progress: Progress | null; status: strin
             <dd>{speed ? `${speed.toFixed(1)}× realtime` : '—'}</dd>
           </div>
           <div>
-            <dt>Frames per second</dt>
+            <dt>Frames/s</dt>
             <dd>{speed ? Math.round(speed * probe.fps) : '—'}</dd>
           </div>
           <div>
@@ -1274,24 +1362,45 @@ function verdict(ssim: number) {
   return 'Visible loss'
 }
 
+/** What's wrong with a typed Fit under size, if anything: nothing typed, not above 0, or not below the original. */
+type FitProblem = 'empty' | 'zero' | 'over' | null
+
+const fitProblem = (text: string, limit: number): FitProblem => {
+  const mb = Number(text)
+  return text.trim() === '' ? 'empty' : !(mb > 0) ? 'zero' : mb * 1e6 >= limit ? 'over' : null
+}
+
 /** The size for "Fit under": typed in megabytes, or one of the common limits smaller than the file. */
-function FitSize({ bytes, limit, onChange, onValid }: {
+function FitSize({ bytes, limit, onChange, onProblem }: {
   bytes: number
   limit: number
   onChange: (bytes: number) => void
-  /** Whether the typed size can be used; Compress waits while it can't. */
-  onValid: (valid: boolean) => void
+  /** What's wrong with the typed size; Compress waits while something is. */
+  onProblem: (problem: FitProblem) => void
 }) {
   const [text, setText] = useState(() => String(bytes / 1e6))
   const presets = FIT_PRESETS.filter((mb) => mb * 1e6 < limit)
-  // Said here: a browser's own validation bubble is easy to miss, or not shown at all.
   const typed = Number(text)
-  const problem = !(typed > 0)
+  const problem = fitProblem(text, limit)
+  // Said here: a browser's own validation bubble is easy to miss, or not shown at all. Only once typing pauses, since
+  // "0." on the way to "0.5" isn't a mistake yet; a fixed size clears it at once.
+  const message = problem === 'empty'
     ? 'Enter a size in megabytes.'
-    : typed * 1e6 >= limit ? `That’s no smaller than the original (${fmt.bytes(limit)}).` : null
+    : problem === 'zero'
+      ? 'Enter a size above 0 MB.'
+      : problem === 'over' ? `That’s no smaller than the original (${fmt.bytes(limit)}).` : null
+  const [said, setSaid] = useState(message)
+  useEffect(() => {
+    if (!message) {
+      setSaid(null)
+      return
+    }
+    const timer = setTimeout(() => setSaid(message), 700)
+    return () => clearTimeout(timer)
+  }, [message])
   const set = (mb: number) => {
     setText(String(mb))
-    onValid(true)
+    onProblem(null)
     onChange(mb * 1e6)
   }
   return (
@@ -1302,29 +1411,27 @@ function FitSize({ bytes, limit, onChange, onValid }: {
           inputMode="decimal"
           step="any"
           value={text}
-          aria-invalid={!!problem}
-          aria-describedby={problem ? 'fit-problem' : undefined}
+          aria-invalid={!!said}
+          aria-describedby={said ? 'fit-problem' : undefined}
           aria-label="Largest size, in megabytes"
           onChange={(e) => {
             setText(e.target.value)
-            const mb = Number(e.target.value)
-            const valid = mb > 0 && mb * 1e6 < limit
-            onValid(valid)
-            if (valid) onChange(Math.round(mb * 1e6))
+            const problem = fitProblem(e.target.value, limit)
+            onProblem(problem)
+            if (!problem) onChange(Math.round(Number(e.target.value) * 1e6))
           }}
         />
         <span>MB</span>
       </label>
       {presets.map((mb) => (
-        <button key={mb} type="button" className="fit-preset" aria-pressed={bytes === mb * 1e6} onClick={() => set(mb)}>
+        <button key={mb} type="button" className="fit-preset" aria-pressed={typed === mb} onClick={() => set(mb)}>
           {mb} MB
         </button>
       ))}
-      {problem && (
-        <p id="fit-problem" className="error fit-problem" role="alert">
-          {problem}
-        </p>
-      )}
+      {/* Always there, so the message is read when it changes rather than as an alert at every keystroke. */}
+      <div id="fit-problem" className="fit-problem" aria-live="polite">
+        {said && <p className="error">{said}</p>}
+      </div>
     </div>
   )
 }
@@ -1348,24 +1455,38 @@ function Done(props: {
   // encoder broken frames (WebKit's copyTo did, SSIM 0.01-0.02). readback.ts should catch that first; if it didn't,
   // an error says so and downloading is no longer the main action.
   const damaged = typeof quality === 'object' && !!quality.mismatch && quality.ssim < 0.5
+  const [shareFailed, setShareFailed] = useState(false)
+  const share = () => {
+    setShareFailed(false)
+    void navigator.share({ files: [file] }).catch((err: unknown) => {
+      // Closing the share sheet isn't a failure, nor is a second tap while it's open; a file too big for the app is.
+      const name = (err as Error)?.name
+      if (name !== 'AbortError' && name !== 'InvalidStateError') setShareFailed(true)
+    })
+  }
+  const missed = props.phase.missed
+  // The quality line is one line without a score for every frame: a resolution Pare chose is judged on sampled frames,
+  // and the browser's encoder gives no scores. The longer line has room kept for it on phones.
+  const short = props.copy || quality === 'failed' ||
+    (typeof quality === 'object' ? quality.scored <= quality.frames.length : !!props.phase.shortSide || !props.phase.codec)
 
   return (
     <section className="stack">
       <div className="panel result">
-        <p className="result-kicker">
-          {damaged ? 'Done, but the copy is damaged' : smaller ? 'Done' : 'Done, but the original is smaller'}
+        <h1 className="result-kicker" tabIndex={-1}>
+          {damaged ? 'The copy came out damaged' : smaller ? 'Done' : 'Done, but the original is smaller'}
           {props.phase.codec && ` · ${props.phase.codec === 'av1' ? 'AV1' : 'H.264'}`}
-          {props.phase.shortSide && ` · ${props.phase.shortSide}p to fit`}
-        </p>
+          {props.phase.shortSide && ` · ${props.phase.shortSide}p${missed ? '' : ' to fit'}`}
+        </h1>
         <p className="result-sizes">
           <span className="from">{fmt.bytes(before)}</span>
           <span className="arrow" aria-label="to">
             →
           </span>
           <span className="to">{fmt.bytes(after)}</span>
-          <span className={smaller ? 'delta' : 'delta bad'}>{fmt.change(before, after)}</span>
+          <span className={!smaller ? 'delta bad' : missed ? 'delta muted' : 'delta'}>{fmt.change(before, after)}</span>
         </p>
-        <p className="result-quality" aria-live="polite">
+        <p className="result-quality" data-short={short || undefined} aria-live="polite">
           {props.copy ? (
             'Bit-identical frames. Nothing was re-encoded.'
           ) : quality === 'pending' ? (
@@ -1386,8 +1507,8 @@ function Done(props: {
         </p>
         {damaged && (
           <p className="error" role="alert">
-            This copy came out damaged: this browser handed the encoder broken frames. Keep the original, or try
-            compressing it in another browser.
+            Played back, this copy doesn’t match the original, most likely because this browser handed the encoder broken
+            frames. Try compressing it in another browser.
           </p>
         )}
         {quality !== 'pending' && quality !== 'failed' && quality.mismatch && !damaged && (
@@ -1396,29 +1517,36 @@ function Done(props: {
             frames below. Compare them before keeping it.
           </p>
         )}
-        {!smaller && (
+        {!smaller && !damaged && (
           <p className="note">This video was already efficiently compressed. Keep the original, or try a lower quality.</p>
         )}
-        {smaller && props.phase.missed && (
+        {smaller && missed && !damaged && (
           <p className="note">
-            {props.phase.missed.target
-              ? `This is as small as ${props.phase.codec === 'av1' ? 'AV1' : 'H.264'} could make it here: short of ${fmt.bytes(props.phase.missed.target)}.`
-              : `This video was already efficiently compressed, and this is as small as ${props.phase.codec === 'av1' ? 'AV1' : 'H.264'} could make it: short of half the size.`}
-            {props.phase.missed.lower
-              ? ' A lower resolution would get further.'
-              : props.phase.missed.noAv1 ? ' A browser that plays AV1 would get further.' : ''}
+            {!props.phase.codec
+              ? `${missed.label} came out over ${missed.target ? `the ${fmt.bytes(missed.target)} you chose` : 'half the size'}. The Thorough encoder aims closer.`
+              : missed.target
+                ? `It came out at ${fmt.bytes(after)}, over the ${fmt.bytes(missed.target)} you chose: that’s as small as ${missed.label} gets with this video${missed.lower ? ' at this resolution' : ''}.`
+                : `This video was already efficiently compressed, and this is as small as ${missed.label} could make it: short of half the size.`}
+            {!props.phase.codec
+              ? ''
+              : missed.lower
+                ? ' A lower resolution would get further.'
+                : missed.noAv1
+                  ? ' A browser that plays AV1 would get further.'
+                  : missed.target ? ' A larger size will fit.' : ''}
           </p>
         )}
+        {shareFailed && <p className="note">This file couldn’t be shared from here. Download it instead.</p>}
         <div className="result-actions">
           <a className={smaller && !damaged ? 'button primary' : 'button'} href={url} download={name}>
             Download {ext.toUpperCase()}
           </a>
-          {shareable && (
-            <button type="button" className="button ghost" onClick={() => void navigator.share({ files: [file] }).catch(() => {})}>
+          {shareable && !damaged && (
+            <button type="button" className="button share" onClick={share}>
               Share
             </button>
           )}
-          <button type="button" className="button ghost" onClick={props.onAdjust}>
+          <button type="button" className={shareable && !damaged ? 'button' : 'button ghost'} onClick={props.onAdjust}>
             Change settings
           </button>
           <button type="button" className="link push" onClick={props.onNew}>

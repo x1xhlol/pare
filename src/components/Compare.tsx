@@ -107,7 +107,8 @@ export function Compare({ frames, timeline, title = 'Compare frames', note }: {
   return (
     <section className="compare" aria-labelledby={titleId}>
       <div className="compare-head">
-        <h2 id={titleId}>{title}</h2>
+        {/* Focusable for a view that moves the focus here (the preview, when it opens). */}
+        <h2 id={titleId} tabIndex={-1}>{title}</h2>
         <label className="toggle">
           <input type="checkbox" checked={actual} onChange={(e) => setActual(e.target.checked)} />
           <span>Actual pixels</span>
@@ -160,6 +161,7 @@ export function Compare({ frames, timeline, title = 'Compare frames', note }: {
             type="button"
             className="strip-item"
             aria-pressed={i === index}
+            aria-label={`Frame at ${duration(f.time)}, SSIM ${f.ssim.toFixed(3)}`}
             onClick={() => setIndex(i)}
           >
             <Bitmap bitmap={f.compressed} className="strip-thumb" width={240} />
