@@ -1228,6 +1228,13 @@ In Chrome all of it passed. The failures, all fixed:
 - **An Exact copy of a MOV with PCM audio** became an MP4 with ISO 'ipcm' audio, which few players read; it stays MOV now.
 - The Fit under field let the browser's own validation block Compress without a word; it now says what's wrong and
   holds Compress back itself.
+- **WebM recorded with MediaRecorder** always came back "Quality check unavailable". Such files have no cues, and their
+  clusters don't all hold a key frame; Mediabunny's key frame lookup starts at the latest cluster it has read before
+  the timestamp and scans only forward, so once the file had been read it found none and no frame could be decoded for
+  the comparison. On a 20 s recording from Chrome (VP8 and Opus, key frames every 3.4 s), 31 of 40 lookups came back
+  empty. Pare ships a small patch (`patches/mediabunny@1.59.1.patch`) that scans from the start when the fast lookup
+  finds nothing; those files now check as usual (SSIM 0.990 in Chrome, 0.986 in WebKit). A fix for Mediabunny itself
+  is drafted.
 
 ## End to end in the browser
 

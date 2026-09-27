@@ -22,7 +22,7 @@ index 5a3579537995b6a3672f130ae67c67d69f081bdc..a1273e9efb5f27b49abb6d9948f7208d
 +            return packet;
 +        }
 +        // The lookup starts at the latest cue point or cached cluster before the timestamp, and a cluster there may hold
-+        // no key frame of its own (files without cues, such as MediaRecorder's, where only the first cluster has one).
++        // no key frame of its own (files without cues, such as MediaRecorder's, have clusters without one).
 +        // Scan from the start of the segment instead, which keeps the last key frame at or before the timestamp.
 +        return this.performClusterLookup(null, getMatchInCluster, -Infinity, timestampInTimescale, options);
      }
