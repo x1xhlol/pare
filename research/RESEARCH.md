@@ -1248,8 +1248,9 @@ last chunk at its end, and audio is cut to it (copied: the straddling first pack
 needs to warm up, go below 0 and the MP4 edit list hides them; encoded: cut sample-exactly).
 
 Checked on synthetic clips (a moving test pattern, a 50 ms beep each second, keyframes every 2 s, B-frames) by
-comparing each copy with the source frame by frame and finding the beeps (`/tmp/trimtest`-style: frame alignment by PSNR
-at shifts of -2 to +2 frames, frame count, onset of every beep):
+comparing each copy with the source frame by frame and finding the beeps (`research/trim.mjs` makes the copy in the
+browser, `research/trimcheck.py` checks frame alignment by PSNR at shifts of -2 to +2 frames, frame count, and the onset
+of every beep):
 
 | Case | First frame | Frames | Audio |
 | --- | --- | --- | --- |
