@@ -44,7 +44,10 @@ function serviceWorker(): Plugin {
       const shell = [entry.fileName, ...(entry.viteMetadata?.importedCss ?? []), ...fonts].map((f) => `/${f}`)
       const assets = Object.keys(bundle).map((f) => `/${f}`).filter((f) => f.startsWith('/assets/') && !shell.includes(f))
       const template = fs.readFileSync('sw/sw.js', 'utf8')
-      const version = createHash('sha256').update(template + shell.join() + assets.join()).digest('hex').slice(0, 12)
+      // The public files keep their names across versions, so their contents go into the version.
+      const hash = createHash('sha256').update(template + shell.join() + assets.join())
+      for (const file of PUBLIC_SHELL) hash.update(fs.readFileSync(`public${file}`))
+      const version = hash.digest('hex').slice(0, 12)
       const source = template
         .replace('__VERSION__', JSON.stringify(version))
         .replace('__SHELL__', JSON.stringify([...shell, ...PUBLIC_SHELL]))

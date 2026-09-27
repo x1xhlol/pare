@@ -660,7 +660,10 @@ export async function measureQuality(
     const mean = (xs: number[]) => xs.reduce((s, x) => s + x, 0) / xs.length
     const pairs = frames.map((f) => f.ssim)
     const psnrMean = mean(frames.map((f) => Math.min(f.psnr, 99)))
-    if (!scores?.ssim.length) return { ssim: mean(pairs), min: Math.min(...pairs), scored: pairs.length, psnr: psnrMean, frames }
+    // The encoder's scores are at the size it encoded, so a comparison at the original's size stands on its own. They
+    // still place the frames: the encode starts where the source first decodes.
+    if (!scores?.ssim.length || atSource)
+      return { ssim: mean(pairs), min: Math.min(...pairs), scored: pairs.length, psnr: psnrMean, frames }
     // The encoder's SSIM compares its output with its own input, so it can't see a frame that went in wrong. An 8-bit
     // HLG clip once went into a 10-bit encoder as noise and still scored 0.94 there, against 0.01 as a player shows it.
     // The side-by-side frames compare the two files as a player shows them.

@@ -70,7 +70,7 @@ What Pare does instead:
   corpus that picked the better encoder in 28 of 30 cases; SSIM would have agreed with VMAF in 21. When H.264's first
   test round already shows fine noise or H.264 at the edge of its range, every clip in the benchmark went to AV1
   anyway, so Auto skips AV1's quality test there and only sizes it. Those clips got 5–45% faster.
-- **A preview before compressing.** Once the size plan is in, Preview encodes three short windows of the video
+- **A preview before compressing.** Once the size plan is in, Preview encodes up to three short windows of the video
   exactly as the compression will (same encoder, rate factor and resolution) and shows a frame of each beside the
   original, so a tight size can be judged before waiting for it. The frame shown is two thirds into a 24-frame
   window, past where the window's own keyframe still shows: within 0.006 SSIM of the real encode's frame, and never

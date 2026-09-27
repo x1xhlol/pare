@@ -187,6 +187,8 @@ export default function App() {
 
   const probe = phase.kind === 'ready' || phase.kind === 'running' || phase.kind === 'done' ? phase.probe : null
 
+  const phaseKind = useRef(phase.kind)
+  phaseKind.current = phase.kind
   const open = useCallback(async (file: File) => {
     setPhase({ kind: 'probing', name: file.name })
     // Someone opening a video will want the encoders: the service worker keeps them for next time, and offline.
@@ -208,6 +210,8 @@ export default function App() {
         ...s,
         codec: s.engine === 'thorough' || probe.encodable[s.codec] ? s.codec : firstEncodable(probe),
         shortSide: null,
+        // Where a video was recorded is kept only when asked, for that video.
+        keepPlace: false,
       }))
       setPhase({ kind: 'ready', probe })
     } catch (err) {
@@ -229,10 +233,12 @@ export default function App() {
         void open(new File([await response.blob()], name, { type: response.headers.get('content-type') ?? '' }))
       })()
     }
+    // A launch into a window that's compressing leaves it be, as a drop there does. (Without a launch_handler Chrome
+    // usually opens a new window, and a share could be lost to one that focuses an existing window instead.)
     const queue = (window as unknown as { launchQueue?: LaunchQueue }).launchQueue
     queue?.setConsumer(async ({ files }) => {
       const handle = files?.[0]
-      if (handle) void open(await handle.getFile())
+      if (handle && !['running', 'probing'].includes(phaseKind.current)) void open(await handle.getFile())
     })
   }, [open])
 
@@ -480,9 +486,8 @@ export default function App() {
       setPhase({ kind: 'done', probe, blob, url, quality: settings.preset === 'copy' ? 'failed' : 'pending', codec, missed,
         shortSide })
       if (settings.preset === 'copy') return
-      // The encoder's own scores are at the size it encoded; a resolution Pare chose itself is judged at the original's.
-      const quality = await (shortSide ? measureQuality(probe, blob, undefined, 8, true) : measureQuality(probe, blob, scores))
-        .catch(() => 'failed' as const)
+      // A resolution Pare chose itself is judged at the original's size.
+      const quality = await measureQuality(probe, blob, scores, 8, !!shortSide).catch(() => 'failed' as const)
       setPhase((p) => (p.kind === 'done' && p.blob === blob ? { ...p, quality } : p))
     } catch (err) {
       if (run.canceled) {
@@ -1157,7 +1162,7 @@ function Ready(props: {
         <Compare
           frames={shown.frames}
           title="Preview"
-          note={`Three moments of this video, encoded with the settings the compression will use${result?.shortSide ? `, at ${result.shortSide}p` : ''}. SSIM of 1.000 means identical.`}
+          note={`${['One moment', 'Two moments', 'Three moments'][shown.frames.length - 1] ?? 'Moments'} of this video, encoded with the settings the compression will use${result?.shortSide ? `, at ${result.shortSide}p` : ''}. SSIM of 1.000 means identical.`}
         />
       )}
     </form>

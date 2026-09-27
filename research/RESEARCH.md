@@ -1175,7 +1175,7 @@ the size target anyway.
 
 ## A preview before compressing
 
-The Preview button encodes three short windows (a fifth, half and four fifths of the way through) exactly as the
+The Preview button encodes up to three short windows, spread evenly through the video, exactly as the
 compression will, same encoder, settings, rate factor and resolution, and shows a frame of each beside the source's.
 Each window starts with a keyframe, and AV1's are coded 24 quantizer steps coarser (see "Cheaper keyframes for AV1's
 chunks"), so frames right after it look worse than the encode's: the preview has to show a frame far enough in.

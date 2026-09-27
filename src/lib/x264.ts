@@ -1122,7 +1122,8 @@ export function encode(probe: Probe, settings: Settings, start: EncodeStart, onP
           report(frames, 'encoding')
         },
         budget ? (chunk) => withCrf(chunk, budget.assign(chunk.index)) : undefined,
-        divider,
+        // Long chunks stay long: cutting one would add the keyframe they're long to avoid.
+        start.long ? undefined : divider,
         stash,
       )
       for (const [index, chunk] of reused) encoded[index] = stash(chunk)
@@ -1152,8 +1153,9 @@ export function encode(probe: Probe, settings: Settings, start: EncodeStart, onP
           // into pieces of at least 20 frames so every encoder works (x264 keeps two threads per piece), and budget for
           // the extra keyframes. With 30, Jellyfish's two 41- and 44-frame chunks went again whole, on 2 of 8 encoders.
           const share = profile.threaded && canThread ? 2 : 1
+          const shortest = start.long ? TAIL_CHUNK_FRAMES : 20
           const piecesFor = (count: number, index: number) =>
-            Math.max(1, Math.min(Math.floor(active / share / count), Math.floor(frameCounts[index] / 20)))
+            Math.max(1, Math.min(Math.floor(active / share / count), Math.floor(frameCounts[index] / shortest)))
           const cuts = (list: { index: number }[]) => list.reduce((t, r) => t + piecesFor(list.length, r.index) - 1, 0)
           // Chunks already at the limit of the range would come out the same.
           const changing = (list: { index: number; crf: number }[]) => list.filter((r) => Math.abs(r.crf - crfs[r.index]) >= 0.05)
@@ -1402,6 +1404,8 @@ function fitAt(probe: Probe, settings: Settings, points: PlanPoint[]): SizePlan 
   // two either side of the goal.
   const measured = Math.log(b.bytes / a.bytes) / (b.crf - a.crf)
   const slope = measured < -0.03 ? measured : profile.slope
+  // What the encode takes: the slope at AV1's max, from which logSize bends (the tests may sit past it).
+  const base = slopeAtMax(profile, slope, (a.crf + b.crf) / 2)
   if (first.bytes <= goal) {
     // A test that started above the floor (AV1's, bracketing a prediction) can land lower, halfway to be safe.
     const floor = floorCrf(settings)
@@ -1409,15 +1413,15 @@ function fitAt(probe: Probe, settings: Settings, points: PlanPoint[]): SizePlan 
       const crf = Math.max(floor, first.crf + Math.log(goal / first.bytes) / slope / 2)
       const video = first.bytes * Math.exp(slope * (crf - first.crf))
       return { crf: Math.round(crf * 10) / 10, size: video + audio, raised: crf > baseCrf,
-        fitted: settings.preset === 'visually-lossless', slope, points: sorted, bound: true }
+        fitted: settings.preset === 'visually-lossless', slope: base, points: sorted, bound: true }
     }
-    return { crf: first.crf, size: first.bytes + audio, raised: false, fitted: false, slope, points: sorted, bound: false }
+    return { crf: first.crf, size: first.bytes + audio, raised: false, fitted: false, slope: base, points: sorted, bound: false }
   }
   const highest = maxCrf(profile, settings)
   // Between the two tests, or short of AV1's bend, a straight line; past the higher test, on from it.
   const reach = goal >= b.bytes || measured >= -0.03
     ? a.crf + Math.log(goal / a.bytes) / slope
-    : crfFor(profile, slopeAtMax(profile, slope, (a.crf + b.crf) / 2), b.crf, Math.log(goal / b.bytes))
+    : crfFor(profile, base, b.crf, Math.log(goal / b.bytes))
   let crf = Math.min(highest, Math.max(first.crf, reach))
   // Past the highest test the straight line tends to overstate sizes (the noise stops costing bits), so land halfway
   // back: the encode checks its real size and corrects either way. Past AV1's `max` the curve bends the other way,
@@ -1429,7 +1433,7 @@ function fitAt(probe: Probe, settings: Settings, points: PlanPoint[]): SizePlan 
   const atMax = measured < -0.03 ? extend(profile, a, b, highest) : a.bytes * Math.exp(slope * (highest - a.crf))
   const expected = atMax > goal ? atMax : Math.min(video, goal)
   return { crf: Math.round(crf * 10) / 10, size: expected + audio, raised: crf > baseCrf,
-    fitted: settings.preset === 'visually-lossless', slope, points: sorted, bound: true }
+    fitted: settings.preset === 'visually-lossless', slope: base, points: sorted, bound: true }
 }
 
 /** The two tests on either side of `bytes` (sizes fall as the rate factor rises), or the nearest two outside them. */
@@ -1639,8 +1643,8 @@ export async function plan(probe: Probe, settings: Settings, signal: AbortSignal
  */
 const PREVIEW_FRAMES = 24
 const PREVIEW_SHOWN = 2 / 3
-/** Where the preview windows sit, as shares of the video. */
-const PREVIEW_AT = [0.2, 0.5, 0.8]
+/** Preview windows, spread evenly across the video, when its length and the memory left allow. */
+const PREVIEW_WINDOWS = 3
 
 /**
  * A look at the result before compressing: short windows spread across the video, encoded as the compression will
@@ -1653,11 +1657,19 @@ export async function preview(probe: Probe, settings: Settings, crf: number, fas
   const line = await timeline(probe.file)
   const n = line.times.length
   const per = Math.min(PREVIEW_FRAMES, n)
-  const starts = [...new Set(PREVIEW_AT.map((at) => Math.max(0, Math.min(n - per, Math.round(at * n - per / 2)))))]
-  const windows = starts.map((first, index) => ({
-    type: 'chunk' as const, index, start: line.times[first], end: first + per < n ? line.times[first + per] : Infinity,
-  }))
   const profile = profileFor(settings)
+  // By now the head start is usually encoding on workerCount's encoders. The preview takes what that leaves of 60% of
+  // the device's memory (at least one encoder), and no more windows than fit in the video side by side.
+  const { width, height } = outputSize(probe, settings.shortSide)
+  const each = profile.memory(width, height)
+  const deviceMB = ((navigator as Navigator & { deviceMemory?: number }).deviceMemory ?? 8) * 1024
+  const spare = Math.floor((deviceMB * 0.6 - workerCount(probe, settings).encoders * each) / each)
+  const count = Math.max(1, Math.min(PREVIEW_WINDOWS, Math.floor(n / per), spare))
+  // Evenly spaced by at least `per` frames, so no two windows share one.
+  const windows = Array.from({ length: count }, (_, index) => {
+    const first = Math.floor((index * n) / count + (n / count - per) / 2)
+    return { type: 'chunk' as const, index, start: line.times[first], end: first + per < n ? line.times[first + per] : Infinity }
+  })
   const fps = probe.fps || 30
   if (signal.aborted) throw new Canceled()
   const pool = await createPool(profile, windows.length, 1, {
@@ -1666,6 +1678,11 @@ export async function preview(probe: Probe, settings: Settings, crf: number, fas
     scoring: false,
   })
   const stop = () => pool.terminate()
+  // Aborted while the encoders started (Compress pressed at once): a listener added now would never run.
+  if (signal.aborted) {
+    stop()
+    throw new Canceled()
+  }
   signal.addEventListener('abort', stop)
   try {
     const chunks = await pool.run(windows, () => {})
@@ -1828,7 +1845,10 @@ export function fitSide(probe: Probe, settings: Settings, plan: SizePlan, codec:
   if (!Number.isFinite(atMax) || atMax <= goal) return null
   const current = Math.min(settings.shortSide ?? Infinity, probe.width, probe.height)
   const lower = FIT_SIDES.filter((side) => side < current)
-  const room = Math.exp(profile.slope * FIT_STEPS)
+  // Size FIT_STEPS short of the highest against at it, along AV1's bend (logSize) where there is one.
+  const highest = maxCrf(profile, settings)
+  const slope = plan.slope && plan.slope < -0.03 ? plan.slope : profile.slope
+  const room = Math.exp(logSize(profile, slope, highest) - logSize(profile, slope, highest - FIT_STEPS))
   const fits = (side: number) => atMax * ((side / current) ** 2) ** PIXEL_POWER[codec] <= goal * room
   return lower.find(fits) ?? lower[lower.length - 1] ?? null
 }
