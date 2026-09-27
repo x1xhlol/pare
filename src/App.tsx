@@ -499,7 +499,10 @@ export default function App() {
         shortSide })
       if (settings.preset === 'copy') return
       // A resolution Pare chose itself is judged at the original's size.
-      const quality = await measureQuality(probe, blob, scores, 8, !!shortSide).catch(() => 'failed' as const)
+      const quality = await measureQuality(probe, blob, scores, 8, !!shortSide).catch((err) => {
+        console.warn(`[pare] quality check failed: ${message(err)}`)
+        return 'failed' as const
+      })
       setPhase((p) => (p.kind === 'done' && p.blob === blob ? { ...p, quality } : p))
     } catch (err) {
       if (run.canceled) {

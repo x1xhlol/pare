@@ -23,6 +23,9 @@
       },
     },
   },
+  "patchedDependencies": {
+    "mediabunny@1.59.1": "patches/mediabunny@1.59.1.patch",
+  },
   "packages": {
     "@fontsource-variable/geist": ["@fontsource-variable/geist@5.3.0", "", {}, "sha512-j0m+vLQuG5XAYoHtGCVu0spvlGreR3EzpECUVzkFmI1mTVnAO38l/NEPDCFgZ177JxzYJCLSmTQibIiYPilGrA=="],
 
