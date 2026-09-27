@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type KeyboardEvent, type PointerEvent } from 'react'
+import { useEffect, useId, useRef, useState, type KeyboardEvent, type PointerEvent, type ReactNode } from 'react'
 import type { FramePair } from '../lib/media'
 import { duration } from '../lib/format'
 
@@ -75,7 +75,13 @@ function Timeline({ points, frames, index, onPick }: {
   )
 }
 
-export function Compare({ frames, timeline }: { frames: FramePair[]; timeline?: Point[] }) {
+export function Compare({ frames, timeline, title = 'Compare frames', note }: {
+  frames: FramePair[]
+  timeline?: Point[]
+  title?: string
+  note?: ReactNode
+}) {
+  const titleId = useId()
   const [index, setIndex] = useState(() => frames.reduce((w, f, i) => (f.ssim < frames[w].ssim ? i : w), 0))
   const [split, setSplit] = useState(50)
   const [actual, setActual] = useState(false)
@@ -99,9 +105,9 @@ export function Compare({ frames, timeline }: { frames: FramePair[]; timeline?: 
   }
 
   return (
-    <section className="compare" aria-labelledby="compare-title">
+    <section className="compare" aria-labelledby={titleId}>
       <div className="compare-head">
-        <h2 id="compare-title">Compare frames</h2>
+        <h2 id={titleId}>{title}</h2>
         <label className="toggle">
           <input type="checkbox" checked={actual} onChange={(e) => setActual(e.target.checked)} />
           <span>Actual pixels</span>
@@ -165,8 +171,12 @@ export function Compare({ frames, timeline }: { frames: FramePair[]; timeline?: 
         ))}
       </div>
       <p className="note">
-        The weakest frames the encoder measured, plus an even spread across the video. SSIM of 1.000 means identical;
-        the view opens on the weakest.
+        {note ?? (
+          <>
+            The weakest frames the encoder measured, plus an even spread across the video. SSIM of 1.000 means
+            identical; the view opens on the weakest.
+          </>
+        )}
       </p>
     </section>
   )

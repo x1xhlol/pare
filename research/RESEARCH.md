@@ -1109,6 +1109,76 @@ reach the target, whatever the quality. The rule was tuned on clips at rate fact
 at 720p H.264 planned 26.3 and scored 66. The quick start now needs a rate factor of 25 or less; above that it waits
 for H.264's scores, and there AV1 won (78.5 against 76.7 on the test windows) and made 71.1 instead of 66.1.
 
+## Under a size the resolution can't reach
+
+A size chosen with Fit under can be far below what the source's resolution allows: 20 seconds of 1080p50 under
+1.5 MB (the rate of a two-minute phone clip under 10 MB) went to AV1 at its highest rate factor then, 55, came out at
+8.66 MB and took 234 s. The first fix planned again at a lower resolution, picked from how size follows the pixel
+count at the highest rate factors (60 frames of four clips from 1080p down to 360p: bytes ~ pixels^0.62-0.88 for
+SVT-AV1, median 0.78; ^0.87-1.12 for x264, median 0.94). That fit, but the resolution it picked was wrong for AV1.
+`research/fit_resolution.py` gives each clip a budget AV1 can't meet at 1080p and CRF 55, finds the rate factor that
+fills it at each resolution (native, preset 8, one encode), and scores VMAF NEG against the 1080p source scaled back up:
+
+| Clip, budget | 1080p | 720p | 480p | 360p |
+| --- | --- | --- | --- | --- |
+| Big Buck Bunny, 1 MB | 83.7 (CRF 57) | 77.7 (50) | 68.6 (32) | 58.6 (21) |
+| town, 0.35 MB | 76.0 (61) | 75.3 (57) | 68.4 (45) | 57.8 (33) |
+| park, 0.8 MB | over at 63 | 37.1 (62) | 38.1 (57) | 32.9 (50) |
+| ducks, 0.6 MB | over at 63 | 19.0 (62) | 23.1 (57) | 21.5 (52) |
+
+SVT-AV1's rate factors go to 63, and past 55 the source's resolution kept winning wherever it could fit. Inside Pare,
+where a 10-second clip is 8 chunks with a keyframe each, the gap held: Big Buck Bunny under 1 MB scored 70.8 at 1080p
+(0.89 MB), 57.5 at 480p; town under 0.35 MB 62.5 at 1080p, 59.5 at 720p, 56.1 at 480p. So under a chosen size AV1
+now goes up to 63 (`limit`), and only a size out of reach even there steps down, to the largest resolution predicted
+to fit 5 steps short of 63. Half the original still stops at 55: a video that doesn't halve there comes out bigger
+rather than worse. x264 steps down as before; earlier data (above) has H.264 doing better smaller at low rates.
+
+Past 55, AV1's sizes fall ever faster: about -0.08 per step at CRF 49-56, -0.12 at 56-59, -0.15 to -0.19 at 59-61
+and -0.25 to -0.44 at 61-63 (the same encodes, at 1080p and 720p). The plan extends its tests past the highest one
+with a slope growing as e^(0.18 x steps past 55), and a refit heading there starts from that slope. Two more fixes came
+out of these runs. Refits used the plan's slope even after the encode had measured its own sizes, and at 720p that
+sent Big Buck Bunny from CRF 53.6 (1.01 MB) to 57.8 (0.69), 53.4 (1.03) and 60.1 (0.51 MB, half the budget); refits
+now take the slope to the encode's own nearest size on the side they're heading. And a lowered resolution was
+judged at its own size, where the 480p copy measured SSIM 0.956, "Excellent", while scoring 57.5 against the 1080p
+original; a resolution Pare picked itself is now compared at the original's size. The 20-second clip now comes out at
+1.46 MB (480p, VMAF NEG 37.5: that's what 1.5 MB buys) in 92 s.
+
+The plan's windows still come in low this far out (Big Buck Bunny planned 0.94 MB at CRF 59.4 and encoded 1.27), so
+these encodes usually take a refit. Preset 10's windows are only 1-6% smaller than preset 8's, so that isn't it; the
+refit, not the plan, lands them.
+
+## Screen recordings in AV1
+
+SVT-AV1 has tools for screen content: palette mode and intra block copy, on keyframes at preset 8. Its default
+(`--scm 2`) turns them on when it detects screen content, but only at preset 8 and slower; from preset 9 it forces
+them off. On 96 frames of the screen recording (a scrolling web page), preset 8 with detection matched `--scm 1` byte
+for byte, and against `--scm 0` saved 17.9% BD-rate on VMAF NEG (527, 387 and 267 KB against 578, 409 and 290 KB at
+CRF 30, 38 and 46), for 25% more time. So the encode already gets them. Preset 10, which the plan's test windows use,
+doesn't: its windows came out 5-14% bigger than preset 8's on this clip, against 1-6% on natural footage. The plan
+overestimates screen recordings, which only errs toward a smaller file, and at 0.06 bits per pixel they rarely need
+the size target anyway.
+
+## A preview before compressing
+
+The Preview button encodes three short windows (a fifth, half and four fifths of the way through) exactly as the
+compression will, same encoder, settings, rate factor and resolution, and shows a frame of each beside the source's.
+Each window starts with a keyframe, and AV1's are coded 24 quantizer steps coarser (see "Cheaper keyframes for AV1's
+chunks"), so frames right after it look worse than the encode's: the preview has to show a frame far enough in.
+Big Buck Bunny's frame 60 at CRF 54, SSIM against the source (ffmpeg, luma), against 0.933 in the compression's own
+38-frame chunk:
+
+| Window, frame shown | AV1 | x264 (CRF 28) |
+| --- | --- | --- |
+| Pare's chunk (37-75), frame 23 | 0.933 | 0.936 |
+| 12 frames, 6th | 0.898 | 0.928 |
+| 16 frames, 8th | 0.909 | |
+| 24 frames, 16th | 0.927 | 0.934 |
+| 32 frames, 24th | 0.929 | |
+
+Pare's preview is 24 frames showing the 16th: within 0.006 of the real encode, and on the pessimistic side. On town
+(x264, CRF 24) it was 0.949 against 0.951. It takes as long as encoding 24 frames on three encoders; for AV1 at 1080p
+that was 33 to 59 s on the benchmark machine under load, with the head start running alongside.
+
 ## End to end in the browser
 
 Same headless Chrome, same files, production builds:

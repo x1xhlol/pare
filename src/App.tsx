@@ -4,7 +4,7 @@ import { Compare } from './components/Compare'
 import { BENCHMARKS, BENCHMARK_SETUP } from './benchmarks'
 import * as fmt from './lib/format'
 import { dropPlace, placeLabel } from './lib/origin'
-import type { Calibration, Job, QualityReport } from './lib/media'
+import type { Calibration, FramePair, Job, QualityReport } from './lib/media'
 import type { Progress, SizePlan } from './lib/x264'
 import {
   audioFor, CODEC_LABEL, codecName, copiesFrames, deepFormat, forEngine, keepsHdr, reachable, targetBytes, outputSize, type Engine, type OutputCodec, type Preset, type Probe,
@@ -285,7 +285,7 @@ export default function App() {
         if (currentKey.current === key) setTuning({ key, round: 0, side })
         result = await again(sized)
       }
-      return { result, shortSide: sized.shortSide ?? undefined }
+      return { result, shortSide: sized === settings ? undefined : sized.shortSide ?? undefined }
     }
     // Auto tests AV1 while the settings are on screen. Starting before the test ends goes ahead with H.264 when it
     // meets the size target, so a quick start doesn't wait for a test that rarely changes the answer.
@@ -480,7 +480,9 @@ export default function App() {
       setPhase({ kind: 'done', probe, blob, url, quality: settings.preset === 'copy' ? 'failed' : 'pending', codec, missed,
         shortSide })
       if (settings.preset === 'copy') return
-      const quality = await measureQuality(probe, blob, scores).catch(() => 'failed' as const)
+      // The encoder's own scores are at the size it encoded; a resolution Pare chose itself is judged at the original's.
+      const quality = await (shortSide ? measureQuality(probe, blob, undefined, 8, true) : measureQuality(probe, blob, scores))
+        .catch(() => 'failed' as const)
       setPhase((p) => (p.kind === 'done' && p.blob === blob ? { ...p, quality } : p))
     } catch (err) {
       if (run.canceled) {
@@ -856,6 +858,35 @@ function Ready(props: {
 
   const unavailable = (['avc', 'hevc', 'av1'] as const).filter((c) => !probe.encodable[c]).map((c) => CODEC_LABEL[c])
   const result = tuning && 'result' in tuning ? tuning.result : null
+  // A few frames encoded as the compression will encode them, on request, for a look before it runs.
+  const [preview, setPreview] = useState<{ key: string; frames?: FramePair[]; error?: string } | null>(null)
+  const previewing = useRef<AbortController | null>(null)
+  const previewKey = result ? `${settingsKey(settings)}|${result.codec}|${result.crf}|${result.shortSide}|${result.fast}` : ''
+  const shown = preview && preview.key === previewKey ? preview : null
+  const canPreview = usesX264(settings) && !copy && result?.crf !== undefined && result.choice?.reason !== 'testing'
+  useEffect(() => {
+    previewing.current?.abort()
+    setPreview(null)
+  }, [previewKey])
+  useEffect(() => () => preview?.frames?.forEach((f) => (f.original.close(), f.compressed.close())), [preview])
+  const runPreview = async () => {
+    if (!result?.crf) return
+    previewing.current?.abort()
+    const controller = new AbortController()
+    previewing.current = controller
+    const key = previewKey
+    setPreview({ key })
+    try {
+      const codec = settings.autoCodec ? result.codec ?? 'avc' : thoroughCodec(settings)
+      const sized = { ...forEngine(probe, settings), codec, shortSide: result.shortSide ?? settings.shortSide }
+      const clip = await (await x264()).preview(probe, sized, result.crf, codec === 'avc' && !!result.fast, controller.signal)
+      const frames = await (await media()).framePairs(probe, clip.blob, clip.times, clip.first)
+      if (controller.signal.aborted) frames.forEach((f) => (f.original.close(), f.compressed.close()))
+      else setPreview({ key, frames })
+    } catch (err) {
+      if (!controller.signal.aborted) setPreview({ key, error: message(err) })
+    }
+  }
   const presetLabel = PRESETS.find((p) => p.value === settings.preset)?.label.toLowerCase()
   const better = (['hevc', 'av1'] as const).filter((c) => c !== settings.codec && probe.encodable[c])
   // Open by default only when something in it has been changed.
@@ -1077,6 +1108,11 @@ function Ready(props: {
                   : '\u00a0'}
           </span>
         </div>
+        {canPreview && (
+          <button type="button" className="button ghost" onClick={() => void runPreview()} disabled={!!shown && !shown.frames && !shown.error}>
+            {shown && !shown.frames && !shown.error ? 'Previewing…' : 'Preview'}
+          </button>
+        )}
         <button type="submit" className="button primary" disabled={noEncoder || (!!tuning && 'error' in tuning && !usesX264(settings))}>
           {copy ? 'Repackage video' : 'Compress video'}
         </button>
@@ -1108,6 +1144,18 @@ function Ready(props: {
         <p className="error" role="alert">
           {props.error}
         </p>
+      )}
+      {shown?.error && (
+        <p className="error" role="alert">
+          Couldn't make a preview. {shown.error}
+        </p>
+      )}
+      {shown?.frames && (
+        <Compare
+          frames={shown.frames}
+          title="Preview"
+          note={`Three moments of this video, encoded with the settings the compression will use${result?.shortSide ? `, at ${result.shortSide}p` : ''}. SSIM of 1.000 means identical.`}
+        />
       )}
     </form>
   )

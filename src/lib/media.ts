@@ -570,18 +570,62 @@ function pickFrames(probe: Probe, scores: { times: number[]; ssim: number[] } | 
  * Decodes matching frames from both files for the side-by-side view and scores them. When the encoder scored every
  * frame, those scores are the headline numbers and the view opens on the weakest frames.
  */
+/**
+ * The source's frames at `times` beside the same frames of `clip`, an encode that kept the source's timestamps from
+ * `first` (a preview).
+ */
+export async function framePairs(probe: Probe, clip: Blob, times: number[], first: number): Promise<FramePair[]> {
+  const source = openInput(probe.file)
+  const encoded = openInput(clip)
+  try {
+    const [a, b] = await Promise.all([source.getPrimaryVideoTrack(), encoded.getPrimaryVideoTrack()])
+    if (!a || !b) throw new Error('Missing video track.')
+    const size = measureSize(await b.getDisplayWidth(), await b.getDisplayHeight())
+    const sinkA = new CanvasSink(a, size)
+    const sinkB = new CanvasSink(b, size)
+    const offset = first - Math.max(0, await b.getFirstTimestamp())
+    const frames: FramePair[] = []
+    for (const t of times) {
+      const original = await sinkA.getCanvas(t)
+      const compressed = original && (await sinkB.getCanvas(original.timestamp - offset + original.duration / 2))
+      if (!original || !compressed) continue
+      const ya = lumaOf(original.canvas, size.width, size.height)
+      const yb = lumaOf(compressed.canvas, size.width, size.height)
+      frames.push({
+        time: original.timestamp - probe.firstTimestamp,
+        original: await createImageBitmap(original.canvas),
+        compressed: await createImageBitmap(compressed.canvas),
+        ssim: ssim(ya, yb, size.width, size.height),
+        psnr: psnr(ya, yb),
+      })
+    }
+    if (!frames.length) throw new Error('Could not decode frames to compare.')
+    return frames
+  } finally {
+    source.dispose()
+    encoded.dispose()
+  }
+}
+
 export async function measureQuality(
   probe: Probe,
   result: Blob,
   scores?: { times: number[]; ssim: number[] },
   count = 8,
+  atSource = false,
 ): Promise<QualityReport> {
   const source = openInput(probe.file)
   const encoded = openInput(result)
   try {
     const [a, b] = await Promise.all([source.getPrimaryVideoTrack(), encoded.getPrimaryVideoTrack()])
     if (!a || !b) throw new Error('Missing video track.')
-    const size = measureSize(await b.getDisplayWidth(), await b.getDisplayHeight())
+    // Frames are compared at the copy's size, which is what a resolution picked by hand asks about. One Pare lowered to
+    // fit a size is compared with the original at the original's: at its own size, Big Buck Bunny's 480p copy under
+    // 1 MB measured SSIM 0.956 ("Excellent") while scoring 57.5 VMAF NEG against the 1080p original, 13 points under
+    // the 1080p copy of the same size.
+    const size = atSource
+      ? measureSize(await a.getDisplayWidth(), await a.getDisplayHeight())
+      : measureSize(await b.getDisplayWidth(), await b.getDisplayHeight())
     const sinkA = new CanvasSink(a, size)
     const sinkB = new CanvasSink(b, size)
     // Encoded time = source time − offset. The browser's encoder (a Mediabunny conversion) trims to the source's first

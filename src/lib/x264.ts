@@ -101,7 +101,9 @@ type Profile = {
   /** Rate factors without the size target. Visually lossless with it starts from `ceiling` instead. */
   crf: Record<EncodingPreset, number>
   ceiling: number
+  /** The highest rate factor for half the size, and for a size chosen with Fit under (see maxCrf). */
   max: number
+  limit: number
   /** Typical change in log size per rate factor step, and the steeper one the budget assumes. */
   slope: number
   budgetSlope: number
@@ -146,6 +148,7 @@ const X264: Profile = {
   /** Past this, extra bits buy nothing visible even on paused frames (VMAF NEG 95-100 on the corpus at CRF 16). */
   ceiling: 15,
   max: 30,
+  limit: 30,
   /** Sizes fall ~13% per step between CRF 15 and 25 (median of the corpus, range 8-25%). */
   slope: -0.13,
   budgetSlope: -0.15,
@@ -192,6 +195,10 @@ const AV1: Profile = {
   crf: { 'visually-lossless': 18, high: 36, compact: 42 },
   ceiling: 16,
   max: 55,
+  // Under a chosen size SVT-AV1's whole range beats a lower resolution: Big Buck Bunny under 1 MB scored 83.7 VMAF NEG
+  // at 1080p and CRF 57 against 77.7 at 720p and 68.6 at 480p, town under 0.35 MB 76.0 at CRF 61 against 75.3 and
+  // 68.4 (research/fit_resolution.py).
+  limit: 63,
   /** Sizes fall ~7.5% per step (median of the corpus, range 4-15%). */
   slope: -0.075,
   budgetSlope: -0.1,
@@ -222,6 +229,55 @@ const AV1: Profile = {
     options.push(`color-range=${color.fullRange ? 1 : 0}`)
     return options
   },
+}
+
+/**
+ * The highest rate factor the size target may take the encoder to. Half the original stops at `max`, and a video
+ * that doesn't halve there comes out bigger rather than worse: it was efficiently compressed already. A size chosen
+ * with Fit under is usually a hard limit (an upload or attachment cap), so it goes to `limit`.
+ */
+export const maxCrf = (profile: Profile, settings: Settings) => (settings.targetBytes ? profile.limit : profile.max)
+
+/**
+ * Past `max`, SVT-AV1's sizes fall ever faster toward its highest rate factor as its quantizer steps grow: about
+ * -0.08 a step at CRF 49-56, -0.12 at 56-59, -0.15 to -0.19 at 59-61 and -0.25 to -0.44 at 61-63 (Big Buck Bunny,
+ * town, park and ducks at 1080p and 720p, research/fit_resolution.py). There the slope measured below `max` grows as
+ * e^(TAIL × steps past it); a straight line would put the rate factor for a size too high and the size at one too big.
+ */
+const TAIL = 0.18
+
+/** Log size at rate factor `crf` against at `max`, from the slope measured below it (straight for x264). */
+function logSize(profile: Profile, slope: number, crf: number) {
+  return crf <= profile.max || profile.limit === profile.max
+    ? slope * (crf - profile.max)
+    : (slope / TAIL) * Math.expm1(TAIL * (crf - profile.max))
+}
+
+/** The rate factor where log size has changed by `change` from rate factor `from`: logSize's inverse. */
+function crfFor(profile: Profile, slope: number, from: number, change: number) {
+  const target = logSize(profile, slope, from) + change
+  return target >= 0 || profile.limit === profile.max
+    ? profile.max + target / slope
+    : profile.max + Math.log1p((target * TAIL) / slope) / TAIL
+}
+
+/** The slope at rate factor `crf`: `slope` up to `max`, steeper past it (logSize). */
+const slopeAt = (profile: Profile, slope: number, crf: number) =>
+  crf <= profile.max || profile.limit === profile.max ? slope : slope * Math.exp(TAIL * (crf - profile.max))
+
+/** The slope at `max` that logSize needs to have `slope` at rate factor `at`: slopeAt's inverse. */
+const slopeAtMax = (profile: Profile, slope: number, at: number) =>
+  at <= profile.max || profile.limit === profile.max ? slope : slope / Math.exp(TAIL * (at - profile.max))
+
+/**
+ * Bytes at rate factor `crf` from tests `a` and `b` (a.crf < b.crf): log size straight between them, and past `b`
+ * from `b`, bending past AV1's `max` from the slope measured between them.
+ */
+function extend(profile: Profile, a: { crf: number; bytes: number }, b: { crf: number; bytes: number }, crf: number) {
+  const slope = Math.log(b.bytes / a.bytes) / (b.crf - a.crf)
+  if (crf <= b.crf) return a.bytes * Math.exp(slope * (crf - a.crf))
+  const base = slopeAtMax(profile, slope, (a.crf + b.crf) / 2)
+  return b.bytes * Math.exp(logSize(profile, base, crf) - logSize(profile, base, b.crf))
 }
 
 /** The encoder the settings ask for: AV1 when chosen, x264 otherwise. */
@@ -945,7 +1001,8 @@ export function encode(probe: Probe, settings: Settings, start: EncodeStart, onP
       const size = frameSize(probe, settings, turn.rotation)
       const profile = profileFor(settings)
       const floor = floorCrf(settings)
-      const crf = Math.min(profile.max, Math.max(floor, start.crf ?? floor))
+      const ceiling = maxCrf(profile, settings)
+      const crf = Math.min(ceiling, Math.max(floor, start.crf ?? floor))
       const slope = start.slope && start.slope < -0.03 ? start.slope : profile.slope
       const [line, tuned, sound] = await Promise.all([timeline(probe.file), encoderOptions(probe, settings, crf),
         audioPackets(probe.file)])
@@ -974,7 +1031,8 @@ export function encode(probe: Probe, settings: Settings, start: EncodeStart, onP
       // A steeper slope than measured keeps the budget from overreaching when it lowers the rate factor: near the
       // sizes it lands on, noisy footage grows much faster than the plan's two distant tests suggest.
       const budget = settings.sizeTarget
-        ? new Budget({ goal, frames: frameCounts, floor, max: profile.max, crf, slope: Math.min(slope, profile.budgetSlope) })
+        ? new Budget({ goal, frames: frameCounts, floor, max: ceiling, crf,
+            slope: Math.min(slopeAt(profile, slope, crf), profile.budgetSlope) })
         : null
       const crfs: number[] = chunks.map(() => crf)
       /** Ends chunk `index` before the frame at `at`, and returns the rest as a new chunk. */
@@ -1061,13 +1119,21 @@ export function encode(probe: Probe, settings: Settings, start: EncodeStart, onP
       // UNDER_GOAL: at 78% of it, tree's AV1 encode went again for +0.5 VMAF NEG in 40% more time. Either way the
       // second pass aims just under the limit rather than back at the first pass's aim.
       let total = encoded.reduce((t, c) => t + chunkBytes(c), 0)
+      /**
+       * The whole video's size at each mean rate factor encoded so far. Once there's one on the side a refit is
+       * heading, the slope to it beats the plan's estimates: on Big Buck Bunny under 1 MB at 720p, the plan's slope
+       * sent AV1 from 53.6 (1.01 MB) to 57.8 (0.69), back to 53.4 (1.03), and on to 60.1 (0.51).
+       */
+      const tried: { crf: number; bytes: number }[] = []
       const fitTo = async (limit: number) => {
         for (let round = 0; budget && round < 3; round++) {
           if (canceled) throw new Canceled()
           const over = total > limit
           if (!over && !(total < goal * UNDER_GOAL && crfs.some((c) => c > floor + 0.25))) break
           const mean = encoded.reduce((t, c) => t + crfs[c.index] * chunkBytes(c), 0) / total
-          const local = localSlope(start.points ?? [], mean, total, over, slope)
+          const planned = localSlope(start.points ?? [], mean, total, over, slopeAt(profile, slope, mean + (over ? 1.5 : -1.5)))
+          const local = localSlope(tried, mean, total, over, planned)
+          tried.push({ crf: mean, bytes: total })
           // A few chunks to redo would leave most encoders idle, and AV1 has no threads to give them: cut each chunk
           // into pieces of at least 20 frames so every encoder works (x264 keeps two threads per piece), and budget for
           // the extra keyframes. With 30, Jellyfish's two 41- and 44-frame chunks went again whole, on 2 of 8 encoders.
@@ -1078,8 +1144,8 @@ export function encode(probe: Probe, settings: Settings, start: EncodeStart, onP
           // Chunks already at the limit of the range would come out the same.
           const changing = (list: { index: number; crf: number }[]) => list.filter((r) => Math.abs(r.crf - crfs[r.index]) >= 0.05)
           const aim = limit * REFIT_AIM
-          let redo = changing(refit(encoded, crfs, total - aim, local, floor, profile.max))
-          if (cuts(redo)) redo = changing(refit(encoded, crfs, total - aim + cuts(redo) * keyframeCost(encoded), local, floor, profile.max))
+          let redo = changing(refit(encoded, crfs, total - aim, local, floor, ceiling))
+          if (cuts(redo)) redo = changing(refit(encoded, crfs, total - aim + cuts(redo) * keyframeCost(encoded), local, floor, ceiling))
           if (!redo.length) break
           const again = redo.flatMap(({ index, crf: value }) =>
             cutInto(index, piecesFor(redo.length, index)).map((c) => withCrf(c, value)))
@@ -1320,14 +1386,20 @@ function fit(probe: Probe, settings: Settings, points: PlanPoint[]): SizePlan {
     }
     return { crf: first.crf, size: first.bytes + audio, raised: false, fitted: false, slope, points: sorted, bound: false }
   }
-  let crf = Math.min(profile.max, Math.max(first.crf, a.crf + Math.log(goal / a.bytes) / slope))
+  const highest = maxCrf(profile, settings)
+  // Between the two tests, or short of AV1's bend, a straight line; past the higher test, on from it.
+  const reach = goal >= b.bytes || measured >= -0.03
+    ? a.crf + Math.log(goal / a.bytes) / slope
+    : crfFor(profile, slopeAtMax(profile, slope, (a.crf + b.crf) / 2), b.crf, Math.log(goal / b.bytes))
+  let crf = Math.min(highest, Math.max(first.crf, reach))
   // Past the highest test the straight line tends to overstate sizes (the noise stops costing bits), so land halfway
-  // back: the encode checks its real size and corrects either way.
-  if (crf > top) crf = top + (crf - top) / 2
-  const video = a.bytes * Math.exp(slope * (crf - a.crf))
+  // back: the encode checks its real size and corrects either way. Past AV1's `max` the curve bends the other way,
+  // and logSize follows it.
+  if (crf > top && reach <= profile.max) crf = top + (crf - top) / 2
+  const video = measured < -0.03 ? extend(profile, a, b, crf) : a.bytes * Math.exp(slope * (crf - a.crf))
   console.info(`[pare] plan: crf ${crf.toFixed(1)} → ${(video / 1e6).toFixed(2)} MB video, slope ${slope.toFixed(3)}`)
   // The encode steers to the goal, so that's the size to expect, unless even the highest rate factor misses it.
-  const atMax = a.bytes * Math.exp(slope * (profile.max - a.crf))
+  const atMax = measured < -0.03 ? extend(profile, a, b, highest) : a.bytes * Math.exp(slope * (highest - a.crf))
   const expected = atMax > goal ? atMax : Math.min(video, goal)
   return { crf: Math.round(crf * 10) / 10, size: expected + audio, raised: crf > baseCrf,
     fitted: settings.preset === 'visually-lossless', slope, points: sorted, bound: true }
@@ -1472,7 +1544,7 @@ export async function plan(probe: Probe, settings: Settings, signal: AbortSignal
     // presets keep their own rate factor unless it would miss the target.
     const [lo, hi] = tests ?? [
       settings.preset === 'visually-lossless' ? profile.ceiling : baseCrf,
-      Math.min(profile.max, (settings.preset === 'visually-lossless' ? profile.ceiling : baseCrf) +
+      Math.min(maxCrf(profile, settings), (settings.preset === 'visually-lossless' ? profile.ceiling : baseCrf) +
         (settings.preset === 'visually-lossless' ? profile.span.lossless : profile.span.other)),
     ]
     if (fastFirst && score) {
@@ -1508,7 +1580,7 @@ export async function plan(probe: Probe, settings: Settings, signal: AbortSignal
     // Bunny, the phone clips) the line held within a few percent and the round isn't worth its time.
     const curved = planned.crf > hi || (planned.slope ?? 0) <= CURVED
     if (planned.bound && curved && planned.crf > lo + MID_TEST && Math.abs(planned.crf - hi) > MID_TEST) {
-      points.push(...(await videoAt([Math.round(Math.min(profile.max, planned.crf) * 2) / 2])))
+      points.push(...(await videoAt([Math.round(Math.min(maxCrf(profile, settings), planned.crf) * 2) / 2])))
       planned = fit(probe, settings, points)
     }
     console.info(`[pare] plan: ${(performance.now() - began) / 1000 | 0} s, ${windows.length}×${per} frames, ` +
@@ -1532,6 +1604,56 @@ export async function plan(probe: Probe, settings: Settings, signal: AbortSignal
   }
 }
 
+/**
+ * Frames in each preview window, and the one shown, two thirds in. Each window starts with a keyframe, which AV1 codes
+ * coarser, and frames close to it look worse than the encode's: on Big Buck Bunny at CRF 54, against 0.933 SSIM for
+ * the same frame in the compression's own 38-frame chunk, the middle of a 12-frame window scored 0.898, of 16 0.909,
+ * and frame 16 of 24 0.927.
+ */
+const PREVIEW_FRAMES = 24
+const PREVIEW_SHOWN = 2 / 3
+/** Where the preview windows sit, as shares of the video. */
+const PREVIEW_AT = [0.2, 0.5, 0.8]
+
+/**
+ * A look at the result before compressing: short windows spread across the video, encoded as the compression will
+ * encode them (same encoder, settings, rate factor and resolution), as a small MP4 with the source's timestamps.
+ * `times` are the frames to show, one from each window, past where its keyframe still shows (PREVIEW_FRAMES).
+ */
+export async function preview(probe: Probe, settings: Settings, crf: number, fast: boolean, signal: AbortSignal) {
+  const orient = await orientation(probe.file)
+  const size = frameSize(probe, settings, orient.rotation)
+  const line = await timeline(probe.file)
+  const n = line.times.length
+  const per = Math.min(PREVIEW_FRAMES, n)
+  const starts = [...new Set(PREVIEW_AT.map((at) => Math.max(0, Math.min(n - per, Math.round(at * n - per / 2)))))]
+  const windows = starts.map((first, index) => ({
+    type: 'chunk' as const, index, start: line.times[first], end: first + per < n ? line.times[first + per] : Infinity,
+  }))
+  const profile = profileFor(settings)
+  const fps = probe.fps || 30
+  if (signal.aborted) throw new Canceled()
+  const pool = await createPool(profile, windows.length, 1, {
+    file: probe.file, options: fast ? fastest(encoderOptions(probe, settings, crf)) : encoderOptions(probe, settings, crf),
+    width: size.width, height: size.height, fpsNum: Math.round(fps * 1000), fpsDen: 1000, direct: copiesFrames(probe),
+    scoring: false,
+  })
+  const stop = () => pool.terminate()
+  signal.addEventListener('abort', stop)
+  try {
+    const chunks = await pool.run(windows, () => {})
+    if (signal.aborted) throw new Canceled()
+    const ordered = windows.map((w) => chunks[w.index])
+    const blob = await mux(probe, { ...settings, keepAudio: false }, ordered, size, orient)
+    const bytes = ordered.reduce((sum, c) => sum + c.packets.reduce((s, p) => s + p.size, 0), 0)
+    return { blob, times: ordered.map((c) => c.times[Math.floor(c.times.length * PREVIEW_SHOWN)]),
+      first: Math.min(...ordered.map((c) => c.times[0])), bitrate: (bytes * 8 * fps) / ordered.reduce((s, c) => s + c.times.length, 0) }
+  } finally {
+    signal.removeEventListener('abort', stop)
+    pool.terminate()
+  }
+}
+
 export type Choice = {
   codec: 'avc' | 'av1'
   /** The chosen encoder's size plan, to start the encode from. */
@@ -1547,14 +1669,14 @@ export type Choice = {
   reason: 'unlimited' | 'fits' | 'high' | 'device' | 'size' | 'better' | 'even' | 'predicted' | 'hdr'
 }
 
-/** Predicted bytes at rate factor `crf`, log size straight through the plan's two tests. */
-function bytesAt(points: SizePlan['points'], crf: number) {
+/** Predicted bytes at rate factor `crf`: log size straight through the plan's tests, bending past AV1's `max`. */
+function bytesAt(points: SizePlan['points'], crf: number, profile?: Profile) {
   if (!points || points.length < 2) return Infinity
   const sorted = [...points].sort((a, b) => a.crf - b.crf)
   let i = 0
   while (i + 2 < sorted.length && sorted[i + 1].crf <= crf) i++
   const [lo, hi] = [sorted[i], sorted[i + 1]]
-  return lo.bytes * Math.exp((Math.log(hi.bytes / lo.bytes) / (hi.crf - lo.crf)) * (crf - lo.crf))
+  return profile ? extend(profile, lo, hi, crf) : lo.bytes * Math.exp((Math.log(hi.bytes / lo.bytes) / (hi.crf - lo.crf)) * (crf - lo.crf))
 }
 
 /** VMAF NEG at `bytes`, linear in log size through the plan's two tests. */
@@ -1629,7 +1751,7 @@ function predictsAv1(avc: SizePlan) {
 async function planAv1(probe: Probe, settings: Settings, avc: SizePlan, signal: AbortSignal) {
   const guess = 1.88 * avc.crf - 10.7
   const edge = avc.crf >= X264.max - AUTO_EDGE
-  const low = Math.round(Math.min(AV1.max - AV1_BRACKET * 2, Math.max(AV1.ceiling, edge ? guess : guess - AV1_BRACKET)))
+  const low = Math.round(Math.min(maxCrf(AV1, settings) - AV1_BRACKET * 2, Math.max(AV1.ceiling, edge ? guess : guess - AV1_BRACKET)))
   const av1 = { ...settings, codec: 'av1' as const }
   const tested = await plan(probe, av1, signal, false, AV1_TEST_WINDOWS, [low, low + AV1_BRACKET * 2])
   return fit(probe, av1, tested.points!.map((p) => ({ ...p, bytes: p.bytes * subsetScale(avc) })))
@@ -1646,7 +1768,7 @@ function subsetScale(avc: SizePlan) {
 function testAv1(probe: Probe, settings: Settings, avc: SizePlan, signal: AbortSignal) {
   const { width, height } = outputSize(probe, settings.shortSide)
   const guess = 1.88 * avc.crf - 10.7
-  const low = Math.round(Math.min(AV1.max - AV1_BRACKET * 2, Math.max(AV1.ceiling, guess - AV1_BRACKET)))
+  const low = Math.round(Math.min(maxCrf(AV1, settings) - AV1_BRACKET * 2, Math.max(AV1.ceiling, guess - AV1_BRACKET)))
   const test = playsAv1(width, height, probe.fps).then((ok) => ok
     ? plan(probe, { ...settings, codec: 'av1' }, signal, true, AV1_TEST_WINDOWS, [low, low + AV1_BRACKET * 2])
     : null)
@@ -1666,15 +1788,16 @@ const PIXEL_POWER = { avc: 0.94, av1: 0.78 }
 const FIT_STEPS = 5
 
 /**
- * For a size target the video can't reach at `settings`' resolution even at the encoder's highest rate factor: the
- * largest lower short side that should reach it FIT_STEPS below that, or the lowest there is. Null when the plan
- * reaches the target, or nothing lower is left. The plan at that size says whether it did.
+ * For a size chosen with Fit under that the video can't reach at `settings`' resolution even at the encoder's highest
+ * rate factor: the largest lower short side that should reach it FIT_STEPS below that, or the lowest there is. Null
+ * when the plan reaches the target, or nothing lower is left; the plan at that size says whether it did. Half the
+ * original never gets here: a video that doesn't halve comes out bigger rather than worse (maxCrf).
  */
 export function fitSide(probe: Probe, settings: Settings, plan: SizePlan, codec: 'avc' | 'av1') {
-  if (!settings.sizeTarget || !plan.bound) return null
+  if (!settings.sizeTarget || !settings.targetBytes || !plan.bound) return null
   const profile = codec === 'av1' ? AV1 : X264
   const goal = videoGoal(probe, { ...settings, codec })
-  const atMax = bytesAt(plan.points, profile.max)
+  const atMax = bytesAt(plan.points, maxCrf(profile, settings), profile)
   if (!Number.isFinite(atMax) || atMax <= goal) return null
   const current = Math.min(settings.shortSide ?? Infinity, probe.width, probe.height)
   const lower = FIT_SIDES.filter((side) => side < current)
@@ -1685,7 +1808,7 @@ export function fitSide(probe: Probe, settings: Settings, plan: SizePlan, codec:
 
 /** Whether H.264 can meet the size target at all, going by its plan. Otherwise Auto has to wait for AV1's test. */
 export const avcReaches = (probe: Probe, settings: Settings, avc: SizePlan) =>
-  !settings.sizeTarget || !avc.bound || bytesAt(avc.points, X264.max) <= videoGoal(probe, settings)
+  !settings.sizeTarget || !avc.bound || bytesAt(avc.points, maxCrf(X264, settings)) <= videoGoal(probe, settings)
 
 /**
  * Whether a compression started now may skip AV1's test, given H.264's plan: at once when its size falls gently near
@@ -1751,7 +1874,7 @@ export async function settle(probe: Probe, settings: Settings, avc: SizePlan, si
     console.info(`[pare] auto: VMAF NEG at ${(goal / 1e6).toFixed(1)} MB, H.264 ${vmaf.avc.toFixed(2)}, AV1 ${vmaf.av1?.toFixed(2)}; ` +
       `rate factors ${avc.crf} / ${av1.crf}`)
     // x264 at its highest rate factor still over the target: only AV1 can keep the size promise.
-    if (!reaches && bytesAt(av1.points, AV1.max) <= goal) return { codec: 'av1', plan: av1, vmaf, reason: 'size' }
+    if (!reaches && bytesAt(av1.points, maxCrf(AV1, settings), AV1) <= goal) return { codec: 'av1', plan: av1, vmaf, reason: 'size' }
     // At the edge of its range H.264 has no headroom, and a first pass over the size ends at its highest rate factor
     // (park: planned 28.3, finished at 30 with 78.9 against a predicted 82.8), so there AV1 wins ties.
     const margin = avc.crf >= X264.max - AUTO_EDGE ? 0 : AUTO_MARGIN

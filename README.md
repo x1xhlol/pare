@@ -70,13 +70,20 @@ What Pare does instead:
   corpus that picked the better encoder in 28 of 30 cases; SSIM would have agreed with VMAF in 21. When H.264's first
   test round already shows fine noise or H.264 at the edge of its range, every clip in the benchmark went to AV1
   anyway, so Auto skips AV1's quality test there and only sizes it. Those clips got 5–45% faster.
+- **A preview before compressing.** Once the size plan is in, Preview encodes three short windows of the video
+  exactly as the compression will (same encoder, rate factor and resolution) and shows a frame of each beside the
+  original, so a tight size can be judged before waiting for it. The frame shown is two thirds into a 24-frame
+  window, past where the window's own keyframe still shows: within 0.006 SSIM of the real encode's frame, and never
+  flattering it.
 - **Works offline, and as an app.** A service worker keeps the page and, once a video has been opened, the encoders,
   so Pare works with the network off: switch it off and compress something to check that nothing leaves the device.
   Installed on Android, it takes videos shared from the gallery; installed on the desktop, it opens video files. The
   result can go straight to another app with the Share button, where the browser supports it.
-- **Too small for the resolution.** When a size target is out of reach at the source's resolution even at the
-  encoder's lowest quality, Pare plans again at the largest of 1080p, 720p, 480p and 360p that should reach it, rather
-  than encode a file that misses. Big Buck Bunny (30.7 MB) under 1 MB came out at 0.93 MB, in AV1 at 480p.
+- **Sizes out of reach.** Under a size chosen with Fit under, AV1 goes to its highest rate factor (63) before anything
+  else: measured against the 1080p original, the source's resolution beat every lower one at the same size (Big Buck
+  Bunny under 1 MB: 70.8 VMAF NEG at 1080p, 57.5 at 480p). Only a size out of reach even there makes Pare plan again
+  at the largest of 1080p, 720p, 480p and 360p that should fit, rather than encode a file that misses: 20 seconds of
+  1080p50 under 1.5 MB used to come out at 8.66 MB, and now does at 1.46.
 
 The encoder settings come from measurement. Every candidate was swept over rate factors on a test corpus and scored
 with VMAF, VMAF NEG, SSIM and PSNR. `faster` with a 40-frame lookahead and weighted prediction needs about 30% fewer
