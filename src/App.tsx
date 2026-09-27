@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, type DragEvent } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent } from 'react'
 import { Choice, type Option } from './components/Choice'
 import { Compare } from './components/Compare'
 import { BENCHMARKS, BENCHMARK_SETUP } from './benchmarks'
@@ -13,6 +13,9 @@ import {
 
 const media = () => import('./lib/media')
 const x264 = () => import('./lib/x264')
+type X264Module = Awaited<ReturnType<typeof x264>>
+/** The File Handling API's queue of files an installed app was opened with (Chromium only, not in TypeScript's DOM). */
+type LaunchQueue = { setConsumer(consumer: (params: { files?: FileSystemFileHandle[] }) => void): void }
 
 type Phase =
   | { kind: 'empty'; error?: string }
@@ -29,10 +32,20 @@ type Phase =
       codec?: 'avc' | 'av1'
       /** The size target was on and the file still came out over it: the target, or null for half the original. */
       missed?: { target: number | null }
+      /** The short side Pare went down to because the size target was out of reach at the source's. */
+      shortSide?: number
     }
 
-type Tuning = { round: number } | { result: Calibration } | { error: string }
-type HeadStart = { key: string; job: Job; codec: 'avc' | 'av1'; progress: Progress | null; watch?: (p: Progress) => void }
+/** `side`: planning again at that short side, the size target being out of reach at the source's. */
+type Tuning = { round: number; side?: number } | { result: Calibration } | { error: string }
+type HeadStart = {
+  key: string
+  job: Job
+  codec: 'avc' | 'av1'
+  shortSide?: number
+  progress: Progress | null
+  watch?: (p: Progress) => void
+}
 type CalibrationEntry = {
   promise: Promise<Calibration>
   controller: AbortController
@@ -176,6 +189,8 @@ export default function App() {
 
   const open = useCallback(async (file: File) => {
     setPhase({ kind: 'probing', name: file.name })
+    // Someone opening a video will want the encoders: the service worker keeps them for next time, and offline.
+    navigator.serviceWorker?.controller?.postMessage('warm')
     headStart.current?.job.cancel()
     headStart.current = null
     headStarted.current.clear()
@@ -199,6 +214,27 @@ export default function App() {
       setPhase({ kind: 'empty', error: `Couldn't open ${file.name}. ${message(err)}` })
     }
   }, [])
+
+  // A video shared to the installed app (the manifest's share_target), which the service worker holds for the page, or
+  // one opened with it from the desktop (file_handlers).
+  useEffect(() => {
+    if (new URLSearchParams(location.search).has('shared') && 'caches' in window) {
+      history.replaceState(null, '', '/')
+      void (async () => {
+        const cache = await caches.open('pare-shared')
+        const response = await cache.match('/shared')
+        if (!response) return
+        await cache.delete('/shared')
+        const name = decodeURIComponent(response.headers.get('x-name') ?? 'Shared video')
+        void open(new File([await response.blob()], name, { type: response.headers.get('content-type') ?? '' }))
+      })()
+    }
+    const queue = (window as unknown as { launchQueue?: LaunchQueue }).launchQueue
+    queue?.setConsumer(async ({ files }) => {
+      const handle = files?.[0]
+      if (handle) void open(await handle.getFile())
+    })
+  }, [open])
 
   const resultUrl = phase.kind === 'done' ? phase.url : null
   const report = phase.kind === 'done' && typeof phase.quality === 'object' ? phase.quality : null
@@ -238,6 +274,19 @@ export default function App() {
     }
     const fromPlan = ({ size, crf, raised, fitted, slope, points, reuse, fast }: SizePlan): Calibration =>
       ({ bitrate: 0, size, ssim: 0, target: 0, reached: true, crf, raised, fitted, slope, points, reuse, fast })
+    // A size target out of reach at the source's resolution even at the highest rate factor plans again smaller, down
+    // to 360p, rather than encode a file that misses it. Only from Original: a resolution picked by hand stays.
+    const shrink = async <T,>(m: X264Module, result: T, of: (r: T) => [SizePlan, 'avc' | 'av1'],
+                              again: (s: Settings) => Promise<T>) => {
+      let sized = settings
+      for (let side = settings.shortSide === null ? m.fitSide(probe, sized, ...of(result)) : null; side !== null;
+           side = m.fitSide(probe, sized, ...of(result))) {
+        sized = { ...sized, shortSide: side }
+        if (currentKey.current === key) setTuning({ key, round: 0, side })
+        result = await again(sized)
+      }
+      return { result, shortSide: sized.shortSide ?? undefined }
+    }
     // Auto tests AV1 while the settings are on screen. Starting before the test ends goes ahead with H.264 when it
     // meets the size target, so a quick start doesn't wait for a test that rarely changes the answer.
     const test = new AbortController()
@@ -257,11 +306,17 @@ export default function App() {
             await avc.scored
             if (m.testsAv1(probe, settings, avc) && currentKey.current === key && !entry.result)
               setTuning({ key, result: { ...fromPlan(avc), codec: 'avc', choice: { reason: 'testing' } } })
-            const { codec, plan, reason, vmaf } = await m.settle(probe, settings, avc, test.signal)
-            return { ...fromPlan(plan), codec, choice: { reason, vmaf } }
+            const { result: { codec, plan, reason, vmaf }, shortSide } = await shrink(m,
+              await m.settle(probe, settings, avc, test.signal), (c) => [c.plan, c.codec],
+              async (s) => m.settle(probe, s, await m.planAvc(probe, s, controller.signal), test.signal))
+            return { ...fromPlan(plan), codec, choice: { reason, vmaf }, shortSide }
           })
         : usesX264(settings)
-          ? x264().then(async (m) => fromPlan(await m.plan(probe, settings, controller.signal)))
+          ? x264().then(async (m) => {
+              const { result, shortSide } = await shrink(m, await m.plan(probe, settings, controller.signal),
+                (p) => [p, thoroughCodec(settings)], (s) => m.plan(probe, s, controller.signal))
+              return { ...fromPlan(result), shortSide }
+            })
           : media().then((m) => m.calibrate(probe, settings, controller.signal, onRound)),
     }
     entry.promise.then(
@@ -325,8 +380,9 @@ export default function App() {
       const codec = settings.autoCodec ? settled.codec ?? 'avc' : thoroughCodec(settings)
       const start = { crf: settled.crf, slope: settled.slope, points: settled.points,
         reuse: codec === 'avc' ? settled.reuse : undefined, fast: codec === 'avc' && settled.fast }
-      const spec: HeadStart = { key, codec, progress: null, job: null as unknown as Job }
-      spec.job = engine.encode(probe, { ...forEngine(probe, settings), codec }, start, (p) => {
+      const spec: HeadStart = { key, codec, shortSide: settled.shortSide, progress: null, job: null as unknown as Job }
+      const sized = { ...forEngine(probe, settings), codec, shortSide: settled.shortSide ?? settings.shortSide }
+      spec.job = engine.encode(probe, sized, start, (p) => {
         spec.progress = p
         spec.watch?.(p)
       })
@@ -379,11 +435,13 @@ export default function App() {
     })
     const onProgress = (progress: Progress) => setPhase((p) => (p.kind === 'running' ? { ...p, progress } : p))
     let codec: 'avc' | 'av1' | undefined
+    let shortSide: number | undefined
     try {
       if (adopted) {
         adopted.watch = onProgress
         run.job = adopted.job
         codec = adopted.codec
+        shortSide = adopted.shortSide
       } else if (usesX264(settings)) {
         const x264Engine = await x264()
         let plan: Calibration | undefined
@@ -404,7 +462,8 @@ export default function App() {
         setPhase((p) => (p.kind === 'running' ? { ...p, status: 'Starting encoders…' } : p))
         // Auto without a size target has nothing to compare, and only an HDR video it keeps in 10 bits goes to AV1.
         codec = settings.autoCodec ? plan?.codec ?? (keepsHdr(probe) ? 'av1' : 'avc') : thoroughCodec(settings)
-        run.job = x264Engine.encode(probe, { ...engine, codec },
+        shortSide = plan?.shortSide
+        run.job = x264Engine.encode(probe, { ...engine, codec, shortSide: shortSide ?? engine.shortSide },
           { crf: plan?.crf, slope: plan?.slope, points: plan?.points, reuse: codec === 'avc' ? plan?.reuse : undefined,
             fast: codec === 'avc' && plan?.fast }, onProgress)
       } else {
@@ -418,7 +477,8 @@ export default function App() {
       const url = URL.createObjectURL(blob)
       const missed = engine.sizeTarget && settings.preset !== 'copy' && blob.size > targetBytes(probe, settings)
         ? { target: settings.targetBytes ?? null } : undefined
-      setPhase({ kind: 'done', probe, blob, url, quality: settings.preset === 'copy' ? 'failed' : 'pending', codec, missed })
+      setPhase({ kind: 'done', probe, blob, url, quality: settings.preset === 'copy' ? 'failed' : 'pending', codec, missed,
+        shortSide })
       if (settings.preset === 'copy') return
       const quality = await measureQuality(probe, blob, scores).catch(() => 'failed' as const)
       setPhase((p) => (p.kind === 'done' && p.blob === blob ? { ...p, quality } : p))
@@ -753,13 +813,13 @@ function FileSummary({ probe, onReplace }: { probe: Probe; onReplace?: () => voi
 }
 
 /** What Auto picked and why, as "format: reason" in one line on wide screens (two on phones). */
-function choiceDetail({ reason, vmaf }: NonNullable<Calibration['choice']>) {
+function choiceDetail({ reason, vmaf }: NonNullable<Calibration['choice']>, fit: boolean) {
   const gain = vmaf?.av1 !== undefined ? vmaf.av1 - vmaf.avc : 0
   if (reason === 'testing') return 'H.264 so far, testing AV1'
   if (reason === 'high' && vmaf) return `H.264: already ${Math.round(vmaf.avc)} VMAF here`
   if (vmaf?.av1 === undefined && reason === 'even') return 'Measured on short test encodes'
   if (reason === 'device') return "H.264: this device can't play AV1"
-  if (reason === 'size') return "AV1: H.264 can't reach half the size"
+  if (reason === 'size') return `AV1: H.264 can't get ${fit ? 'under that size' : 'to half the size'}`
   if (reason === 'predicted') return 'AV1: H.264 is near its limit at this size'
   if (reason === 'hdr') return 'AV1: keeps this HDR video in 10 bits'
   if (reason === 'better') return `AV1: ${gain.toFixed(1)} VMAF above H.264 here`
@@ -779,6 +839,7 @@ function Ready(props: {
   const copy = settings.preset === 'copy'
   const short = Math.min(probe.width, probe.height)
   const target = outputSize(probe, settings.shortSide)
+  const fitted = outputSize(probe, (tuning && 'result' in tuning && tuning.result.shortSide) || null)
   const noEncoder = !copy && settings.engine === 'fast' && !probe.encodable[settings.codec]
 
   const resolutions: Option<string>[] = [
@@ -803,6 +864,7 @@ function Ready(props: {
       !!settings.keepPlace,
   )
   const thoroughName = (c: 'avc' | 'av1') => (c === 'av1' ? 'SVT-AV1' : 'x264')
+  const outOfReach = `${short}p can’t get ${settings.targetBytes ? `under ${fmt.bytes(settings.targetBytes)}` : 'to half the size'}`
   const sizeMode: SizeMode = !settings.sizeTarget ? 'any' : settings.targetBytes ? 'fit' : 'half'
   const audioNote = () => {
     const audio = probe.audio
@@ -843,7 +905,8 @@ function Ready(props: {
           ? result?.codec ? `Auto: ${thoroughName(result.codec)}` : 'Auto'
           : thoroughName(thoroughCodec(settings))
         : `Browser ${CODEC_LABEL[settings.codec]}`,
-    copy || !settings.shortSide ? 'Original resolution' : `${settings.shortSide}p`,
+    copy || !settings.shortSide ? (result?.shortSide && !copy ? `${result.shortSide}p to fit` : 'Original resolution')
+      : `${settings.shortSide}p`,
     // Repackaging copies the audio whatever the plan says Pare's own encoders could do with it.
     !probe.audio ? 'No audio' : settings.keepAudio && (copy || audioFor(probe, settings)?.kind !== 'drop') ? 'Audio kept' : 'Audio removed',
     probe.origin.place && (settings.keepPlace ? 'Location kept' : 'Location removed'),
@@ -929,7 +992,11 @@ function Ready(props: {
               options={resolutions}
               disabled={copy || resolutions.length === 1}
               onChange={(v) => setSettings((s) => ({ ...s, shortSide: v === 'original' ? null : Number(v) }))}
-              hint={copy ? 'Unchanged.' : `${target.width}×${target.height}`}
+              hint={copy
+                ? 'Unchanged.'
+                : result?.shortSide && !settings.shortSide
+                  ? `${fitted.width}×${fitted.height}: ${outOfReach}, at any quality.`
+                  : `${target.width}×${target.height}`}
             />
             <Choice
               legend="Audio"
@@ -981,10 +1048,14 @@ function Ready(props: {
             </span>
           )}
           <span className="estimate-detail">
-            {result?.choice && result.choice.reason !== 'unlimited' && result.choice.reason !== 'fits'
+            {tuning && 'side' in tuning && tuning.side
+              ? `Trying ${tuning.side}p: ${outOfReach}`
+              : result?.shortSide
+              ? `${result.codec === 'av1' ? 'AV1' : result.codec === 'avc' ? 'H.264' : 'Encoding'} at ${result.shortSide}p: ${outOfReach}`
+              : result?.choice && result.choice.reason !== 'unlimited' && result.choice.reason !== 'fits'
               ? result.choice.reason === 'device' && result.size > targetBytes(probe, settings)
                 ? `H.264 can’t get this one ${settings.targetBytes ? 'under that size' : 'to half'}, and this device can’t play AV1`
-                : choiceDetail(result.choice)
+                : choiceDetail(result.choice, !!settings.targetBytes)
               : !result && usesX264(settings) && settings.autoCodec && settings.sizeTarget && !(tuning && 'error' in tuning)
               ? 'Test-encoding to pick the format'
               : result?.fast
@@ -1158,6 +1229,9 @@ function Done(props: {
   const smaller = after < before
   const ext = blob.type.includes('matroska') ? 'mkv' : 'mp4'
   const name = `${probe.file.name.replace(/\.[^.]+$/, '')} (compressed).${ext}`
+  // Phones and most desktop browsers can hand the file straight to another app: a chat, mail, or the photo library.
+  const file = useMemo(() => new File([blob], name, { type: blob.type }), [blob, name])
+  const shareable = typeof navigator !== 'undefined' && !!navigator.canShare?.({ files: [file] })
 
   return (
     <section className="stack">
@@ -1165,6 +1239,7 @@ function Done(props: {
         <p className="result-kicker">
           {smaller ? 'Done' : 'Done, but the original is smaller'}
           {props.phase.codec && ` · ${props.phase.codec === 'av1' ? 'AV1' : 'H.264'}`}
+          {props.phase.shortSide && ` · ${props.phase.shortSide}p to fit`}
         </p>
         <p className="result-sizes">
           <span className="from">{fmt.bytes(before)}</span>
@@ -1214,6 +1289,11 @@ function Done(props: {
           <a className={smaller ? 'button primary' : 'button'} href={url} download={name}>
             Download {ext.toUpperCase()}
           </a>
+          {shareable && (
+            <button type="button" className="button ghost" onClick={() => void navigator.share({ files: [file] }).catch(() => {})}>
+              Share
+            </button>
+          )}
           <button type="button" className="button ghost" onClick={props.onAdjust}>
             Change settings
           </button>

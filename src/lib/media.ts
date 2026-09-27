@@ -256,6 +256,8 @@ export type Calibration = {
   fast?: boolean
   /** Auto: the encoder the in-browser test picked, why, and each one's predicted VMAF NEG at the target size. */
   codec?: 'avc' | 'av1'
+  /** The short side chosen because the size target is out of reach at the source's resolution (fitSide). */
+  shortSide?: number
   choice?: {
     /** testing: H.264's plan so far, while AV1's test runs. */
     reason: 'unlimited' | 'fits' | 'high' | 'device' | 'size' | 'better' | 'even' | 'predicted' | 'hdr' | 'testing'

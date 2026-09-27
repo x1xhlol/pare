@@ -70,6 +70,13 @@ What Pare does instead:
   corpus that picked the better encoder in 28 of 30 cases; SSIM would have agreed with VMAF in 21. When H.264's first
   test round already shows fine noise or H.264 at the edge of its range, every clip in the benchmark went to AV1
   anyway, so Auto skips AV1's quality test there and only sizes it. Those clips got 5–45% faster.
+- **Works offline, and as an app.** A service worker keeps the page and, once a video has been opened, the encoders,
+  so Pare works with the network off: switch it off and compress something to check that nothing leaves the device.
+  Installed on Android, it takes videos shared from the gallery; installed on the desktop, it opens video files. The
+  result can go straight to another app with the Share button, where the browser supports it.
+- **Too small for the resolution.** When a size target is out of reach at the source's resolution even at the
+  encoder's lowest quality, Pare plans again at the largest of 1080p, 720p, 480p and 360p that should reach it, rather
+  than encode a file that misses. Big Buck Bunny (30.7 MB) under 1 MB came out at 0.93 MB, in AV1 at 480p.
 
 The encoder settings come from measurement. Every candidate was swept over rate factors on a test corpus and scored
 with VMAF, VMAF NEG, SSIM and PSNR. `faster` with a 40-frame lookahead and weighted prediction needs about 30% fewer
@@ -145,6 +152,7 @@ runs `checkasm` to check every SIMD kernel against the C reference, and links th
 | `src/lib/encode-worker.ts` | One encoder per worker, fed by WebCodecs through Mediabunny; scores test encodes with VMAF |
 | `src/lib/media.ts` | Probing, the WebCodecs encoder path, the frame-by-frame quality check |
 | `src/lib/origin.ts` | The recording date and place: read from the source, written to the copy |
+| `sw/sw.js` | The service worker: offline use, and videos shared to the installed app (lists filled in by `vite.config.ts`) |
 | `x264-wasm/` | The SIMD patch, the pinned x264 commit, the C binding, and the build script |
 | `av1-wasm/` | The SVT-AV1 patch, dispatch-fallback generator, replacement intrinsic header, C binding, build script |
 | `vmaf-wasm/` | The libvmaf patch (AVX2 kernels under Emscripten), the scoring binding, and the build script |

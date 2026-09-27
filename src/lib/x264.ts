@@ -1654,6 +1654,35 @@ function testAv1(probe: Probe, settings: Settings, avc: SizePlan, signal: AbortS
   return test
 }
 
+/** Short sides a size target out of reach at the source's resolution steps down through (the Resolution choices). */
+const FIT_SIDES = [1080, 720, 480, 360]
+/**
+ * How size follows the pixel count near the highest rate factors, bytes ∝ pixels^k: 60 frames of Big Buck Bunny,
+ * town, park and ducks at 1080p, 720p, 480p and 360p gave 0.62-0.88 for SVT-AV1 at CRF 45 and 55 (median 0.78) and
+ * 0.87-1.12 for x264 at CRF 24 and 30 (median 0.94).
+ */
+const PIXEL_POWER = { avc: 0.94, av1: 0.78 }
+/** A lower resolution is picked to fit this many rate factor steps short of the highest, where quality holds up. */
+const FIT_STEPS = 5
+
+/**
+ * For a size target the video can't reach at `settings`' resolution even at the encoder's highest rate factor: the
+ * largest lower short side that should reach it FIT_STEPS below that, or the lowest there is. Null when the plan
+ * reaches the target, or nothing lower is left. The plan at that size says whether it did.
+ */
+export function fitSide(probe: Probe, settings: Settings, plan: SizePlan, codec: 'avc' | 'av1') {
+  if (!settings.sizeTarget || !plan.bound) return null
+  const profile = codec === 'av1' ? AV1 : X264
+  const goal = videoGoal(probe, { ...settings, codec })
+  const atMax = bytesAt(plan.points, profile.max)
+  if (!Number.isFinite(atMax) || atMax <= goal) return null
+  const current = Math.min(settings.shortSide ?? Infinity, probe.width, probe.height)
+  const lower = FIT_SIDES.filter((side) => side < current)
+  const room = Math.exp(profile.slope * FIT_STEPS)
+  const fits = (side: number) => atMax * ((side / current) ** 2) ** PIXEL_POWER[codec] <= goal * room
+  return lower.find(fits) ?? lower[lower.length - 1] ?? null
+}
+
 /** Whether H.264 can meet the size target at all, going by its plan. Otherwise Auto has to wait for AV1's test. */
 export const avcReaches = (probe: Probe, settings: Settings, avc: SizePlan) =>
   !settings.sizeTarget || !avc.bound || bytesAt(avc.points, X264.max) <= videoGoal(probe, settings)
