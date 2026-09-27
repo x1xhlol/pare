@@ -6,6 +6,7 @@ import {
   Input,
   MATROSKA,
   MkvOutputFormat,
+  MovOutputFormat,
   MP4,
   Mp4OutputFormat,
   Output,
@@ -13,6 +14,8 @@ import {
   Quality,
   StreamTarget,
   VideoSampleSink,
+  type VideoSample,
+  type AudioSample,
   WEBM,
   canEncodeAudio,
   canEncodeVideo,
@@ -22,11 +25,13 @@ import {
   type InputAudioTrack,
   type InputVideoTrack,
 } from 'mediabunny'
+import { encoderFrames, packetFrames, resamplerBlock } from './audio-frames'
 import { ownDownmix, stereoDownmix } from './downmix'
 import { originTags, readOrigin, stampDate } from './origin'
+import { readsBack } from './readback'
 import { lumaOf, psnr, ssim } from './metrics'
 import {
-  audioBytes as plannedAudioBytes, audioFor, deepFormat, even, MP4_AUDIO, outputSize, playsAv1, targetBytes, type AudioEncode,
+  audioBytes as plannedAudioBytes, audioFor, deepFormat, DIRECT_FORMATS, even, MP4_AUDIO, outputSize, playsAv1, targetBytes, type AudioEncode,
   type AudioPlan, type OutputCodec, type Preset, type Probe, type Settings,
 } from './shared'
 
@@ -60,7 +65,7 @@ export async function probeFile(file: File): Promise<Probe> {
     const video = await input.getPrimaryVideoTrack()
     if (!video) throw new Error('This file has no video track.')
 
-    const [format, duration, videoCodec, width, height, decodable, tags, stats] = await Promise.all([
+    const [format, end, videoCodec, width, height, decodable, tags, stats] = await Promise.all([
       input.getFormat(),
       input.computeDuration(),
       video.getCodec(),
@@ -71,7 +76,13 @@ export async function probeFile(file: File): Promise<Probe> {
       video.computePacketStats(),
     ])
     const firstTimestamp = Math.max(0, await video.getFirstTimestamp())
-    const frame = decodable ? await firstFrame(video, firstTimestamp) : null
+    const audioTrack = await input.getPrimaryAudioTrack()
+    // Where the copy starts: the earliest track, as a Mediabunny conversion trims to, never before 0 (an edit list
+    // drops pre-roll). computeDuration is where the last track ends, not a length: a file shifted 10 s in (an empty
+    // edit) measured 13 s for 3 s of content, which made its audio look like 70% of half the file.
+    const start = Math.max(0, await input.getFirstTimestamp(audioTrack ? [video, audioTrack] : [video]))
+    const duration = Math.max(0, end - start)
+    const frame = decodable ? await firstFrame(video, firstTimestamp, firstTimestamp + Math.min(1, duration * 0.1)) : null
     // A browser can call a codec supported and still fail on every frame (WebKit on Linux with 10-bit AV1).
     const canDecode = !!frame
     // TypeScript's DOM types lag the WebCodecs spec, which has 'pq' and 'hlg'.
@@ -81,7 +92,6 @@ export async function probeFile(file: File): Promise<Probe> {
     const fps = stats.averagePacketRate
     const playsHdrAv1 = hdr && deepFormat(frame?.format) && (await playsAv1(width, height, fps, true))
 
-    const audioTrack = await input.getPrimaryAudioTrack()
     const audio = audioTrack ? await describeAudio(audioTrack) : null
 
     const encodable = Object.fromEntries(
@@ -101,6 +111,7 @@ export async function probeFile(file: File): Promise<Probe> {
       container: format.name,
       duration,
       firstTimestamp,
+      start,
       width,
       height,
       fps,
@@ -109,7 +120,7 @@ export async function probeFile(file: File): Promise<Probe> {
       canDecode,
       hdr,
       colorSpace,
-      frame: frame && { format: frame.format, width: frame.width, height: frame.height },
+      frame: frame && { format: frame.format, width: frame.width, height: frame.height, copies: frame.copies },
       playsHdrAv1,
       audio,
       poster,
@@ -137,26 +148,34 @@ async function planAudio(track: InputAudioTrack, codec: AudioCodec | null, chann
   Promise<AudioPlan> {
   const decodes = await track.canDecode().catch(() => false)
   const encode = decodes ? await encoding(channels, sampleRate) : null
-  if (codec && MP4_AUDIO.includes(codec)) return { kind: 'copy', encode: encode ?? undefined }
+  const compact = decodes ? (await encoding(channels, sampleRate, COMPACT_AUDIO)) ?? undefined : undefined
+  if (codec && MP4_AUDIO.includes(codec)) return { kind: 'copy', encode: encode ?? undefined, compact }
   if (!decodes) return { kind: 'drop', reason: 'decode' }
-  return encode ? { kind: 'encode', ...encode } : { kind: 'drop', reason: 'encode' }
+  return encode ? { kind: 'encode', ...encode, compact } : { kind: 'drop', reason: 'encode' }
 }
 
-/** How this browser can encode audio with this many channels at this rate, if it can. */
-async function encoding(channels: number, sampleRate: number): Promise<AudioEncode | null> {
+/** Per channel, for audio under a size chosen with Fit under that it would otherwise take much of (audioFor). */
+const COMPACT_AUDIO = 48_000
+
+/**
+ * How this browser can encode audio with this many channels at this rate, if it can, at `perChannel` bits a second
+ * per channel: by default 96 kbps, transparent for AAC and Opus alike.
+ */
+async function encoding(channels: number, sampleRate: number, perChannel = 96_000): Promise<AudioEncode | null> {
   const stereo = Math.min(2, channels)
-  for (const [ch, rate] of [[channels, sampleRate], [stereo, sampleRate], [stereo, 48000]])
-    for (const out of ['aac', 'opus'] as const) {
-      // 96 kbps per channel is transparent for AAC and Opus alike.
-      const bitrate = Math.min(256_000, 96_000 * ch)
+  // Compact audio is stereo at most: at that rate extra channels cost more than they bring.
+  const layouts = perChannel < 96_000 ? [[stereo, sampleRate], [stereo, 48000]] : [[channels, sampleRate], [stereo, sampleRate], [stereo, 48000]]
+  for (const [ch, rate] of layouts)
+    for (const out of perChannel < 96_000 ? (['opus', 'aac'] as const) : (['aac', 'opus'] as const)) {
+      const bitrate = Math.min(256_000, perChannel * ch)
       if (await canEncodeAudio(out, { numberOfChannels: ch, sampleRate: rate, bitrate }).catch(() => false))
-        return { codec: out, channels: ch, sampleRate: rate, bitrate }
+        return { codec: out, channels: ch, sampleRate: rate, bitrate, reduced: perChannel < 96_000 || undefined }
     }
   return null
 }
 
 /** The first frame's pixel format, visible size (turned to display orientation) and colour space. */
-async function firstFrame(track: InputVideoTrack, timestamp: number) {
+async function firstFrame(track: InputVideoTrack, timestamp: number, later: number) {
   const sink = new VideoSampleSink(track)
   // A file can start on an I-frame that isn't an IDR, which Chrome won't start decoding from: there the first sample
   // comes from the first IDR, as it will in the encode.
@@ -170,8 +189,16 @@ async function firstFrame(track: InputVideoTrack, timestamp: number) {
     const { width, height } = sample.visibleRect
     const turned = sample.rotation % 180 !== 0
     const { primaries, transfer, matrix, fullRange } = sample.colorSpace
+    // Frames go into the encoders through copyTo only when it gives them back as they are (readback.ts). A black or
+    // flat first frame (a fade-in, a title) only shows whether every byte was written; a later one shows the layout.
+    const check = async (s: VideoSample) => readsBack(s).catch(() => false)
+    let copies = DIRECT_FORMATS.includes(sample.format) ? await check(sample) : false
+    if (copies === null) {
+      const next = await sink.getSample(later).catch(() => null)
+      copies = next ? await check(next).finally(() => next.close()) : null
+    }
     return { format: sample.format, width: turned ? height : width, height: turned ? width : height,
-      colorSpace: { primaries, transfer, matrix, fullRange } as VideoColorSpaceInit }
+      colorSpace: { primaries, transfer, matrix, fullRange } as VideoColorSpaceInit, copies: copies !== false }
   } finally {
     sample.close()
   }
@@ -204,11 +231,22 @@ async function audioOptions(probe: Probe, settings: Settings): Promise<Conversio
   const plan = audioFor(probe, settings)
   if (settings.preset === 'copy' || !plan || plan.kind === 'copy') return {}
   if (plan.kind === 'drop') return { discard: true }
-  const quality = new Quality({ bitrate: plan.bitrate })
-  if (plan.channels === 2 && ownDownmix(probe.audio!.channels))
-    return { codec: plan.codec, sampleRate: plan.sampleRate, process: stereoDownmix(probe.audio!.channels),
-      processedNumberOfChannels: 2, quality }
-  return { codec: plan.codec, numberOfChannels: plan.channels, sampleRate: plan.sampleRate, quality }
+  // As in Pare's own mux (x264.ts audioEncoding): a constant rate for Opus, and a packet at a time for WebKit.
+  const quality = new Quality({ bitrate: plan.bitrate, bitrateMode: plan.codec === 'opus' ? 'constant' : undefined })
+  const pieces = encoderFrames(packetFrames(plan.codec, plan.sampleRate), resamplerBlock(plan.sampleRate))
+  if (plan.channels === 2 && ownDownmix(probe.audio!.channels)) {
+    const mix = stereoDownmix(probe.audio!.channels)
+    const process = (sample: AudioSample) => {
+      const mixed = mix(sample)
+      try {
+        return pieces(mixed)
+      } finally {
+        mixed.close()
+      }
+    }
+    return { codec: plan.codec, sampleRate: plan.sampleRate, process, processedNumberOfChannels: 2, quality }
+  }
+  return { codec: plan.codec, numberOfChannels: plan.channels, sampleRate: plan.sampleRate, process: pieces, quality }
 }
 
 function audioBytes(probe: Probe, settings: Settings) {
@@ -221,7 +259,13 @@ function outputFormat(probe: Probe, settings: Settings) {
   const mp4 = new Mp4OutputFormat({ fastStart: 'in-memory', metadataFormat: 'udta' })
   if (settings.preset !== 'copy') return mp4
   const fits = probe.videoCodec && mp4.getSupportedCodecs().includes(probe.videoCodec)
-  return fits ? mp4 : new MkvOutputFormat()
+  if (!fits) return new MkvOutputFormat()
+  // PCM audio goes into an MP4 only as ISO 'ipcm', which few players read (and ffprobe loses its channel layout); a
+  // QuickTime source's copy stays QuickTime, with the audio as it was.
+  const audio = probe.audio?.codec
+  if (settings.keepAudio && audio && !MP4_AUDIO.includes(audio) && probe.container === 'QuickTime File Format')
+    return new MovOutputFormat({ fastStart: 'in-memory', metadataFormat: 'udta' })
+  return mp4
 }
 
 function describeFailure(conversion: Conversion) {
@@ -469,7 +513,7 @@ export function compress(probe: Probe, settings: Settings, bitrate: number, onPr
       },
     })
     const output = new Output({ format, target: new StreamTarget(writable, { chunked: true, chunkSize: 8 * 2 ** 20 }) })
-    const mp4 = format instanceof Mp4OutputFormat
+    const mp4 = format instanceof Mp4OutputFormat || format instanceof MovOutputFormat
     if (mp4) stampDate(output, probe.origin)
 
     try {

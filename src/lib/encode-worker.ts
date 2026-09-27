@@ -6,6 +6,7 @@ import {
   type VideoSample,
 } from 'mediabunny'
 import { decoderConfig } from './codec-config'
+import { unwritten } from './readback'
 import type createVmaf from './vmaf/vmaf.mjs'
 import type { VmafModule } from './vmaf/vmaf.mjs'
 import type createX264 from './x264/x264.mjs'
@@ -207,6 +208,17 @@ async function bounced(frame: VideoSample, planes: Plane[] | null, base: number,
 /** Whether a sample is the size the encoder takes, as stored (before rotation). */
 const fits = (sample: VideoSample) => sample.visibleRect.width === init.width && sample.visibleRect.height === init.height
 
+/**
+ * Threads x264 starts for `threads` frame threads: those, its lookahead thread, and a pool of lookahead threads when it
+ * picks more than one. It picks threads / 4 at Pare's faster preset and threads / 6 at superfast (lookahead_thread_div
+ * for b-adapt 1), at most height / 128; threads / 3 covers both. One frame encoded on 8 threads needed 11 at 360p
+ * against the 10 workers started before, and hung in WebKit and, driven directly, in Chrome.
+ */
+function x264Threads(threads: number, height: number) {
+  const lookahead = Math.min(Math.floor(threads / 3), Math.floor(height / 128))
+  return threads + 1 + (lookahead > 1 ? lookahead : 0)
+}
+
 /** Picks the cheapest way to get this sample's pixels into the encoder. */
 function planInput(sample: VideoSample, enc: number): Loader {
   const { width, height } = init
@@ -223,9 +235,18 @@ function planInput(sample: VideoSample, enc: number): Loader {
     // The encoder's layout was set by the chunk's first frame, so every frame has to match it (a video with alpha can
     // mix I420 and I420A). Each one is copied or scaled on its own: a video can change size partway.
     const kind = (format: VideoSample['format']) => (format === 'I420A' ? 'I420' : format)
+    // The probe checked that copyTo gives the first frame back whole (readback.ts); a chunk's first frame, and any at a
+    // new size, are checked again for bytes it leaves unwritten, which is how WebKit's broken copies show.
+    let checked = ''
     return async (s) => {
       if (kind(s.format) !== kind(sample.format))
         throw new Error(`The video's frames changed from ${sample.format} to ${s.format ?? 'an unnamed format'} partway.`)
+      const size = `${s.visibleRect.width}x${s.visibleRect.height}`
+      if (size !== checked) {
+        if (await unwritten(s))
+          throw new Error(`This browser copied frames at ${size.replace('x', '×')} out incomplete. Another browser may work.`)
+        checked = size
+      }
       await (fits(s) ? copy(s) : scale(s))
     }
   }
@@ -506,9 +527,9 @@ self.onmessage = async (event: MessageEvent<WorkerInit | WorkerChunk | WorkerSpl
       init = message
       const { default: create }: { default: typeof createX264 } = await import(/* @vite-ignore */ message.script)
       x = await create({
-        // The threaded build starts its thread workers up front: x264's threads plus its lookahead thread, and one
-        // spare. A thread started later would deadlock, since this worker blocks while x264 waits on them.
-        threads: message.threads > 1 ? message.threads + 2 : 0,
+        // The threaded build starts its thread workers up front, one for every thread x264 starts, and a spare. A thread
+        // started later would deadlock: this worker blocks while x264 waits on it.
+        threads: message.threads > 1 ? x264Threads(message.threads, message.height) + 1 : 0,
         instantiateWasm: (imports, done) => {
           void WebAssembly.instantiate(message.module, imports).then((instance) => done(instance, message.module))
           return {}

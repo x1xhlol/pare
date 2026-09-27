@@ -15,6 +15,7 @@ import {
   Quality,
   StreamTarget,
   WEBM,
+  type AudioSample,
 } from 'mediabunny'
 import singleScript from './x264/x264.mjs?url'
 import singleWasm from './x264/x264.wasm?url'
@@ -25,12 +26,13 @@ import av1Wasm from './av1/av1.wasm?url'
 import vmafScript from './vmaf/vmaf.mjs?url'
 import vmafWasm from './vmaf/vmaf.wasm?url'
 import type { EncodedChunk, FrameStat, WorkerChunk, WorkerInit, WorkerMessage, WorkerSplit } from './encode-worker'
+import { encoderFrames, packetFrames, resamplerBlock } from './audio-frames'
 import { av1Config, avcConfig } from './codec-config'
 import { ownDownmix, stereoDownmix } from './downmix'
 import { originTags, stampDate } from './origin'
 import {
-  aimBytes, audioBytes, audioFor, copiesFrames, keepsHdr, outputSize, playsAv1, targetBytes, VIDEO_FLOOR, type Preset, type Probe,
-  type Settings,
+  aimBytes, audioBytes, audioFor, copiesFrames, keepsHdr, outputSize, playsAv1, targetBytes, VIDEO_FLOOR, type AudioEncode,
+  type Preset, type Probe, type Settings,
 } from './shared'
 
 type EncodingPreset = Exclude<Preset, 'copy'>
@@ -742,6 +744,30 @@ async function unstash(chunk: EncodedChunk): Promise<EncodedChunk> {
   return { ...chunk, packets: chunk.packets.map((p) => ({ ...p, data: all.subarray(at, (at += p.size)) })) }
 }
 
+/**
+ * How the audio is encoded: the plan's codec and rate, at a constant rate for Opus (WebKit's variable rate came out 35%
+ * over, 129 kbps for 96, which the size plan can't see), mixed down by Pare when Mediabunny wouldn't, and handed to the
+ * encoder a packet at a time (audio-frames.ts).
+ */
+export function audioEncoding(plan: AudioEncode, channels: number) {
+  const pieces = encoderFrames(packetFrames(plan.codec, plan.sampleRate), resamplerBlock(plan.sampleRate))
+  const mix = plan.channels === 2 && ownDownmix(channels) ? stereoDownmix(channels) : null
+  return {
+    codec: plan.codec,
+    quality: new Quality({ bitrate: plan.bitrate, bitrateMode: plan.codec === 'opus' ? ('constant' as const) : undefined }),
+    transform: mix
+      ? { sampleRate: plan.sampleRate, process: (sample: AudioSample) => {
+          const mixed = mix(sample)
+          try {
+            return pieces(mixed)
+          } finally {
+            mixed.close()
+          }
+        } }
+      : { numberOfChannels: plan.channels, sampleRate: plan.sampleRate, process: pieces },
+  }
+}
+
 async function mux(probe: Probe, settings: Settings, chunks: EncodedChunk[], size: { width: number; height: number },
                    { rotation, flip }: Orientation) {
   // The file goes to the blob store as it's written, 8 MB at a time, rather than piling up in the page.
@@ -770,15 +796,7 @@ async function mux(probe: Probe, settings: Settings, chunks: EncodedChunk[], siz
     const audioCodec = audioTrack ? await audioTrack.getCodec() : null
     const audioCopy = audioTrack && plan?.kind === 'copy' ? new EncodedAudioPacketSource(audioCodec!) : null
     const channels = probe.audio?.channels ?? 2
-    const audioEncode = audioTrack && plan?.kind === 'encode'
-      ? new AudioSampleSource({
-          codec: plan.codec,
-          quality: new Quality({ bitrate: plan.bitrate }),
-          transform: plan.channels === 2 && ownDownmix(channels)
-            ? { sampleRate: plan.sampleRate, process: stereoDownmix(channels) }
-            : { numberOfChannels: plan.channels, sampleRate: plan.sampleRate },
-        })
-      : null
+    const audioEncode = audioTrack && plan?.kind === 'encode' ? new AudioSampleSource(audioEncoding(plan, channels)) : null
     if (audioCopy) output.addAudioTrack(audioCopy)
     if (audioEncode) output.addAudioTrack(audioEncode)
 
@@ -791,6 +809,9 @@ async function mux(probe: Probe, settings: Settings, chunks: EncodedChunk[], siz
       : undefined
     const config = { ...profile.config(chunks[0].headers, size.width, size.height), colorSpace }
     const allTimes = chunks.flatMap((c) => c.times)
+    // The copy starts at 0, as a Mediabunny conversion's does: a source shifted in by an empty edit kept its 10 s lead-in
+    // and a 13 s movie header. Audio moves with the video, so they stay in sync.
+    const base = probe.start
     const frameDuration = allTimes.length > 1 ? (allTimes[allTimes.length - 1] - allTimes[0]) / (allTimes.length - 1) : 1 / 30
     let first = true
     let offset = 0
@@ -798,8 +819,8 @@ async function mux(probe: Probe, settings: Settings, chunks: EncodedChunk[], siz
       const chunk = await unstash(stashed)
       for (const packet of chunk.packets) {
         const i = offset + packet.pts
-        const timestamp = allTimes[i]
-        const duration = i + 1 < allTimes.length ? allTimes[i + 1] - timestamp : frameDuration
+        const timestamp = allTimes[i] - base
+        const duration = i + 1 < allTimes.length ? allTimes[i + 1] - allTimes[i] : frameDuration
         await video.add(new EncodedPacket(packet.data, packet.key ? 'key' : 'delta', timestamp, duration),
           first ? { decoderConfig: config } : undefined)
         first = false
@@ -812,13 +833,15 @@ async function mux(probe: Probe, settings: Settings, chunks: EncodedChunk[], siz
       const decoderConfig = await audioTrack.getDecoderConfig()
       let firstAudio = true
       for await (const packet of new EncodedPacketSink(audioTrack).packets()) {
-        await audioCopy.add(packet, firstAudio && decoderConfig ? { decoderConfig } : undefined)
+        const moved = base ? packet.clone({ timestamp: packet.timestamp - base }) : packet
+        await audioCopy.add(moved, firstAudio && decoderConfig ? { decoderConfig } : undefined)
         firstAudio = false
       }
       audioCopy.close()
     }
     if (audioTrack && audioEncode) {
       for await (const sample of new AudioSampleSink(audioTrack).samples()) {
+        if (base) sample.setTimestamp(sample.timestamp - base)
         await audioEncode.add(sample)
         sample.close()
       }
@@ -1200,7 +1223,8 @@ export function encode(probe: Probe, settings: Settings, start: EncodeStart, onP
       // The allowance for everything but the video is an upper bound, so this shouldn't happen. If the file still came
       // out over, the video makes up the difference, measured from what was actually muxed. When the audio and container
       // alone leave the video less than the 5% floor, no video size keeps the promise, and the floor stands.
-      for (let again = 0; budget && blob.size > target && again < 2; again++) {
+      // Only while some chunk has a rate factor left to raise: at the top of the range another pass changes nothing.
+      for (let again = 0; budget && blob.size > target && again < 2 && crfs.some((c) => c < ceiling - 0.05); again++) {
         if (canceled) throw new Canceled()
         const room = target - (blob.size - total)
         if (room < target * VIDEO_FLOOR) break
@@ -1851,6 +1875,17 @@ export function fitSide(probe: Probe, settings: Settings, plan: SizePlan, codec:
   const room = Math.exp(logSize(profile, slope, highest) - logSize(profile, slope, highest - FIT_STEPS))
   const fits = (side: number) => atMax * ((side / current) ** 2) ** PIXEL_POWER[codec] <= goal * room
   return lower.find(fits) ?? lower[lower.length - 1] ?? null
+}
+
+/**
+ * Whether a size chosen with Fit under is out of reach for this plan even at the encoder's highest rate factor, so the
+ * file will come out over it: shown before compressing rather than found out after.
+ */
+export function misses(probe: Probe, settings: Settings, plan: SizePlan, codec: 'avc' | 'av1') {
+  const profile = codec === 'av1' ? AV1 : X264
+  const sized = { ...settings, codec }
+  return !!settings.sizeTarget && !!settings.targetBytes && !!plan.bound &&
+    bytesAt(plan.points, maxCrf(profile, settings), profile) > targetBytes(probe, sized) - audioBytes(probe, sized)
 }
 
 /** Whether H.264 can meet the size target at all, going by its plan. Otherwise Auto has to wait for AV1's test. */

@@ -5,7 +5,7 @@
 //   CODEC=auto|avc|av1 (the Format setting; default Auto), ENGINE=fast (the browser's encoder), NOLIMIT=1 (no size
 //   target), CORES=n (pretend core count), CLICK_AFTER=seconds after the file loads (default 1), RES=720 (short side),
 //   BROWSER=webkit|firefox (Playwright's WebKit or Firefox build instead of Chrome), FIT=10 (fit under 10 MB),
-//   PLACE=keep (keep where the video was recorded)
+//   PLACE=keep (keep where the video was recorded), PRESET='Exact copy'|High|Compact (the Quality setting)
 //
 // Prints one JSON line per video: seconds, sizes, the app's quality line, and the encoder log.
 import { chromium, firefox, webkit } from 'playwright-core'
@@ -35,6 +35,7 @@ for (const file of process.argv.slice(2)) {
   const loaded = Date.now()
   await page.setInputFiles('input[type=file]', file)
   await page.waitForSelector('.settings', { timeout: 60000 })
+  if (process.env.PRESET) await page.getByRole('radio', { name: process.env.PRESET, exact: true }).check()
   if (process.env.NOLIMIT) await page.getByRole('radio', { name: 'No limit', exact: true }).check()
   if (process.env.FIT) {
     await page.getByRole('radio', { name: 'Fit under', exact: true }).check()
@@ -83,7 +84,8 @@ for (const file of process.argv.slice(2)) {
     for (let i = 0; i < buf.length; i += 0x8000) s += String.fromCharCode(...buf.subarray(i, i + 0x8000))
     return btoa(s)
   })
-  const saved = path.join(out, `${tag}-${path.basename(file)}.mp4`)
+  const ext = (await page.textContent('.result-actions a'))?.match(/Download (\w+)/)?.[1]?.toLowerCase() ?? 'mp4'
+  const saved = path.join(out, `${tag}-${path.basename(file)}.${ext}`)
   fs.writeFileSync(saved, Buffer.from(data, 'base64'))
   console.log(JSON.stringify({
     tag, source: file, output: saved, seconds, fromLoad, estimate, kicker, quality,

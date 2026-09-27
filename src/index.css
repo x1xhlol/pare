@@ -681,6 +681,10 @@ label {
   gap: 8px;
 }
 
+.fit-problem {
+  flex-basis: 100%;
+}
+
 .fit-field {
   display: inline-flex;
   align-items: center;

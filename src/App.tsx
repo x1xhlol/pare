@@ -31,7 +31,13 @@ type Phase =
       /** The format Pare's own encoders wrote, when they ran. */
       codec?: 'avc' | 'av1'
       /** The size target was on and the file still came out over it: the target, or null for half the original. */
-      missed?: { target: number | null }
+      missed?: {
+        target: number | null
+        /** The copy is above 360p, the lowest Fit under steps down to: a lower resolution would get further. */
+        lower: boolean
+        /** H.264 because this browser can't play AV1, which would have got further. */
+        noAv1: boolean
+      }
       /** The short side Pare went down to because the size target was out of reach at the source's. */
       shortSide?: number
     }
@@ -315,13 +321,15 @@ export default function App() {
             const { result: { codec, plan, reason, vmaf }, shortSide } = await shrink(m,
               await m.settle(probe, settings, avc, test.signal), (c) => [c.plan, c.codec],
               async (s) => m.settle(probe, s, await m.planAvc(probe, s, controller.signal), test.signal))
-            return { ...fromPlan(plan), codec, choice: { reason, vmaf }, shortSide }
+            const reached = !m.misses(probe, { ...settings, shortSide: shortSide ?? settings.shortSide }, plan, codec)
+            return { ...fromPlan(plan), codec, choice: { reason, vmaf }, shortSide, reached }
           })
         : usesX264(settings)
           ? x264().then(async (m) => {
               const { result, shortSide } = await shrink(m, await m.plan(probe, settings, controller.signal),
                 (p) => [p, thoroughCodec(settings)], (s) => m.plan(probe, s, controller.signal))
-              return { ...fromPlan(result), shortSide }
+              const sized = { ...settings, shortSide: shortSide ?? settings.shortSide }
+              return { ...fromPlan(result), shortSide, reached: !m.misses(probe, sized, result, thoroughCodec(settings)) }
             })
           : media().then((m) => m.calibrate(probe, settings, controller.signal, onRound)),
     }
@@ -481,8 +489,12 @@ export default function App() {
       const { blob: made, scores } = await run.job.promise
       const blob = settings.keepPlace ? made : await dropPlace(made)
       const url = URL.createObjectURL(blob)
+      const reason = calibrations.current.get(settingsKey(settings))?.result?.choice?.reason
       const missed = engine.sizeTarget && settings.preset !== 'copy' && blob.size > targetBytes(probe, settings)
-        ? { target: settings.targetBytes ?? null } : undefined
+        ? { target: settings.targetBytes ?? null,
+            lower: Math.min(probe.width, probe.height, shortSide ?? engine.shortSide ?? Infinity) > 360,
+            noAv1: codec === 'avc' && reason === 'device' }
+        : undefined
       setPhase({ kind: 'done', probe, blob, url, quality: settings.preset === 'copy' ? 'failed' : 'pending', codec, missed,
         shortSide })
       if (settings.preset === 'copy') return
@@ -904,6 +916,8 @@ function Ready(props: {
   const thoroughName = (c: 'avc' | 'av1') => (c === 'av1' ? 'SVT-AV1' : 'x264')
   const outOfReach = `${short}p can’t get ${settings.targetBytes ? `under ${fmt.bytes(settings.targetBytes)}` : 'to half the size'}`
   const sizeMode: SizeMode = !settings.sizeTarget ? 'any' : settings.targetBytes ? 'fit' : 'half'
+  // A typed Fit under size the field rejects (empty, zero, not below the original) holds Compress back.
+  const [fitValid, setFitValid] = useState(true)
   const audioNote = () => {
     const audio = probe.audio
     if (!audio) return 'This video has no audio.'
@@ -917,6 +931,8 @@ function Ready(props: {
     const changes = [
       plan.channels < audio.channels && `mixed down to ${plan.channels === 1 ? 'mono' : 'stereo'}`,
       plan.sampleRate !== audio.sampleRate && `at ${plan.sampleRate / 1000} kHz`,
+      // The compact rate for a tight Fit under size (audioFor).
+      plan.reduced && `at ${plan.bitrate / 1000} kbps to fit`,
     ].filter(Boolean)
     const converted = `is converted to ${CODEC_LABEL[plan.codec]}${changes.length ? `, ${changes.join(' and ')}` : ''}.`
     return audio.codec ? `${name} ${converted}` : `This video’s audio ${converted}`
@@ -955,6 +971,7 @@ function Ready(props: {
       className="stack"
       onSubmit={(e) => {
         e.preventDefault()
+        if (sizeMode === 'fit' && !fitValid) return
         props.onStart()
       }}
     >
@@ -973,8 +990,12 @@ function Ready(props: {
           value={sizeMode}
           options={SIZE_OPTIONS}
           disabled={copy}
-          onChange={(v) => setSettings((s) => ({ ...s, sizeTarget: v !== 'any',
-            targetBytes: v === 'fit' ? (s.targetBytes ?? defaultFit(probe.file.size)) : null }))}
+          onChange={(v) => {
+            // The field comes back showing the last size it accepted.
+            setFitValid(true)
+            setSettings((s) => ({ ...s, sizeTarget: v !== 'any',
+              targetBytes: v === 'fit' ? (s.targetBytes ?? defaultFit(probe.file.size)) : null }))
+          }}
           hint={copy ? 'Unchanged.' : SIZE_HINT[sizeMode]}
         >
           {sizeMode === 'fit' && !copy && (
@@ -982,6 +1003,7 @@ function Ready(props: {
               bytes={settings.targetBytes ?? defaultFit(probe.file.size)}
               limit={probe.file.size}
               onChange={(targetBytes) => setSettings((s) => ({ ...s, targetBytes }))}
+              onValid={setFitValid}
             />
           )}
         </Choice>
@@ -1121,11 +1143,22 @@ function Ready(props: {
             </button>
           )}
         </div>
-        <button type="submit" className="button primary" disabled={noEncoder || (!!tuning && 'error' in tuning && !usesX264(settings))}>
+        <button type="submit" className="button primary"
+                disabled={noEncoder || (!!tuning && 'error' in tuning && !usesX264(settings)) || (sizeMode === 'fit' && !fitValid)}>
           {copy ? 'Repackage video' : 'Compress video'}
         </button>
       </div>
-      {result && !result.reached && !copy && (
+      {result && !result.reached && !copy && usesX264(settings) && settings.targetBytes && (
+        <p className="note">
+          {(result.codec ?? thoroughCodec(settings)) === 'av1' ? 'AV1' : 'H.264'} can’t get this video under{' '}
+          {fmt.bytes(settings.targetBytes)} even at its lowest quality{result.shortSide ? ` and ${result.shortSide}p` : ''},
+          so the copy will come out over it.{' '}
+          {(result.codec ?? thoroughCodec(settings)) === 'avc' && result.choice?.reason === 'device'
+            ? 'AV1 would get further, but this browser can’t play it.'
+            : 'A larger size will get there.'}
+        </p>
+      )}
+      {result && !result.reached && !copy && !usesX264(settings) && (
         <p className="note">
           {CODEC_LABEL[settings.codec]} in this browser can't reach {presetLabel} quality on this video{' '}
           {settings.sizeTarget
@@ -1239,11 +1272,23 @@ function verdict(ssim: number) {
 }
 
 /** The size for "Fit under": typed in megabytes, or one of the common limits smaller than the file. */
-function FitSize({ bytes, limit, onChange }: { bytes: number; limit: number; onChange: (bytes: number) => void }) {
+function FitSize({ bytes, limit, onChange, onValid }: {
+  bytes: number
+  limit: number
+  onChange: (bytes: number) => void
+  /** Whether the typed size can be used; Compress waits while it can't. */
+  onValid: (valid: boolean) => void
+}) {
   const [text, setText] = useState(() => String(bytes / 1e6))
   const presets = FIT_PRESETS.filter((mb) => mb * 1e6 < limit)
+  // Said here: a browser's own validation bubble is easy to miss, or not shown at all.
+  const typed = Number(text)
+  const problem = !(typed > 0)
+    ? 'Enter a size in megabytes.'
+    : typed * 1e6 >= limit ? `That’s no smaller than the original (${fmt.bytes(limit)}).` : null
   const set = (mb: number) => {
     setText(String(mb))
+    onValid(true)
     onChange(mb * 1e6)
   }
   return (
@@ -1252,14 +1297,17 @@ function FitSize({ bytes, limit, onChange }: { bytes: number; limit: number; onC
         <input
           type="number"
           inputMode="decimal"
-          min={0.1}
           step="any"
           value={text}
+          aria-invalid={!!problem}
+          aria-describedby={problem ? 'fit-problem' : undefined}
           aria-label="Largest size, in megabytes"
           onChange={(e) => {
             setText(e.target.value)
             const mb = Number(e.target.value)
-            if (mb > 0) onChange(Math.round(mb * 1e6))
+            const valid = mb > 0 && mb * 1e6 < limit
+            onValid(valid)
+            if (valid) onChange(Math.round(mb * 1e6))
           }}
         />
         <span>MB</span>
@@ -1269,6 +1317,11 @@ function FitSize({ bytes, limit, onChange }: { bytes: number; limit: number; onC
           {mb} MB
         </button>
       ))}
+      {problem && (
+        <p id="fit-problem" className="error fit-problem" role="alert">
+          {problem}
+        </p>
+      )}
     </div>
   )
 }
@@ -1283,17 +1336,21 @@ function Done(props: {
   const before = probe.file.size
   const after = blob.size
   const smaller = after < before
-  const ext = blob.type.includes('matroska') ? 'mkv' : 'mp4'
+  const ext = blob.type.includes('matroska') ? 'mkv' : blob.type.includes('quicktime') ? 'mov' : 'mp4'
   const name = `${probe.file.name.replace(/\.[^.]+$/, '')} (compressed).${ext}`
   // Phones and most desktop browsers can hand the file straight to another app: a chat, mail, or the photo library.
   const file = useMemo(() => new File([blob], name, { type: blob.type }), [blob, name])
   const shareable = typeof navigator !== 'undefined' && !!navigator.canShare?.({ files: [file] })
+  // Played back, the copy barely resembles the original although the encoder measured it fine: the browser handed the
+  // encoder broken frames (WebKit's copyTo did, SSIM 0.01-0.02). readback.ts should catch that first; if it didn't,
+  // an error says so and downloading is no longer the main action.
+  const damaged = typeof quality === 'object' && !!quality.mismatch && quality.ssim < 0.5
 
   return (
     <section className="stack">
       <div className="panel result">
         <p className="result-kicker">
-          {smaller ? 'Done' : 'Done, but the original is smaller'}
+          {damaged ? 'Done, but the copy is damaged' : smaller ? 'Done' : 'Done, but the original is smaller'}
           {props.phase.codec && ` · ${props.phase.codec === 'av1' ? 'AV1' : 'H.264'}`}
           {props.phase.shortSide && ` · ${props.phase.shortSide}p to fit`}
         </p>
@@ -1324,7 +1381,13 @@ function Done(props: {
             </>
           )}
         </p>
-        {quality !== 'pending' && quality !== 'failed' && quality.mismatch && (
+        {damaged && (
+          <p className="error" role="alert">
+            This copy came out damaged: this browser handed the encoder broken frames. Keep the original, or try
+            compressing it in another browser.
+          </p>
+        )}
+        {quality !== 'pending' && quality !== 'failed' && quality.mismatch && !damaged && (
           <p className="note">
             Played back, this copy looks less like the original than the encoder measured, so these numbers come from the
             frames below. Compare them before keeping it.
@@ -1335,14 +1398,16 @@ function Done(props: {
         )}
         {smaller && props.phase.missed && (
           <p className="note">
-            This video was already efficiently compressed, and this is as small as{' '}
-            {props.phase.codec === 'av1' ? 'AV1' : 'H.264'} could make it: short of{' '}
-            {props.phase.missed.target ? fmt.bytes(props.phase.missed.target) : 'half the size'}. A lower resolution
-            would get further.
+            {props.phase.missed.target
+              ? `This is as small as ${props.phase.codec === 'av1' ? 'AV1' : 'H.264'} could make it here: short of ${fmt.bytes(props.phase.missed.target)}.`
+              : `This video was already efficiently compressed, and this is as small as ${props.phase.codec === 'av1' ? 'AV1' : 'H.264'} could make it: short of half the size.`}
+            {props.phase.missed.lower
+              ? ' A lower resolution would get further.'
+              : props.phase.missed.noAv1 ? ' A browser that plays AV1 would get further.' : ''}
           </p>
         )}
         <div className="result-actions">
-          <a className={smaller ? 'button primary' : 'button'} href={url} download={name}>
+          <a className={smaller && !damaged ? 'button primary' : 'button'} href={url} download={name}>
             Download {ext.toUpperCase()}
           </a>
           {shareable && (

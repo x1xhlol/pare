@@ -29,6 +29,8 @@ export type Probe = {
   container: string
   duration: number
   firstTimestamp: number
+  /** Where the copy's timeline starts: the earliest track's first timestamp, at least 0. `duration` runs from here. */
+  start: number
   width: number
   height: number
   fps: number
@@ -42,9 +44,10 @@ export type Probe = {
   /**
    * One decoded frame: its pixel format and visible size, turned to display orientation. What the encoders will be
    * given, which the container tags can't say (an HLG video can be 8-bit, and a 10-bit one can decode to a format
-   * WebCodecs doesn't name). Null when the browser can't decode the video.
+   * WebCodecs doesn't name). Null when the browser can't decode the video. `copies`: copyTo gives it back as it is
+   * (readback.ts), so frames can go into the encoders as decoded.
    */
-  frame: { format: VideoSamplePixelFormat | null; width: number; height: number } | null
+  frame: { format: VideoSamplePixelFormat | null; width: number; height: number; copies: boolean } | null
   /** Whether this device decodes 10-bit AV1 at the source's size smoothly (only asked for 10-bit HDR sources). */
   playsHdrAv1: boolean
   audio: { codec: AudioCodec | null; bitrate: number; channels: number; sampleRate: number; plan: AudioPlan } | null
@@ -57,7 +60,14 @@ export type Probe = {
 export const MP4_AUDIO: AudioCodec[] = ['aac', 'opus', 'mp3', 'ac3', 'eac3', 'flac']
 
 /** How this browser can encode the audio: codec, and the channels and sample rate it takes. */
-export type AudioEncode = { codec: 'aac' | 'opus'; channels: number; sampleRate: number; bitrate: number }
+export type AudioEncode = {
+  codec: 'aac' | 'opus'
+  channels: number
+  sampleRate: number
+  bitrate: number
+  /** The compact rate, for audio under a tight Fit under size (audioFor). */
+  reduced?: boolean
+}
 
 /**
  * What Pare's own encoders do with the audio, decided when the file is opened so a compression can't fail at the end:
@@ -65,8 +75,8 @@ export type AudioEncode = { codec: 'aac' | 'opus'; channels: number; sampleRate:
  * encoder needs that), or leave it out.
  */
 export type AudioPlan =
-  | { kind: 'copy'; encode?: AudioEncode }
-  | ({ kind: 'encode' } & AudioEncode)
+  | { kind: 'copy'; encode?: AudioEncode; compact?: AudioEncode }
+  | ({ kind: 'encode'; compact?: AudioEncode } & AudioEncode)
   | { kind: 'drop'; reason: 'decode' | 'encode' }
 
 /** The default size target: at most half the original. The first pass aims 6% under a target, for its errors. */
@@ -90,6 +100,14 @@ export function audioFor(probe: Probe, settings: Settings): AudioPlan | null {
   const audio = probe.audio
   if (!audio || !settings.keepAudio) return null
   const plan = audio.plan
+  // Under a size chosen with Fit under, audio that would take over a quarter of it goes down to a compact rate
+  // (48 kbps a channel, stereo at most) when that saves a fifth of it or more: a 142 kbps Opus track took 43% of
+  // 164 KB, and H.264 missed by 7%.
+  if (plan.kind !== 'drop' && plan.compact && settings.sizeTarget && settings.targetBytes && settings.preset !== 'copy') {
+    const rate = plan.kind === 'copy' ? audio.bitrate : plan.bitrate
+    if (rate > 1.25 * plan.compact.bitrate && (rate * probe.duration) / 8 > 0.25 * targetBytes(probe, settings))
+      return { kind: 'encode', ...plan.compact }
+  }
   if (plan.kind === 'copy' && plan.encode && settings.sizeTarget && settings.preset !== 'copy' &&
       audio.bitrate > 2 * plan.encode.bitrate && (audio.bitrate * probe.duration) / 8 > 0.25 * targetBytes(probe, settings))
     return { kind: 'encode', ...plan.encode }
@@ -145,14 +163,15 @@ export function outputSize(probe: Probe, shortSide: number | null) {
 }
 
 /** Pixel formats the encoders take as they are. Anything else goes through an RGB canvas. */
-const DIRECT_FORMATS: (VideoSamplePixelFormat | null)[] = ['NV12', 'I420', 'I420A', 'I420P10', 'I420P12']
+export const DIRECT_FORMATS: (VideoSamplePixelFormat | null)[] = ['NV12', 'I420', 'I420A', 'I420P10', 'I420P12']
 
 /**
  * Whether the source's frames go into the encoder as decoded, keeping their colours and bit depth: planar 4:2:0, copied
  * in at the source's size or scaled plane by plane. Otherwise (RGB from Firefox's decoder, 4:2:2, 4:4:4) they're drawn
- * on an RGB canvas at the output size, which makes them 8-bit BT.709 SDR, and the output has to be tagged that way.
+ * on an RGB canvas at the output size, which makes them 8-bit BT.709 SDR, and the output has to be tagged that way. So
+ * are frames this browser doesn't copy out correctly (Probe.frame.copies).
  */
-export const copiesFrames = (probe: Probe) => DIRECT_FORMATS.includes(probe.frame?.format ?? null)
+export const copiesFrames = (probe: Probe) => !!probe.frame?.copies && DIRECT_FORMATS.includes(probe.frame.format ?? null)
 
 /** Whether decoded frames of this format carry more than 8 bits. */
 export const deepFormat = (format: VideoSamplePixelFormat | null | undefined) => format === 'I420P10' || format === 'I420P12'

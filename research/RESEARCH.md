@@ -1194,6 +1194,41 @@ Pare's preview is 24 frames showing the 16th: within 0.006 of the real encode, a
 (x264, CRF 24) it was 0.949 against 0.951. It takes as long as encoding 24 frames on three encoders; for AV1 at 1080p
 that was 33 to 59 s on the benchmark machine under load, with the head start running alongside.
 
+## An edge-case sweep in three browsers
+
+About 50 small files built to break things (odd and tiny sizes, one and three frames, variable frame rate, a 10 s
+start offset, open GOPs, long GOPs with B-frames, rotation and flips, HDR, 4:2:2 and 4:4:4, VP9 and AV1 sources,
+MediaRecorder-style WebM, PCM in MOV, 5.1 and odd channel layouts, two audio tracks, location metadata) went through
+Pare in Chrome, Firefox 155 and WebKit 26.6 under every setting, each output checked with ffprobe and ffmpeg: frame
+count, duration, rotation, colour tags, audio channels and timing, creation time, location, size against the target.
+In Chrome all of it passed. The failures, all fixed:
+
+- **WebKit's `VideoFrame.copyTo` returns wrong bytes** for frames whose decoder rows are wider than the picture (VP9 at
+  640 wide padded to 704, and plain H.264 at 720 wide): padded rows copied as if packed, bottom rows left unwritten.
+  Pare's direct input path trusts copyTo, so the encoder got garbage (SSIM 0.01-0.02 against the source) while its own
+  SSIM against its input looked fine. The probe now checks that copyTo gives a frame back (no unwritten bytes, and luma
+  following a canvas draw band by band; a flat first frame defers to a later one), falling back to the canvas path,
+  and each chunk checks again. WebKit's canvas path is slower (a 720p worker copied for 10 s instead of 0.2) but right:
+  SSIM 0.94-0.99 on the same files. A copy that still plays back far from the original is flagged as damaged.
+- **One to three frames on 8 threads hung forever.** x264 starts its frame threads, a lookahead thread and, above 5
+  threads at Pare's preset, a pool of lookahead threads: 11 at 8 threads, against 10 pre-started workers. A thread
+  started later needs the blocked worker's event loop. WebKit hung in the app; Chrome hung too when driven directly.
+  The pool now covers every thread x264 starts.
+- **A file shifted in by an empty edit grew 42%.** Mediabunny's `computeDuration` is where the last track ends, so a 3 s
+  clip starting at 10 s measured 13 s; its audio looked like 70% of half the file and the size target was dropped. The
+  probe now measures from the earliest track, and the copy starts at 0 without the 10 s lead-in.
+- **WebKit's AudioEncoder stamps every packet from one AudioData with that AudioData's timestamp.** Mediabunny's
+  resampler hands the encoder 5-second blocks, so a short clip's re-encoded audio all sat at time 0. Audio now goes to
+  the encoder one packet at a time, timed from a running frame count (`src/lib/audio-frames.ts`). WebKit's variable-rate
+  Opus also came out 35% over its rate (129 kbps for 96); Opus is now constant-rate, which lands exactly.
+- **Under a tight Fit under size with only H.264** (WebKit on Linux can't play AV1), the target was missed with no warning
+  and a note that called the file "already efficiently compressed". Pare now says before compressing when a size is out
+  of reach, names AV1 when the browser can't play it, and takes audio that would fill over a quarter of the size down to
+  48 kbps a channel: MediaRecorder WebM under 164 KB in Chrome with H.264 went from 174,882 to 153,842 bytes.
+- **An Exact copy of a MOV with PCM audio** became an MP4 with ISO 'ipcm' audio, which few players read; it stays MOV now.
+- The Fit under field let the browser's own validation block Compress without a word; it now says what's wrong and
+  holds Compress back itself.
+
 ## End to end in the browser
 
 Same headless Chrome, same files, production builds:
