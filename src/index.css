@@ -763,6 +763,66 @@ label {
   outline-offset: 2px;
 }
 
+/* Length: a player to find the moments, and the two times. */
+.trim {
+  display: grid;
+  gap: 12px;
+}
+
+.trim-player {
+  display: block;
+  width: 100%;
+  max-height: 240px;
+  border-radius: var(--radius-control);
+  background: #000;
+}
+
+.trim-fields {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+}
+
+.trim-field {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.trim-field label {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+  color: var(--text-muted);
+}
+
+.trim-field input {
+  width: 96px;
+  min-height: 44px;
+  padding: 0 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-control);
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  font-size: 16px;
+  font-variant-numeric: tabular-nums;
+}
+
+.trim-field input:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+.trim-field input[aria-invalid='true'] {
+  border-color: var(--danger);
+}
+
+.trim-field input[aria-invalid='true']:focus-visible {
+  outline-color: var(--danger);
+}
+
 .choice-hint {
   grid-column: 2;
   font-size: 14px;

@@ -39,3 +39,17 @@ export function change(from: number, to: number) {
   const pct = Math.round((1 - to / from) * 100)
   return pct >= 0 ? `−${pct}%` : `+${-pct}%`
 }
+
+/** A time to a tenth of a second (or `digits` places): 0:03.4, 1:02:05.0. */
+export function clock(s: number, digits = 1) {
+  const scale = 10 ** digits
+  const parts = Math.max(0, Math.round(s * scale))
+  return `${duration(Math.floor(parts / scale))}.${String(parts % scale).padStart(digits, '0')}`
+}
+
+/** Seconds from a typed time: 83.5, 1:23.5 or 1:01:23.5. Null when it isn't one. */
+export function parseClock(text: string) {
+  const parts = text.trim().split(':')
+  if (parts.length > 3 || parts.some((p) => !/^\d+(\.\d*)?$|^\.\d+$/.test(p.trim()))) return null
+  return parts.reduce((total, p) => total * 60 + Number(p), 0)
+}

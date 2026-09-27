@@ -1,7 +1,7 @@
 import { expect, test } from 'bun:test'
 import {
-  aimBytes, audioBytes, audioFor, codecName, copiesFrames, forEngine, keepsHdr, outputSize, reachable, targetBytes,
-  type AudioPlan, type Probe,
+  aimBytes, audioBytes, audioFor, codecName, copiesFrames, forEngine, keepsHdr, narrow, outputSize, reachable, snapTrim,
+  targetBytes, type AudioPlan, type FrameIndex, type Probe,
   type Settings,
 } from '../src/lib/shared'
 
@@ -9,9 +9,16 @@ const settings: Settings = { preset: 'visually-lossless', engine: 'thorough', co
   keepAudio: true, sizeTarget: true }
 
 /** A 10 s 1080p video of `size` bytes with audio at `bitrate` bits a second. */
+/** 10 s at 30 fps, a keyframe every second, each frame `frameBytes` (keyframes 5x). */
+function frames(frameBytes = 20_000): FrameIndex {
+  const times = Float64Array.from({ length: 300 }, (_, i) => i / 30)
+  const bytes = Float64Array.from({ length: 300 }, (_, i) => (i % 30 === 0 ? 5 : 1) * frameBytes)
+  return { times, bytes, keys: Array.from({ length: 10 }, (_, k) => k * 30), total: bytes.reduce((a, b) => a + b, 0) }
+}
+
 function probe(size: number, bitrate: number, plan: AudioPlan, extra: Partial<Probe> = {}): Probe {
   return {
-    file: { size } as File, container: 'MP4', duration: 10, firstTimestamp: 0, start: 0, width: 1920, height: 1080, fps: 30,
+    file: { size } as File, bytes: size, trim: null, index: frames(), container: 'MP4', duration: 10, firstTimestamp: 0, start: 0, width: 1920, height: 1080, fps: 30,
     videoCodec: 'avc', videoBitrate: 8e6, canDecode: true, hdr: false, colorSpace: {},
     frame: { format: 'I420', width: 1920, height: 1080, copies: true }, playsHdrAv1: false,
     audio: { codec: 'flac', bitrate, channels: 2, sampleRate: 48000, plan }, poster: null,
@@ -118,4 +125,38 @@ test('a chosen size replaces half the original everywhere', () => {
   expect(reachable(probe(100e6, 7e6, { kind: 'copy' }), fit)).toBe(false)
   // With an encoder, the lossless-size track is encoded and the target is within reach again.
   expect(reachable(probe(100e6, 7e6, { kind: 'copy', encode: opus }), fit)).toBe(true)
+})
+
+test('a part snaps to frames: it starts on the frame shown at its start and ends before the first frame at its end', () => {
+  const p = probe(20e6, 128_000, { kind: 'copy' })
+  // 2.01 s shows frame 60 (2.000 s); the first frame at or after 5.01 is frame 151.
+  const trim = snapTrim(p, 2.01, 5.01)!
+  expect(trim.start).toBe(2)
+  expect(trim.end).toBeCloseTo(151 / 30, 9)
+  // Snapped again, a part stays the same: its end is a frame's start.
+  expect(snapTrim(p, trim.start, trim.end)).toEqual(trim)
+  // Up to the end, the part ends where the video does.
+  expect(snapTrim(p, 1, 10)!.end).toBe(10)
+  // All of it is no part at all.
+  expect(snapTrim(p, 0, 10)).toBeNull()
+  expect(snapTrim(p, -1, 99)).toBeNull()
+})
+
+test('a part is measured by its own frames and length of audio, and half the size means half of it', () => {
+  const p = probe(10e6, 128_000, { kind: 'copy' })
+  expect(narrow(p, settings)).toBe(p)
+  const part = narrow(p, { ...settings, trim: { start: 2, end: 4 } })
+  expect(part.start).toBe(2)
+  expect(part.duration).toBe(2)
+  expect(part.firstTimestamp).toBe(2)
+  // Frames 60-119: two keyframes and 58 others, at 20 KB.
+  const video = (2 * 5 + 58) * 20_000
+  expect(part.videoBitrate).toBeCloseTo((video * 8) / 2, 6)
+  const whole = frames().total + (128_000 * 10) / 8
+  expect(part.bytes).toBeCloseTo((10e6 * (video + (128_000 * 2) / 8)) / whole, 3)
+  expect(targetBytes(part, settings)).toBeCloseTo(part.bytes / 2, 3)
+  // A size chosen with Fit under stays what it is.
+  expect(targetBytes(part, { ...settings, targetBytes: 1e6 })).toBe(1e6)
+  // The audio's share of the target follows the part's length: 2 s of it.
+  expect(audioBytes(part, { ...settings, trim: { start: 2, end: 4 } })).toBe(32_000)
 })

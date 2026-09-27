@@ -3,6 +3,7 @@ import {
   BufferTarget,
   CanvasSink,
   Conversion,
+  EncodedPacketSink,
   Input,
   MATROSKA,
   MkvOutputFormat,
@@ -32,7 +33,7 @@ import { readsBack } from './readback'
 import { lumaOf, psnr, ssim } from './metrics'
 import {
   audioBytes as plannedAudioBytes, audioFor, deepFormat, DIRECT_FORMATS, even, MP4_AUDIO, outputSize, playsAv1, targetBytes, type AudioEncode,
-  type AudioPlan, type OutputCodec, type Preset, type Probe, type Settings,
+  type AudioPlan, type FrameIndex, type OutputCodec, type Preset, type Probe, type Settings,
 } from './shared'
 
 type EncodingPreset = Exclude<Preset, 'copy'>
@@ -73,7 +74,7 @@ export async function probeFile(file: File): Promise<Probe> {
       video.getDisplayHeight(),
       video.canDecode(),
       video.getColorSpace(),
-      video.computePacketStats(),
+      frameIndex(video),
     ])
     const firstTimestamp = Math.max(0, await video.getFirstTimestamp())
     const audioTrack = await input.getPrimaryAudioTrack()
@@ -89,7 +90,7 @@ export async function probeFile(file: File): Promise<Probe> {
     const isHdr = (c?: VideoColorSpaceInit) => ['pq', 'hlg'].includes(c?.transfer as string)
     const colorSpace = !tags.transfer && isHdr(frame?.colorSpace) ? frame!.colorSpace : tags
     const hdr = isHdr(colorSpace)
-    const fps = stats.averagePacketRate
+    const fps = stats.packetRate
     const playsHdrAv1 = hdr && deepFormat(frame?.format) && (await playsAv1(width, height, fps, true))
 
     const audio = audioTrack ? await describeAudio(audioTrack) : null
@@ -108,6 +109,9 @@ export async function probeFile(file: File): Promise<Probe> {
 
     return {
       file,
+      bytes: file.size,
+      trim: null,
+      index: stats.index,
       container: format.name,
       duration,
       firstTimestamp,
@@ -116,7 +120,7 @@ export async function probeFile(file: File): Promise<Probe> {
       height,
       fps,
       videoCodec,
-      videoBitrate: stats.averageBitrate,
+      videoBitrate: stats.bitrate,
       canDecode,
       hdr,
       colorSpace,
@@ -129,6 +133,36 @@ export async function probeFile(file: File): Promise<Probe> {
     }
   } finally {
     input.dispose()
+  }
+}
+
+/**
+ * Every frame from the container's index (only packet sizes are read): the frame index a trim is cut from, and the
+ * rates computePacketStats would give.
+ */
+async function frameIndex(track: InputVideoTrack) {
+  const frames: { t: number; bytes: number; key: boolean }[] = []
+  let startTimestamp = Infinity
+  let endTimestamp = -Infinity
+  let total = 0
+  for await (const packet of new EncodedPacketSink(track).packets(undefined, undefined, { metadataOnly: true })) {
+    frames.push({ t: packet.timestamp, bytes: packet.byteLength, key: packet.type === 'key' })
+    startTimestamp = Math.min(startTimestamp, packet.timestamp)
+    endTimestamp = Math.max(endTimestamp, packet.timestamp + packet.duration)
+    total += packet.byteLength
+  }
+  frames.sort((a, b) => a.t - b.t)
+  const span = endTimestamp - startTimestamp
+  const index: FrameIndex = {
+    times: Float64Array.from(frames, (f) => f.t),
+    bytes: Float64Array.from(frames, (f) => f.bytes),
+    keys: frames.flatMap((f, i) => (f.key ? [i] : [])),
+    total,
+  }
+  return {
+    index,
+    packetRate: frames.length ? Number((frames.length / span).toPrecision(16)) : 0,
+    bitrate: frames.length ? Number(((8 * total) / span).toPrecision(16)) : 0,
   }
 }
 
@@ -340,7 +374,7 @@ export async function calibrate(
   const target = SSIM_TARGET[settings.preset]
   // Some containers don't report a usable bitrate; fall back to a generous per-pixel budget.
   // With a size target, 90% of it (45% of the original for half).
-  const share = settings.sizeTarget ? (0.9 * targetBytes(probe, settings)) / probe.file.size : MAX_SHARE_OF_SOURCE
+  const share = settings.sizeTarget ? (0.9 * targetBytes(probe, settings)) / probe.bytes : MAX_SHARE_OF_SOURCE
   const ceiling = probe.videoBitrate > 0 ? probe.videoBitrate * share : width * height * fps * 0.4
   const floor = Math.min(ceiling, 150_000)
   const clampRate = (b: number) => Math.min(ceiling, Math.max(floor, b))
@@ -521,6 +555,8 @@ export function compress(probe: Probe, settings: Settings, bitrate: number, onPr
         input,
         output,
         tracks: 'primary',
+        // Only for a part: left out, the conversion starts where the tracks it keeps do, which measureQuality expects.
+        trim: probe.trim ? { start: probe.trim.start, end: probe.trim.end } : undefined,
         video: videoOptions(probe, settings, bitrate),
         audio: await audioOptions(probe, settings),
         // Only the recording date and place carry over, as from Pare's own encoders.

@@ -16,6 +16,7 @@ import {
   StreamTarget,
   WEBM,
   type AudioSample,
+  type InputAudioTrack,
 } from 'mediabunny'
 import singleScript from './x264/x264.mjs?url'
 import singleWasm from './x264/x264.wasm?url'
@@ -32,7 +33,7 @@ import { ownDownmix, stereoDownmix } from './downmix'
 import { originTags, stampDate } from './origin'
 import {
   aimBytes, audioBytes, audioFor, copiesFrames, keepsHdr, outputSize, playsAv1, targetBytes, VIDEO_FLOOR, type AudioEncode,
-  type Preset, type Probe, type Settings,
+  framesIn, type Preset, type Probe, type Settings, type Trim,
 } from './shared'
 
 type EncodingPreset = Exclude<Preset, 'copy'>
@@ -343,35 +344,76 @@ async function openTrack(file: Blob) {
 }
 
 type Timeline = {
-  /** Presentation timestamps of every video frame, in order. */
+  /** Presentation timestamps of every video frame being encoded, in order. */
   times: number[]
   /** Indexes into `times` of the source's keyframes. */
   keys: number[]
+  /** Where the last frame's chunk ends: the end of a trimmed part, or Infinity for the end of the video. */
+  end: number
+  /** Frames before the first one, from the keyframe it decodes from: 0 unless a part starts between keyframes. */
+  lead0: number
 }
 
-async function timeline(file: Blob): Promise<Timeline> {
-  const { input, track } = await openTrack(file)
-  try {
-    const frames: { t: number; key: boolean }[] = []
-    for await (const packet of new EncodedPacketSink(track).packets(undefined, undefined, { metadataOnly: true })) {
-      frames.push({ t: packet.timestamp, key: packet.type === 'key' })
-    }
-    frames.sort((a, b) => a.t - b.t)
-    return { times: frames.map((f) => f.t), keys: frames.flatMap((f, i) => (f.key ? [i] : [])) }
-  } finally {
-    input.dispose()
+/** The frames to encode: the probe's frame index, or the part of it a trim keeps. */
+function timeline(probe: Probe): Timeline {
+  const { index, trim } = probe
+  const { first, last } = trim ? framesIn(index, trim) : { first: 0, last: index.times.length }
+  if (last <= first) throw new Error('There are no frames in this part of the video.')
+  const before = index.keys.filter((k) => k <= first).at(-1) ?? 0
+  return {
+    times: Array.from(index.times.subarray(first, last)),
+    keys: index.keys.filter((k) => k >= first && k < last).map((k) => k - first),
+    end: trim ? trim.end : Infinity,
+    lead0: first - before,
   }
 }
 
-/** Bytes and packets of the source's audio, from the container's index: only packet sizes are read. */
-async function audioPackets(file: Blob) {
-  const input = new Input({ source: new BlobSource(file), formats: [MP4, QTFF, WEBM, MATROSKA] })
+/**
+ * Seconds by which a track's timestamps run late. Mediabunny reads a Matroska track's Opus packets at their block
+ * timestamps without subtracting the track's CodecDelay (the encoder's pre-skip), which the Matroska spec says to do.
+ * A whole track plays right (a decoder drops the pre-skip at its start), but a part cut from its middle came out 7.5 ms
+ * late. The pre-skip is read from the Opus header; CodecDelay holds the same.
+ */
+async function audioDelay(input: Input, track: InputAudioTrack) {
+  const format = await input.getFormat()
+  if ((format !== WEBM && format !== MATROSKA) || (await track.getCodec()) !== 'opus') return 0
+  const description = (await track.getDecoderConfig())?.description
+  if (!description) return 0
+  const head = ArrayBuffer.isView(description)
+    ? new DataView(description.buffer, description.byteOffset, description.byteLength)
+    : new DataView(description)
+  return head.byteLength >= 12 ? head.getUint16(10, true) / 48000 : 0
+}
+
+/**
+ * The source's audio packets in a part: the one playing at its start, through the last one starting before its end.
+ * All of them without a trim. `delay`: how late the track's timestamps run (audioDelay).
+ */
+async function* audioIn(track: InputAudioTrack, trim: Trim | null, metadataOnly: boolean, delay = 0) {
+  const sink = new EncodedPacketSink(track)
+  if (!trim) {
+    yield* sink.packets(undefined, undefined, { metadataOnly })
+    return
+  }
+  const first = (await sink.getPacket(trim.start + delay, { metadataOnly })) ?? (await sink.getFirstPacket({ metadataOnly }))
+  if (!first) return
+  for await (const packet of sink.packets(first, undefined, { metadataOnly })) {
+    const at = packet.timestamp - delay
+    if (at >= trim.end - 1e-6) break
+    // Before the part (a gap in the audio): nothing of it plays.
+    if (at + packet.duration <= trim.start + 1e-6) continue
+    yield packet
+  }
+}
+
+/** Bytes and packets of the source's audio that mux copies, from the container's index: only packet sizes are read. */
+async function audioPackets(probe: Probe) {
+  const input = new Input({ source: new BlobSource(probe.file), formats: [MP4, QTFF, WEBM, MATROSKA] })
   try {
     const track = await input.getPrimaryAudioTrack()
     let bytes = 0, count = 0
-    if (track)
-      for await (const packet of new EncodedPacketSink(track).packets(undefined, undefined, { metadataOnly: true }))
-        (bytes += packet.byteLength), count++
+    const delay = track && probe.trim ? await audioDelay(input, track) : 0
+    if (track) for await (const packet of audioIn(track, probe.trim, true, delay)) (bytes += packet.byteLength), count++
     return { bytes, count }
   } finally {
     input.dispose()
@@ -648,12 +690,12 @@ async function startPool(profile: Profile, build: EncoderBuild, size: number, th
  * chunk reaching as far as the cost allows is optimal: a frame moved into a chunk costs a whole frame, while starting
  * the next chunk later costs at most a fraction of one in extra decoding.
  */
-function planChunks({ times, keys }: Timeline, workers: number, decodeShare: number): WorkerChunk[] {
+function planChunks({ times, keys, end, lead0 }: Timeline, workers: number, decodeShare: number): WorkerChunk[] {
   const total = times.length
   const n = Math.max(1, Math.min(Math.max(workers, Math.min(6 * workers, Math.ceil(total / 240))), Math.floor(total / 30)))
   // Frames decoded before the first one used, for a chunk starting at each frame.
   const lead: number[] = []
-  for (let i = 0, k = 0, key = 0; i < total; i++) {
+  for (let i = 0, k = 0, key = -lead0; i < total; i++) {
     while (k < keys.length && keys[k] <= i) key = keys[k++]
     lead.push(i - key)
   }
@@ -683,7 +725,7 @@ function planChunks({ times, keys }: Timeline, workers: number, decodeShare: num
     type: 'chunk',
     index,
     start: times[first],
-    end: index === firsts.length - 1 ? Infinity : times[firsts[index + 1]],
+    end: index === firsts.length - 1 ? end : times[firsts[index + 1]],
   }))
 }
 
@@ -692,10 +734,10 @@ function planChunks({ times, keys }: Timeline, workers: number, decodeShare: num
  * are split for the workers in proportion to each gap's length. Returns every chunk in time order, and the finished
  * ones by their new index.
  */
-function planAround({ times }: Timeline, workers: number, done: (Omit<Reusable, 'chunk'> & { chunk?: EncodedChunk })[]) {
+function planAround({ times, end }: Timeline, workers: number, done: (Omit<Reusable, 'chunk'> & { chunk?: EncodedChunk })[]) {
   const total = times.length
   const fixed = done
-    .map((r) => ({ ...r, first: times.indexOf(r.start), last: r.end === Infinity ? total : times.indexOf(r.end) }))
+    .map((r) => ({ ...r, first: times.indexOf(r.start), last: r.end >= end ? total : times.indexOf(r.end) }))
     .filter((r) => r.first >= 0 && r.last > r.first)
     .sort((a, b) => a.first - b.first)
   const gaps: { first: number; last: number }[] = []
@@ -720,7 +762,7 @@ function planAround({ times }: Timeline, workers: number, done: (Omit<Reusable, 
   const reused = new Map<number, EncodedChunk>()
   const chunks = all.map((c, index): WorkerChunk => {
     if (c.chunk) reused.set(index, { ...c.chunk, index })
-    return { type: 'chunk', index, start: times[c.first], end: c.last >= total ? Infinity : times[c.last] }
+    return { type: 'chunk', index, start: times[c.first], end: c.last >= total ? end : times[c.last] }
   })
   return { chunks, reused }
 }
@@ -832,15 +874,32 @@ async function mux(probe: Probe, settings: Settings, chunks: EncodedChunk[], siz
     if (audioTrack && audioCopy) {
       const decoderConfig = await audioTrack.getDecoderConfig()
       let firstAudio = true
-      for await (const packet of new EncodedPacketSink(audioTrack).packets()) {
-        const moved = base ? packet.clone({ timestamp: packet.timestamp - base }) : packet
+      // A part's first packet can start before it: its timestamp goes below 0, and the container's edit list skips
+      // what plays before the part.
+      const delay = probe.trim ? await audioDelay(input, audioTrack) : 0
+      for await (const packet of audioIn(audioTrack, probe.trim, false, delay)) {
+        const moved = base || delay ? packet.clone({ timestamp: packet.timestamp - delay - base }) : packet
         await audioCopy.add(moved, firstAudio && decoderConfig ? { decoderConfig } : undefined)
         firstAudio = false
       }
       audioCopy.close()
     }
     if (audioTrack && audioEncode) {
-      for await (const sample of new AudioSampleSink(audioTrack).samples()) {
+      const trim = probe.trim
+      const delay = trim ? await audioDelay(input, audioTrack) : 0
+      for await (const decoded of new AudioSampleSink(audioTrack).samples(trim ? trim.start + delay : undefined, trim ? trim.end + delay : undefined)) {
+        if (delay) decoded.setTimestamp(decoded.timestamp - delay)
+        // Cut to the part, as a Mediabunny conversion does.
+        const from = trim && decoded.timestamp < trim.start ? Math.round((trim.start - decoded.timestamp) * decoded.sampleRate) : 0
+        const to = trim && decoded.timestamp + decoded.duration > trim.end
+          ? Math.round((trim.end - decoded.timestamp) * decoded.sampleRate)
+          : decoded.numberOfFrames
+        if (to <= from) {
+          decoded.close()
+          continue
+        }
+        const sample = from > 0 || to < decoded.numberOfFrames ? decoded.trim(from, to) : decoded
+        if (sample !== decoded) decoded.close()
         if (base) sample.setTimestamp(sample.timestamp - base)
         await audioEncode.add(sample)
         sample.close()
@@ -1039,8 +1098,8 @@ export function encode(probe: Probe, settings: Settings, start: EncodeStart, onP
       const ceiling = maxCrf(profile, settings)
       const crf = Math.min(ceiling, Math.max(floor, start.crf ?? floor))
       const slope = start.slope && start.slope < -0.03 ? start.slope : profile.slope
-      const [line, tuned, sound] = await Promise.all([timeline(probe.file), encoderOptions(probe, settings, crf),
-        audioPackets(probe.file)])
+      const line = timeline(probe)
+      const [tuned, sound] = await Promise.all([encoderOptions(probe, settings, crf), audioPackets(probe)])
       const options = start.fast && profile === X264 ? fastest(tuned) : tuned
       const { times } = line
       const layout = workerCount(probe, settings, times.length)
@@ -1474,7 +1533,8 @@ export async function plan(probe: Probe, settings: Settings, signal: AbortSignal
   const began = performance.now()
   const size = frameSize(probe, settings, (await orientation(probe.file)).rotation)
   const baseCrf = presetCrf(settings)
-  const [line, full] = await Promise.all([timeline(probe.file), encoderOptions(probe, settings, baseCrf)])
+  const line = timeline(probe)
+  const full = await encoderOptions(probe, settings, baseCrf)
   const { times } = line
   const profile = profileFor(settings)
   // Quality measurements need the real preset: a faster one changes how AV1 looks more on some footage than others.
@@ -1496,7 +1556,7 @@ export async function plan(probe: Probe, settings: Settings, signal: AbortSignal
     const ideal = Math.min(times.length - per, Math.max(0, Math.round(((i + 0.5) / windowCount) * times.length - per / 2)))
     const near = line.keys.filter((k) => Math.abs(k - ideal) <= times.length / windowCount / 3 && k + per <= times.length)
     const first = near.length ? near.reduce((a, b) => (Math.abs(b - ideal) < Math.abs(a - ideal) ? b : a)) : ideal
-    return { start: times[first], end: first + per < times.length ? times[first + per] : Infinity }
+    return { start: times[first], end: first + per < times.length ? times[first + per] : line.end }
   })
   // A test on some of the windows (AV1 when choosing the codec) keeps their positions, so another encoder's test on
   // all of them can tell how the rest compare.
@@ -1679,7 +1739,7 @@ const PREVIEW_WINDOWS = 3
 export async function preview(probe: Probe, settings: Settings, crf: number, fast: boolean, signal: AbortSignal) {
   const orient = await orientation(probe.file)
   const size = frameSize(probe, settings, orient.rotation)
-  const line = await timeline(probe.file)
+  const line = timeline(probe)
   const n = line.times.length
   const per = Math.min(PREVIEW_FRAMES, n)
   const profile = profileFor(settings)
@@ -1693,7 +1753,7 @@ export async function preview(probe: Probe, settings: Settings, crf: number, fas
   // Evenly spaced by at least `per` frames, so no two windows share one.
   const windows = Array.from({ length: count }, (_, index) => {
     const first = Math.floor((index * n) / count + (n / count - per) / 2)
-    return { type: 'chunk' as const, index, start: line.times[first], end: first + per < n ? line.times[first + per] : Infinity }
+    return { type: 'chunk' as const, index, start: line.times[first], end: first + per < n ? line.times[first + per] : line.end }
   })
   const fps = probe.fps || 30
   if (signal.aborted) throw new Canceled()

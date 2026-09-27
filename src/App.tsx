@@ -7,8 +7,8 @@ import { dropPlace, placeLabel } from './lib/origin'
 import type { Calibration, FramePair, Job, QualityReport } from './lib/media'
 import type { Progress, SizePlan } from './lib/x264'
 import {
-  audioFor, CODEC_LABEL, codecName, copiesFrames, deepFormat, forEngine, keepsHdr, reachable, targetBytes, outputSize, type Engine, type OutputCodec, type Preset, type Probe,
-  type Settings,
+  audioFor, CODEC_LABEL, codecName, copiesFrames, deepFormat, endOf, forEngine, keepsHdr, MIN_PART, narrow, reachable,
+  snapTrim, targetBytes, outputSize, type Engine, type OutputCodec, type Preset, type Probe, type Settings, type Trim,
 } from './lib/shared'
 
 const media = () => import('./lib/media')
@@ -25,6 +25,8 @@ type Phase =
   | {
       kind: 'done'
       probe: Probe
+      /** The part that was compressed: `probe` itself unless it was trimmed. */
+      part: Probe
       blob: Blob
       url: string
       quality: QualityReport | 'pending' | 'failed'
@@ -75,7 +77,8 @@ const usesX264 = (s: Settings) => s.engine === 'thorough' && s.preset !== 'copy'
 const thoroughCodec = (s: Settings): 'avc' | 'av1' => (s.codec === 'av1' ? 'av1' : 'avc')
 const thoroughFormat = (s: Settings): ThoroughFormat => (s.autoCodec ? 'auto' : thoroughCodec(s))
 const settingsKey = (s: Settings) =>
-  `${s.preset}|${usesX264(s) ? `wasm-${thoroughFormat(s)}` : s.codec}|${s.shortSide}|${s.keepAudio}|${s.sizeTarget}|${s.targetBytes ?? ''}`
+  `${s.preset}|${usesX264(s) ? `wasm-${thoroughFormat(s)}` : s.codec}|${s.shortSide}|${s.keepAudio}|${s.sizeTarget}|${s.targetBytes ?? ''}` +
+  (s.trim ? `|${s.trim.start}-${s.trim.end}` : '')
 const isAbort = (err: unknown) => err instanceof Error && (err.name === 'AbortError' || err.name === 'ConversionCanceledError')
 
 // The landing page is rendered to HTML at build time, where there is no window: render it as supported, and let the
@@ -225,6 +228,8 @@ export default function App() {
         ...s,
         codec: s.engine === 'thorough' || probe.encodable[s.codec] ? s.codec : firstEncodable(probe),
         shortSide: null,
+        // A part of the last video means nothing for this one.
+        trim: null,
         // A Fit under size carried over from a bigger file starts again from this one's.
         targetBytes: s.targetBytes && s.targetBytes >= probe.file.size ? defaultFit(probe.file.size) : s.targetBytes,
         // Where a video was recorded is kept only when asked, for that video.
@@ -286,8 +291,10 @@ export default function App() {
 
   const key = settingsKey(settings)
 
-  const ensureCalibration = (probe: Probe, chosen: Settings) => {
+  const ensureCalibration = (whole: Probe, chosen: Settings) => {
     const key = settingsKey(chosen)
+    // Everything planned here is for the part being compressed.
+    const probe = narrow(whole, chosen)
     const settings = forEngine(probe, chosen)
     const existing = calibrations.current.get(key)
     if (existing) return existing
@@ -395,6 +402,8 @@ export default function App() {
   useEffect(() => {
     if (headStart.current && headStart.current.key !== key) {
       headStart.current.job.cancel()
+      // Coming back to these settings (a part tried and undone) may start it again.
+      headStarted.current.delete(headStart.current.key)
       headStart.current = null
     }
     if (phase.kind !== 'ready' || !probe || !usesX264(settings) || !settled || headStarted.current.has(key)) return
@@ -406,8 +415,9 @@ export default function App() {
       const start = { crf: settled.crf, slope: settled.slope, points: settled.points,
         reuse: codec === 'avc' ? settled.reuse : undefined, fast: codec === 'avc' && settled.fast, long: settled.long }
       const spec: HeadStart = { key, codec, shortSide: settled.shortSide, progress: null, job: null as unknown as Job }
-      const sized = { ...forEngine(probe, settings), codec, shortSide: settled.shortSide ?? settings.shortSide }
-      spec.job = engine.encode(probe, sized, start, (p) => {
+      const part = narrow(probe, settings)
+      const sized = { ...forEngine(part, settings), codec, shortSide: settled.shortSide ?? settings.shortSide }
+      spec.job = engine.encode(part, sized, start, (p) => {
         spec.progress = p
         spec.watch?.(p)
       })
@@ -440,9 +450,11 @@ export default function App() {
       if (run.job) run.job.cancel()
       else setPhase({ kind: 'ready', probe })
     }
+    // The encoders get the part being compressed; the phases keep the whole video, to go back to.
+    const part = narrow(probe, settings)
     // With the size target, x264 starts from the size plan's rate factor and steers from there while it encodes.
     // Without it there is nothing to plan, and the browser's encoders need their tuned bitrate up front.
-    const engine = forEngine(probe, settings)
+    const engine = forEngine(part, settings)
     const planned = usesX264(settings) && engine.sizeTarget && !adopted
     const waitFor = !adopted && (!usesX264(settings) || planned) ? ensureCalibration(probe, settings) : null
     if (waitFor) waitFor.needed = true
@@ -490,30 +502,30 @@ export default function App() {
         // Auto without a size target has nothing to compare, and only an HDR video it keeps in 10 bits goes to AV1.
         codec = settings.autoCodec ? plan?.codec ?? (keepsHdr(probe) ? 'av1' : 'avc') : thoroughCodec(settings)
         shortSide = plan?.shortSide
-        run.job = x264Engine.encode(probe, { ...engine, codec, shortSide: shortSide ?? engine.shortSide },
+        run.job = x264Engine.encode(part, { ...engine, codec, shortSide: shortSide ?? engine.shortSide },
           { crf: plan?.crf, slope: plan?.slope, points: plan?.points, reuse: codec === 'avc' ? plan?.reuse : undefined,
             fast: codec === 'avc' && plan?.fast, long: plan?.long }, onProgress)
       } else {
         const { bitrate } = await ensureCalibration(probe, settings).promise
         if (run.canceled) return
-        run.job = (await media()).compress(probe, engine, bitrate, onProgress)
+        run.job = (await media()).compress(part, engine, bitrate, onProgress)
       }
       const { measureQuality } = await media()
       const { blob: made, scores } = await run.job.promise
       const blob = settings.keepPlace ? made : await dropPlace(made)
       const url = URL.createObjectURL(blob)
       const reason = calibrations.current.get(settingsKey(settings))?.result?.choice?.reason
-      const missed = engine.sizeTarget && settings.preset !== 'copy' && blob.size > targetBytes(probe, settings)
+      const missed = engine.sizeTarget && settings.preset !== 'copy' && blob.size > targetBytes(part, settings)
         ? { target: settings.targetBytes ?? null,
             lower: Math.min(probe.width, probe.height, shortSide ?? engine.shortSide ?? Infinity) > 360,
             noAv1: codec === 'avc' && reason === 'device',
             label: codec ? (codec === 'av1' ? 'AV1' : 'H.264') : `The browser’s ${CODEC_LABEL[engine.codec]} encoder` }
         : undefined
-      setPhase({ kind: 'done', probe, blob, url, quality: settings.preset === 'copy' ? 'failed' : 'pending', codec, missed,
-        shortSide })
+      setPhase({ kind: 'done', probe, part, blob, url, quality: settings.preset === 'copy' ? 'failed' : 'pending', codec,
+        missed, shortSide })
       if (settings.preset === 'copy') return
       // A resolution Pare chose itself is judged at the original's size.
-      const quality = await measureQuality(probe, blob, scores, 8, !!shortSide).catch((err) => {
+      const quality = await measureQuality(part, blob, scores, 8, !!shortSide).catch((err) => {
         console.warn(`[pare] quality check failed: ${message(err)}`)
         return 'failed' as const
       })
@@ -552,7 +564,8 @@ export default function App() {
   const announcement = phase.kind === 'running'
     ? 'Compressing.'
     : phase.kind === 'done'
-      ? `Done: ${fmt.bytes(phase.probe.file.size)} to ${fmt.bytes(phase.blob.size)}, ${fmt.change(phase.probe.file.size, phase.blob.size)}.`
+      ? `Done: ${fmt.bytes(phase.probe.file.size)} to ${fmt.bytes(phase.blob.size)}, ${fmt.change(phase.probe.file.size, phase.blob.size)}${
+        phase.part.trim ? `, for ${fmt.clock(phase.part.duration)} of ${fmt.duration(phase.probe.duration)}` : ''}.`
       : ''
 
   return (
@@ -617,6 +630,7 @@ export default function App() {
         ) : phase.kind === 'running' ? (
           <Running
             probe={phase.probe}
+            duration={narrow(phase.probe, settings).duration}
             progress={phase.progress}
             status={phase.status}
             target={settings.sizeTarget ? settings.targetBytes : null}
@@ -892,6 +906,9 @@ function Ready(props: {
   onReplace: () => void
 }) {
   const { probe, settings, setSettings, tuning } = props
+  // What's compressed: the whole video, or the part the Length choice keeps. Sizes compare with its bytes.
+  const part = useMemo(() => narrow(probe, settings), [probe, settings.trim])
+  const trimmed = !!part.trim
   const copy = settings.preset === 'copy'
   const short = Math.min(probe.width, probe.height)
   const target = outputSize(probe, settings.shortSide)
@@ -899,9 +916,18 @@ function Ready(props: {
   const sizeMode: SizeMode = !settings.sizeTarget ? 'any' : settings.targetBytes ? 'fit' : 'half'
   // A typed Fit under size the field rejects (empty, zero, not below the original) holds Compress back.
   const [fitProblem, setFitProblem] = useState<FitProblem>(null)
-  // So does a size that isn't below this file's.
+  // So does a size that isn't below this file's, or this part's.
   const fitBad = sizeMode === 'fit' && !copy &&
-    (!!fitProblem || (settings.targetBytes ?? defaultFit(probe.file.size)) >= probe.file.size)
+    (!!fitProblem || (settings.targetBytes ?? defaultFit(part.bytes)) >= part.bytes)
+  // And a part typed but not usable (Length).
+  const [trimProblem, setTrimProblem] = useState<string | null>(null)
+  const setTrim = (trim: Trim | null) => {
+    const next = narrow(probe, { ...settings, trim })
+    setFitProblem(null)
+    // A Fit under size no smaller than the new part starts again from the part's own.
+    setSettings((s) => ({ ...s, trim,
+      targetBytes: s.targetBytes && s.targetBytes >= next.bytes ? defaultFit(next.bytes) : s.targetBytes }))
+  }
   const result = tuning && 'result' in tuning && !fitBad ? tuning.result : null
 
   // A resolution Pare lowered to itself, for a size the source's can't reach, shows on the choice that asked for it.
@@ -921,7 +947,7 @@ function Ready(props: {
 
   const unavailable = (['avc', 'hevc', 'av1'] as const).filter((c) => !probe.encodable[c]).map((c) => CODEC_LABEL[c])
   // Over the size asked for (what "reached" means differs between the engines; the size doesn't).
-  const over = !!result && settings.sizeTarget && result.size > targetBytes(probe, settings)
+  const over = !!result && settings.sizeTarget && result.size > targetBytes(part, settings)
   // The size target in the estimate's words.
   const goal = settings.targetBytes ? `under ${fmt.bytes(settings.targetBytes)}` : 'in half the size'
   // A few frames encoded as the compression will encode them, on request, for a look before it runs.
@@ -959,9 +985,9 @@ function Ready(props: {
     setPreview({ key })
     try {
       const codec = settings.autoCodec ? result.codec ?? 'avc' : thoroughCodec(settings)
-      const sized = { ...forEngine(probe, settings), codec, shortSide: result.shortSide ?? settings.shortSide }
-      const clip = await (await x264()).preview(probe, sized, result.crf, codec === 'avc' && !!result.fast, controller.signal)
-      const frames = await (await media()).framePairs(probe, clip.blob, clip.times, clip.first)
+      const sized = { ...forEngine(part, settings), codec, shortSide: result.shortSide ?? settings.shortSide }
+      const clip = await (await x264()).preview(part, sized, result.crf, codec === 'avc' && !!result.fast, controller.signal)
+      const frames = await (await media()).framePairs(part, clip.blob, clip.times, clip.first)
       if (controller.signal.aborted) frames.forEach((f) => (f.original.close(), f.compressed.close()))
       else setPreview({ key, frames })
     } catch (err) {
@@ -980,7 +1006,7 @@ function Ready(props: {
   const audioNote = () => {
     const audio = probe.audio
     if (!audio) return 'This video has no audio.'
-    const plan = audioFor(probe, settings)
+    const plan = audioFor(part, settings)
     if (copy || !plan || plan.kind === 'copy') return undefined
     const name = audio.codec ? `${codecName(audio.codec)} audio` : 'this video’s audio'
     if (plan.kind === 'drop')
@@ -1023,7 +1049,7 @@ function Ready(props: {
     copy || !settings.shortSide ? (chosenSide && !copy ? `${chosenSide}p${over ? '' : ' to fit'}` : 'Original resolution')
       : `${settings.shortSide}p`,
     // Repackaging copies the audio whatever the plan says Pare's own encoders could do with it.
-    !probe.audio ? 'No audio' : settings.keepAudio && (copy || audioFor(probe, settings)?.kind !== 'drop') ? 'Audio kept' : 'Audio removed',
+    !probe.audio ? 'No audio' : settings.keepAudio && (copy || audioFor(part, settings)?.kind !== 'drop') ? 'Audio kept' : 'Audio removed',
     probe.origin.place && (settings.keepPlace ? 'Location kept' : 'Location removed'),
   ].filter(Boolean).join(' · ')
 
@@ -1032,7 +1058,7 @@ function Ready(props: {
       className="stack"
       onSubmit={(e) => {
         e.preventDefault()
-        if (fitBad) return
+        if (fitBad || trimProblem) return
         props.onStart()
       }}
     >
@@ -1054,21 +1080,29 @@ function Ready(props: {
           onChange={(v) => {
             // The field comes back at the size it starts from, which it accepts.
             setFitProblem(null)
-            setSettings((s) => ({ ...s, sizeTarget: v !== 'any', targetBytes: v === 'fit' ? defaultFit(probe.file.size) : null }))
+            setSettings((s) => ({ ...s, sizeTarget: v !== 'any', targetBytes: v === 'fit' ? defaultFit(part.bytes) : null }))
           }}
           hint={copy
             ? 'Unchanged.'
-            : sizeMode === 'fit' && usesX264(settings) && !settings.shortSide ? FIT_HINT_LOWERS : SIZE_HINT[sizeMode]}
+            : sizeMode === 'fit' && usesX264(settings) && !settings.shortSide
+              ? FIT_HINT_LOWERS
+              : trimmed ? SIZE_HINT[sizeMode].replace('halves the file', 'halves this part') : SIZE_HINT[sizeMode]}
         >
           {sizeMode === 'fit' && !copy && (
             <FitSize
-              bytes={settings.targetBytes ?? defaultFit(probe.file.size)}
-              limit={probe.file.size}
+              // Starts again from the size in the settings when the part changes.
+              key={trimmed ? `${part.trim!.start}-${part.trim!.end}` : 'whole'}
+              bytes={settings.targetBytes ?? defaultFit(part.bytes)}
+              limit={part.bytes}
+              limitLabel={trimmed ? 'this part of the original' : 'the original'}
               onChange={(targetBytes) => setSettings((s) => ({ ...s, targetBytes }))}
               onProblem={setFitProblem}
             />
           )}
         </Choice>
+        {probe.duration >= 2 * MIN_PART && probe.index.times.length > 1 && (
+          <Length probe={probe} trim={settings.trim ?? null} onChange={setTrim} onProblem={setTrimProblem} />
+        )}
         <details className="more" open={more} onToggle={(e) => setMore(e.currentTarget.open)}>
           <summary>
             <span className="more-label">More options</span>
@@ -1146,9 +1180,9 @@ function Ready(props: {
           </div>
         </details>
         {probe.hdr && !copy && <p className="note">{hdrNote()}</p>}
-        {settings.sizeTarget && !copy && !fitBad && !reachable(probe, settings) && (
+        {settings.sizeTarget && !copy && !fitBad && !reachable(part, settings) && (
           <p className="note">
-            The audio alone takes up most of {settings.targetBytes ? 'that size' : 'half this file'}, so no video size
+            The audio alone takes up most of {settings.targetBytes ? 'that size' : trimmed ? 'half this part' : 'half this file'}, so no video size
             gets under it. The video is compressed at the quality you chose instead.
           </p>
         )}
@@ -1174,7 +1208,7 @@ function Ready(props: {
               : 'A lower quality setting will make it smaller.'}
           </p>
         )}
-        {result?.crf && !settings.sizeTarget && result.size > probe.file.size * 0.95 && (
+        {result?.crf && !settings.sizeTarget && result.size > part.bytes * 0.95 && (
           <p className="note">
             This video is already compressed about as tightly as x264 manages at {presetLabel} quality. Compact or a
             smaller resolution will shrink it.
@@ -1205,7 +1239,7 @@ function Ready(props: {
           ) : result ? (
             <span className="estimate-value">
               ~{fmt.bytes(result.size)}
-              <span className={result.size >= probe.file.size ? 'delta bad' : over ? 'delta muted' : 'delta'}>
+              <span className={result.size >= part.bytes ? 'delta bad' : over ? 'delta muted' : 'delta'}>
                 {fmt.change(probe.file.size, result.size)}
               </span>
             </span>
@@ -1223,10 +1257,10 @@ function Ready(props: {
               ? `Trying ${tuning.side}p: ${outOfReach}`
               : result?.shortSide
               ? `${result.codec === 'av1' ? 'AV1' : result.codec === 'avc' ? 'H.264' : 'Encoding'}${result.reached === false
-                ? ` at ${result.shortSide}p: still over ${fmt.bytes(targetBytes(probe, settings))}`
+                ? ` at ${result.shortSide}p: still over ${fmt.bytes(targetBytes(part, settings))}`
                 : `, lowered to ${result.shortSide}p to fit`}`
               : result?.choice && result.choice.reason !== 'unlimited' && result.choice.reason !== 'fits'
-              ? result.choice.reason === 'device' && result.size > targetBytes(probe, settings)
+              ? result.choice.reason === 'device' && result.size > targetBytes(part, settings)
                 ? `H.264 can’t get this one ${settings.targetBytes ? `under ${fmt.bytes(settings.targetBytes)}` : 'to half the size'}, and this device can’t play AV1`
                 : choiceDetail(result.choice, settings.targetBytes)
               : !result && usesX264(settings) && settings.autoCodec && settings.sizeTarget && !(tuning && 'error' in tuning)
@@ -1253,7 +1287,7 @@ function Ready(props: {
           <span className="sr-only" aria-live="polite">
             {result
               ? `Estimated size about ${fmt.bytes(result.size)}, ${fmt.change(probe.file.size, result.size)}${over
-                ? `, still over ${fmt.bytes(targetBytes(probe, settings))}` : ''}.`
+                ? `, still over ${fmt.bytes(targetBytes(part, settings))}` : ''}.`
               : ''}
           </span>
           <span className="sr-only" aria-live="polite">
@@ -1269,7 +1303,7 @@ function Ready(props: {
           )}
         </div>
         <button type="submit" className="button primary" aria-describedby={fitBad ? 'estimate-detail' : undefined}
-                disabled={noEncoder || (!!tuning && 'error' in tuning && !usesX264(settings)) || fitBad}>
+                disabled={noEncoder || (!!tuning && 'error' in tuning && !usesX264(settings)) || fitBad || !!trimProblem}>
           {copy ? 'Repackage video' : 'Compress video'}
         </button>
       </div>
@@ -1288,6 +1322,8 @@ function Ready(props: {
 
 function Running(props: {
   probe: Probe
+  /** Seconds being compressed: the part's, when trimmed. */
+  duration: number
   progress: Progress | null
   status: string
   /** The size chosen with Fit under, for what a refit is for; half the original otherwise. */
@@ -1298,7 +1334,7 @@ function Running(props: {
   const fraction = progress?.fraction ?? 0
   const speed = progress && progress.elapsed > 0.5 ? progress.processed / progress.elapsed : null
   // Encoders start slower than they run, so wait for some progress before predicting the end.
-  const left = speed && fraction > 0.1 ? (probe.duration - (progress?.processed ?? 0)) / speed : Infinity
+  const left = speed && fraction > 0.1 ? (props.duration - (progress?.processed ?? 0)) / speed : Infinity
   const stage = !progress
     ? props.status
     : progress.stage === 'finishing'
@@ -1362,6 +1398,136 @@ function verdict(ssim: number) {
   return 'Visible loss'
 }
 
+/**
+ * Which part of the video to compress: all of it, or from one moment to another, typed or taken from the player. Times
+ * are shown from the video's start and snap to frames (snapTrim); a part is committed when a field is left or Enter is
+ * pressed, so the estimate plans once per change rather than per keystroke.
+ */
+function Length({ probe, trim, onChange, onProblem }: {
+  probe: Probe
+  trim: Trim | null
+  onChange: (trim: Trim | null) => void
+  /** Why the typed part can't be used, or null; Compress waits while there's a reason. */
+  onProblem: (problem: string | null) => void
+}) {
+  const [open, setOpen] = useState(!!trim)
+  const end = endOf(probe)
+  const shown = (t: number) => fmt.clock(t - probe.start, 2)
+  const [from, setFrom] = useState(() => shown(trim?.start ?? probe.start))
+  const [to, setTo] = useState(() => shown(trim?.end ?? end))
+  const [problem, setProblem] = useState<string | null>(null)
+  const url = useMemo(() => URL.createObjectURL(probe.file), [probe.file])
+  useEffect(() => () => URL.revokeObjectURL(url), [url])
+  // The browser may not play what it can decode frame by frame (HEVC in Firefox, some MOV): then only the fields.
+  const [playable, setPlayable] = useState(true)
+  const player = useRef<HTMLVideoElement>(null)
+  const fail = (why: string | null) => {
+    setProblem(why)
+    onProblem(why)
+  }
+  const commit = (fromText: string, toText: string) => {
+    // A time left as it's shown keeps the frame it stands for: a rounded time read back could land on the next one.
+    const a = trim && fromText === shown(trim.start) ? trim.start - probe.start : fmt.parseClock(fromText)
+    const b = trim && toText === shown(trim.end) ? trim.end - probe.start : fmt.parseClock(toText)
+    if (a === null || b === null) return fail('Enter times as seconds or minutes:seconds, like 12.5 or 1:05.')
+    const next = snapTrim(probe, probe.start + a, Math.min(probe.start + b, end))
+    const length = next ? next.end - next.start : probe.duration
+    if (b <= a || length < MIN_PART) return fail(`The part has to be at least ${MIN_PART} second long, and end after it starts.`)
+    fail(null)
+    setFrom(shown(next?.start ?? probe.start))
+    setTo(shown(next?.end ?? end))
+    onChange(next)
+    if (player.current && next) player.current.currentTime = next.start - probe.start
+  }
+  const here = (which: 'from' | 'to') => {
+    // The frame on screen is kept either way: an end half a frame on takes it in.
+    const now = (player.current?.currentTime ?? 0) + (which === 'to' ? 0.5 / (probe.fps || 30) : 0)
+    const at = fmt.clock(now, 2)
+    if (which === 'from') {
+      setFrom(at)
+      commit(at, to)
+    } else {
+      setTo(at)
+      commit(from, at)
+    }
+  }
+  const field = (label: string, value: string, set: (v: string) => void, which: 'from' | 'to') => (
+    <div className="trim-field">
+      <label>
+        <span>{label}</span>
+        <input
+          type="text"
+          inputMode="decimal"
+          value={value}
+          aria-invalid={!!problem}
+          aria-describedby={problem ? 'trim-problem' : undefined}
+          onChange={(e) => set(e.target.value)}
+          onBlur={() => commit(from, to)}
+          onKeyDown={(e) => {
+            if (e.key !== 'Enter') return
+            // Enter commits the part here rather than submitting the form.
+            e.preventDefault()
+            commit(from, to)
+          }}
+        />
+      </label>
+      {playable && (
+        <button type="button" className="fit-preset" onClick={() => here(which)}>
+          {which === 'from' ? 'Start here' : 'End here'}
+        </button>
+      )}
+    </div>
+  )
+  const length = trim ? trim.end - trim.start : probe.duration
+  return (
+    <Choice
+      legend="Length"
+      value={open ? 'part' : 'whole'}
+      options={[
+        { value: 'whole', label: 'Whole video' },
+        { value: 'part', label: 'Part of it' },
+      ]}
+      onChange={(v) => {
+        setOpen(v === 'part')
+        if (v === 'whole') {
+          fail(null)
+          setFrom(shown(probe.start))
+          setTo(shown(end))
+          onChange(null)
+        }
+      }}
+      hint={!open
+        ? `All ${fmt.duration(probe.duration)} of it.`
+        : trim
+          ? `${fmt.clock(length)} of ${fmt.duration(probe.duration)}. The estimate and the size are for this part.`
+          : 'Type where the part starts and ends, or play the video and use Start here and End here.'}
+    >
+      {open && (
+        <div className="trim">
+          {playable && (
+            <video
+              ref={player}
+              className="trim-player"
+              src={url}
+              controls
+              playsInline
+              preload="metadata"
+              onError={() => setPlayable(false)}
+            />
+          )}
+          <div className="trim-fields">
+            {field('From', from, setFrom, 'from')}
+            {field('To', to, setTo, 'to')}
+          </div>
+          <div id="trim-problem" className="fit-problem" aria-live="polite">
+            {problem && <p className="error">{problem}</p>}
+          </div>
+        </div>
+      )}
+    </Choice>
+  )
+}
+
 /** What's wrong with a typed Fit under size, if anything: nothing typed, not above 0, or not below the original. */
 type FitProblem = 'empty' | 'zero' | 'over' | null
 
@@ -1371,9 +1537,11 @@ const fitProblem = (text: string, limit: number): FitProblem => {
 }
 
 /** The size for "Fit under": typed in megabytes, or one of the common limits smaller than the file. */
-function FitSize({ bytes, limit, onChange, onProblem }: {
+function FitSize({ bytes, limit, limitLabel, onChange, onProblem }: {
   bytes: number
   limit: number
+  /** What `limit` is the size of. */
+  limitLabel: string
   onChange: (bytes: number) => void
   /** What's wrong with the typed size; Compress waits while something is. */
   onProblem: (problem: FitProblem) => void
@@ -1388,7 +1556,7 @@ function FitSize({ bytes, limit, onChange, onProblem }: {
     ? 'Enter a size in megabytes.'
     : problem === 'zero'
       ? 'Enter a size above 0 MB.'
-      : problem === 'over' ? `That’s no smaller than the original (${fmt.bytes(limit)}).` : null
+      : problem === 'over' ? `That’s no smaller than ${limitLabel} (${fmt.bytes(limit)}).` : null
   const [said, setSaid] = useState(message)
   useEffect(() => {
     if (!message) {
@@ -1442,12 +1610,14 @@ function Done(props: {
   onAdjust: () => void
   onNew: () => void
 }) {
-  const { probe, blob, url, quality } = props.phase
+  const { probe, part, blob, url, quality } = props.phase
   const before = probe.file.size
   const after = blob.size
-  const smaller = after < before
+  // Against what was compressed: a part of a video is judged by its share of the file. A repackaged copy isn't judged:
+  // it's the same frames, and a part of one starts at the keyframe before the part.
+  const smaller = props.copy || after < part.bytes
   const ext = blob.type.includes('matroska') ? 'mkv' : blob.type.includes('quicktime') ? 'mov' : 'mp4'
-  const name = `${probe.file.name.replace(/\.[^.]+$/, '')} (compressed).${ext}`
+  const name = `${probe.file.name.replace(/\.[^.]+$/, '')} (compressed${part.trim ? ' part' : ''}).${ext}`
   // Phones and most desktop browsers can hand the file straight to another app: a chat, mail, or the photo library.
   const file = useMemo(() => new File([blob], name, { type: blob.type }), [blob, name])
   const shareable = typeof navigator !== 'undefined' && !!navigator.canShare?.({ files: [file] })
@@ -1474,7 +1644,10 @@ function Done(props: {
     <section className="stack">
       <div className="panel result">
         <h1 className="result-kicker" tabIndex={-1}>
-          {damaged ? 'The copy came out damaged' : smaller ? 'Done' : 'Done, but the original is smaller'}
+          {damaged
+            ? 'The copy came out damaged'
+            : smaller ? 'Done' : part.trim ? 'Done, but this part is smaller in the original' : 'Done, but the original is smaller'}
+          {part.trim && ` · ${fmt.clock(part.trim.start - probe.start)} to ${fmt.clock(part.trim.end - probe.start)}`}
           {props.phase.codec && ` · ${props.phase.codec === 'av1' ? 'AV1' : 'H.264'}`}
           {props.phase.shortSide && ` · ${props.phase.shortSide}p${missed ? '' : ' to fit'}`}
         </h1>
@@ -1518,7 +1691,11 @@ function Done(props: {
           </p>
         )}
         {!smaller && !damaged && (
-          <p className="note">This video was already efficiently compressed. Keep the original, or try a lower quality.</p>
+          <p className="note">
+            {part.trim
+              ? 'This part was already efficiently compressed. Try a lower quality.'
+              : 'This video was already efficiently compressed. Keep the original, or try a lower quality.'}
+          </p>
         )}
         {smaller && missed && !damaged && (
           <p className="note">

@@ -22,10 +22,36 @@ export type Settings = {
   targetBytes?: number | null
   /** Keep where the video was recorded, when its file says. The recording date is kept either way. */
   keepPlace?: boolean
+  /** Only this part of the video, or null for all of it. */
+  trim?: Trim | null
+}
+
+/**
+ * A part of the video, in the source's own seconds (the clock of Probe.start and the frames' timestamps): from the
+ * first frame kept to where the part ends, the timestamp of the first frame left out or the end of the video.
+ */
+export type Trim = { start: number; end: number }
+
+/** Every video frame's timestamp, in order, with its size and whether it's a keyframe, from the container's index. */
+export type FrameIndex = {
+  times: Float64Array
+  bytes: Float64Array
+  /** Indexes into `times` of the keyframes. */
+  keys: number[]
+  /** All the frames' bytes. */
+  total: number
 }
 
 export type Probe = {
   file: File
+  /**
+   * The source bytes being compressed: the file's size, or the share of it a trimmed part stands for (its video
+   * frames, its length of audio, and the container in proportion). Half the size means half of this.
+   */
+  bytes: number
+  /** The part being compressed (narrow), or null for the whole video. `start` and `duration` describe the part. */
+  trim: Trim | null
+  index: FrameIndex
   container: string
   duration: number
   firstTimestamp: number
@@ -85,8 +111,8 @@ export const SIZE_AIM = 0.47
 /** The least the video may be given, as a share of the target, however much the audio takes. */
 export const VIDEO_FLOOR = 0.1
 
-/** The most the file may weigh: the size chosen, or half the original. */
-export const targetBytes = (probe: Probe, settings: Settings) => settings.targetBytes ?? probe.file.size * SIZE_TARGET
+/** The most the file may weigh: the size chosen, or half the original (of the part, for a trimmed one). */
+export const targetBytes = (probe: Probe, settings: Settings) => settings.targetBytes ?? probe.bytes * SIZE_TARGET
 
 /** What the first pass aims at: 6% under the target, as 47% is under half. */
 export const aimBytes = (probe: Probe, settings: Settings) => targetBytes(probe, settings) * (SIZE_AIM / SIZE_TARGET)
@@ -222,4 +248,66 @@ function decodesAv1(tenBit: boolean) {
       resolve(false)
     }
   }))
+}
+
+/** The first index in sorted `times` at or after `t`, allowing for float rounding. */
+function firstAtOrAfter(times: Float64Array, t: number) {
+  let lo = 0, hi = times.length
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1
+    if (times[mid] < t - 1e-6) lo = mid + 1
+    else hi = mid
+  }
+  return lo
+}
+
+/** Frames of the index in a part: from `first` up to, not including, `last`. */
+export function framesIn(index: FrameIndex, trim: Trim) {
+  return { first: firstAtOrAfter(index.times, trim.start), last: firstAtOrAfter(index.times, trim.end) }
+}
+
+/** Where the video ends: the last track's end, in the source's seconds. */
+export const endOf = (probe: Probe) => probe.start + probe.duration
+
+/** The shortest part Pare compresses, in seconds. */
+export const MIN_PART = 1
+
+/**
+ * A part from `from` to `to` (seconds on the source's clock) snapped to frames: it starts with the frame shown at
+ * `from` and ends where the first frame at or after `to` starts, or where the video does. A part's own end snaps to
+ * itself. Null for the whole video. Whether the part is long enough is the caller's to check (MIN_PART).
+ */
+export function snapTrim(probe: Probe, from: number, to: number): Trim | null {
+  const { times } = probe.index
+  if (!times.length) return null
+  const first = Math.max(0, firstAtOrAfter(times, from + 2e-6) - 1)
+  const after = firstAtOrAfter(times, to)
+  if (first === 0 && after >= times.length) return null
+  return { start: times[first], end: after < times.length ? times[after] : endOf(probe) }
+}
+
+/**
+ * The probe for the part of the video these settings compress: its start, length, bitrate and bytes. The same probe
+ * when the whole video is compressed, so nothing changes there.
+ */
+export function narrow(probe: Probe, settings: Settings): Probe {
+  const trim = settings.trim
+  if (!trim || probe.trim) return probe
+  const { index } = probe
+  const { first, last } = framesIn(index, trim)
+  let video = 0
+  for (let i = first; i < last; i++) video += index.bytes[i]
+  const duration = Math.min(trim.end, endOf(probe)) - trim.start
+  const audioRate = probe.audio?.bitrate ?? 0
+  const whole = index.total + (audioRate * probe.duration) / 8
+  const part = video + (audioRate * duration) / 8
+  return {
+    ...probe,
+    trim,
+    start: trim.start,
+    duration,
+    firstTimestamp: index.times[first] ?? trim.start,
+    videoBitrate: duration > 0 ? (video * 8) / duration : 0,
+    bytes: whole > 0 ? (probe.file.size * part) / whole : (probe.file.size * duration) / probe.duration,
+  }
 }
