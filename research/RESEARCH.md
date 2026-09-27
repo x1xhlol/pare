@@ -1143,9 +1143,24 @@ judged at its own size, where the 480p copy measured SSIM 0.956, "Excellent", wh
 original; a resolution Pare picked itself is now compared at the original's size. The 20-second clip now comes out at
 1.46 MB (480p, VMAF NEG 37.5: that's what 1.5 MB buys) in 92 s.
 
-The plan's windows still come in low this far out (Big Buck Bunny planned 0.94 MB at CRF 59.4 and encoded 1.27), so
-these encodes usually take a refit. Preset 10's windows are only 1-6% smaller than preset 8's, so that isn't it; the
-refit, not the plan, lands them.
+At these rates chunk keyframes are a large part of the file, and past 55 they can't get coarser (the keyframe offset
+is already at the top of the quantizer range). `research/av1_tail_chunks.py`, native, VMAF NEG at the same size:
+
+| Clip, budget | One encode | 3 chunks | 8 chunks |
+| --- | --- | --- | --- |
+| Big Buck Bunny, 0.95 MB | 83.0 | 79.9 | 73.2 |
+| town, 0.33 MB | 76.9 | 73.9 | 66.7 |
+
+So when the plan lands past 55, AV1 encodes in chunks of at least 100 frames, even though that leaves cores idle on
+a short video. Long videos have chunks that long anyway. In the app, Big Buck Bunny under 1 MB went from 70.8 to 76.7
+(3 encoders, 0.80 MB, 105 s against 100 s), and town under 0.35 MB to 68.4 (at 720p, 0.25 MB, 80 s).
+
+The plan's windows come in low this far out: Big Buck Bunny planned 0.94 MB at CRF 59.4 and 8 chunks made 1.27 MB.
+Preset 10's windows are only 1-6% smaller than preset 8's, so that isn't it. Counting the long layout's fewer
+keyframes in the plan made it worse (0.94 MB planned at CRF 54.9, 1.56 MB made by 4 chunks, three refits on three
+encoders, 299 s), so the plan keeps counting keyframes for the usual layout, which with long chunks lands close or a
+little under. Both clips came out at 71-80% of the budget, above the 75% of the goal that triggers another pass
+downward; using the rest would cost a refit.
 
 ## Screen recordings in AV1
 

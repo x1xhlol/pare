@@ -254,6 +254,8 @@ export type Calibration = {
   /** x264 only: plan test windows the encode can keep, and whether it runs at the superfast preset. */
   reuse?: import('./x264').Reusable[]
   fast?: boolean
+  /** AV1 in fewer, longer chunks (SizePlan.long). */
+  long?: boolean
   /** Auto: the encoder the in-browser test picked, why, and each one's predicted VMAF NEG at the target size. */
   codec?: 'avc' | 'av1'
   /** The short side chosen because the size target is out of reach at the source's resolution (fitSide). */

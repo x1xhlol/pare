@@ -304,6 +304,16 @@ export type Layout = {
  * against 31.9 s).
  */
 const MIN_CHUNK_FRAMES = 60
+/**
+ * Past AV1's `max` (a size chosen with Fit under), chunk keyframes take a large share of a small budget, and they
+ * can't get any coarser. At the same size, native SVT-AV1 (VMAF NEG): Big Buck Bunny under 0.95 MB, one encode 83.0,
+ * 3 chunks 79.9, 8 chunks 73.2; town under 0.33 MB, 76.9, 73.9, 66.7. So there chunks are at least this long, even
+ * if that leaves cores idle on a short video.
+ */
+const TAIL_CHUNK_FRAMES = 100
+/** Encoders for AV1's long chunks: as many as leave each at least TAIL_CHUNK_FRAMES. */
+const longEncoders = (frames: number, encoders: number) =>
+  Math.max(1, Math.min(encoders, Math.floor(frames / TAIL_CHUNK_FRAMES)))
 
 /** The encoders and threads for the whole encode; for x264, fewer and longer chunks when `frames` is short. */
 export function workerCount(probe: Probe, settings: Settings, frames?: number): Layout {
@@ -978,6 +988,8 @@ export type EncodeStart = {
   reuse?: Reusable[]
   /** Encode at x264's superfast preset (the plan found room to spare). */
   fast?: boolean
+  /** AV1 in fewer, longer chunks (SizePlan.long). */
+  long?: boolean
 }
 
 /** A finished stretch of the video: one of the plan's test windows. */
@@ -1008,7 +1020,9 @@ export function encode(probe: Probe, settings: Settings, start: EncodeStart, onP
         audioPackets(probe.file)])
       const options = start.fast && profile === X264 ? fastest(tuned) : tuned
       const { times } = line
-      const { encoders, threads } = workerCount(probe, settings, times.length)
+      const layout = workerCount(probe, settings, times.length)
+      const { threads } = layout
+      const encoders = profile === AV1 && start.long ? longEncoders(times.length, layout.encoders) : layout.encoders
       // The plan's test windows are finished chunks when they were encoded with exactly these settings: x264 at the
       // rate factor this encode starts from.
       const reuse = profile === X264 && start.reuse?.length && crf === floor ? start.reuse : []
@@ -1332,6 +1346,8 @@ export type SizePlan = {
    * the same from only the windows AV1's test uses.
    */
   points?: { crf: number; bytes: number; vmaf?: number; subset?: { bytes: number; vmaf?: number } }[]
+  /** AV1 past its `max`: the encode makes fewer, longer chunks (TAIL_CHUNK_FRAMES). */
+  long?: boolean
   /** The size target binds: the lower test didn't fit, so the rate factor was raised to make it fit. */
   bound?: boolean
   /** Resolves once every point's VMAF NEG is in, when the plan measured quality. */
@@ -1360,7 +1376,18 @@ type PlanPoint = NonNullable<SizePlan['points']>[number]
  * The rate factor that meets the size target, from the predicted sizes at the plan's two test rate factors (the
  * preset's or the quality ceiling, and a higher one).
  */
+/**
+ * Past AV1's max the encode makes fewer, longer chunks. The sizes still count keyframes for the usual layout: this far
+ * out the test windows come in low against real chunks (Big Buck Bunny under 1 MB planned 0.94 MB at CRF 59.4, and 8
+ * chunks made 1.27), and counting the long layout's fewer keyframes made that worse (0.94 planned at 54.9, and 4
+ * chunks made 1.56, which took three refits on three encoders: 299 s against 105).
+ */
 function fit(probe: Probe, settings: Settings, points: PlanPoint[]): SizePlan {
+  const plan = fitAt(probe, settings, points)
+  return profileFor(settings) === AV1 && plan.bound && plan.crf > AV1.max ? { ...plan, long: true } : plan
+}
+
+function fitAt(probe: Probe, settings: Settings, points: PlanPoint[]): SizePlan {
   const profile = profileFor(settings)
   const baseCrf = presetCrf(settings)
   const audio = audioBytes(probe, settings)

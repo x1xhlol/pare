@@ -272,8 +272,8 @@ export default function App() {
     const onRound = (round: number) => {
       if (currentKey.current === key) setTuning({ key, round })
     }
-    const fromPlan = ({ size, crf, raised, fitted, slope, points, reuse, fast }: SizePlan): Calibration =>
-      ({ bitrate: 0, size, ssim: 0, target: 0, reached: true, crf, raised, fitted, slope, points, reuse, fast })
+    const fromPlan = ({ size, crf, raised, fitted, slope, points, reuse, fast, long }: SizePlan): Calibration =>
+      ({ bitrate: 0, size, ssim: 0, target: 0, reached: true, crf, raised, fitted, slope, points, reuse, fast, long })
     // A size target out of reach at the source's resolution even at the highest rate factor plans again smaller, down
     // to 360p, rather than encode a file that misses it. Only from Original: a resolution picked by hand stays.
     const shrink = async <T,>(m: X264Module, result: T, of: (r: T) => [SizePlan, 'avc' | 'av1'],
@@ -379,7 +379,7 @@ export default function App() {
       if (dropped) return
       const codec = settings.autoCodec ? settled.codec ?? 'avc' : thoroughCodec(settings)
       const start = { crf: settled.crf, slope: settled.slope, points: settled.points,
-        reuse: codec === 'avc' ? settled.reuse : undefined, fast: codec === 'avc' && settled.fast }
+        reuse: codec === 'avc' ? settled.reuse : undefined, fast: codec === 'avc' && settled.fast, long: settled.long }
       const spec: HeadStart = { key, codec, shortSide: settled.shortSide, progress: null, job: null as unknown as Job }
       const sized = { ...forEngine(probe, settings), codec, shortSide: settled.shortSide ?? settings.shortSide }
       spec.job = engine.encode(probe, sized, start, (p) => {
@@ -465,7 +465,7 @@ export default function App() {
         shortSide = plan?.shortSide
         run.job = x264Engine.encode(probe, { ...engine, codec, shortSide: shortSide ?? engine.shortSide },
           { crf: plan?.crf, slope: plan?.slope, points: plan?.points, reuse: codec === 'avc' ? plan?.reuse : undefined,
-            fast: codec === 'avc' && plan?.fast }, onProgress)
+            fast: codec === 'avc' && plan?.fast, long: plan?.long }, onProgress)
       } else {
         const { bitrate } = await ensureCalibration(probe, settings).promise
         if (run.canceled) return

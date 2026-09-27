@@ -80,8 +80,9 @@ What Pare does instead:
   Installed on Android, it takes videos shared from the gallery; installed on the desktop, it opens video files. The
   result can go straight to another app with the Share button, where the browser supports it.
 - **Sizes out of reach.** Under a size chosen with Fit under, AV1 goes to its highest rate factor (63) before anything
-  else: measured against the 1080p original, the source's resolution beat every lower one at the same size (Big Buck
-  Bunny under 1 MB: 70.8 VMAF NEG at 1080p, 57.5 at 480p). Only a size out of reach even there makes Pare plan again
+  else: measured against the 1080p original, the source's resolution beat every lower one at the same size. There
+  its chunks are at least 100 frames long, since each chunk's keyframe is a big share of a small budget. Big Buck Bunny
+  under 1 MB went from 57.5 VMAF NEG (480p) to 76.7 (1080p). Only a size out of reach even at 63 makes Pare plan again
   at the largest of 1080p, 720p, 480p and 360p that should fit, rather than encode a file that misses: 20 seconds of
   1080p50 under 1.5 MB used to come out at 8.66 MB, and now does at 1.46.
 
