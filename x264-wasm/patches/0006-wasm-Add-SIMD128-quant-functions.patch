@@ -1,4 +1,4 @@
-From e6f174b1a0bf022989c3614088d42202dfcaf8bb Mon Sep 17 00:00:00 2001
+From 1f323f68f5c49d4cb971dcaa8f30a68d66c11e77 Mon Sep 17 00:00:00 2001
 From: x1xhlol <lucknitelol@proton.me>
 Date: Sat, 26 Sep 2026 21:25:44 +0000
 Subject: [PATCH 6/7] wasm: Add SIMD128 quant functions
@@ -18,7 +18,7 @@ for all inputs, not only the ranges an encode produces.
  create mode 100644 common/wasm/quant.h
 
 diff --git a/Makefile b/Makefile
-index 1dcfbc4f..4c2fea89 100644
+index 5a145e73..2b3c5ff0 100644
 --- a/Makefile
 +++ b/Makefile
 @@ -257,7 +257,8 @@ ifeq ($(SYS_ARCH),WASM)
@@ -59,7 +59,7 @@ index 21bb2955..7903284d 100644
      pf->coeff_last[DCT_CHROMAU_4x4] = pf->coeff_last[DCT_CHROMAV_4x4] = pf->coeff_last[DCT_LUMA_4x4];
 diff --git a/common/wasm/quant.c b/common/wasm/quant.c
 new file mode 100644
-index 00000000..865780aa
+index 00000000..7b9b28ff
 --- /dev/null
 +++ b/common/wasm/quant.c
 @@ -0,0 +1,101 @@
@@ -68,7 +68,7 @@ index 00000000..865780aa
 + *****************************************************************************
 + * Copyright (C) 2026 x264 project
 + *
-+ * Authors: x1xhlol
++ * Authors: x1xhlol <lucknitelol@proton.me>
 + *
 + * This program is free software; you can redistribute it and/or modify
 + * it under the terms of the GNU General Public License as published by
@@ -166,7 +166,7 @@ index 00000000..865780aa
 +}
 diff --git a/common/wasm/quant.h b/common/wasm/quant.h
 new file mode 100644
-index 00000000..e05d38f1
+index 00000000..43310d7a
 --- /dev/null
 +++ b/common/wasm/quant.h
 @@ -0,0 +1,32 @@
@@ -175,7 +175,7 @@ index 00000000..e05d38f1
 + *****************************************************************************
 + * Copyright (C) 2026 x264 project
 + *
-+ * Authors: x1xhlol
++ * Authors: x1xhlol <lucknitelol@proton.me>
 + *
 + * This program is free software; you can redistribute it and/or modify
 + * it under the terms of the GNU General Public License as published by

@@ -1,4 +1,4 @@
-From 6a5669b5c668f7522864b55880651507f87051d4 Mon Sep 17 00:00:00 2001
+From e2bb952070968d0189784080f96a253b8d0e62fe Mon Sep 17 00:00:00 2001
 From: x1xhlol <lucknitelol@proton.me>
 Date: Sat, 26 Sep 2026 21:25:04 +0000
 Subject: [PATCH 5/7] wasm: Add SIMD128 DCT functions
@@ -20,7 +20,7 @@ vector.
  create mode 100644 common/wasm/dct.h
 
 diff --git a/Makefile b/Makefile
-index fd64cf8f..1dcfbc4f 100644
+index 5e581480..5a145e73 100644
 --- a/Makefile
 +++ b/Makefile
 @@ -255,7 +255,8 @@ endif
@@ -61,7 +61,7 @@ index b208e26e..2f561f41 100644
  
 diff --git a/common/wasm/dct.c b/common/wasm/dct.c
 new file mode 100644
-index 00000000..8146bdea
+index 00000000..62b9663a
 --- /dev/null
 +++ b/common/wasm/dct.c
 @@ -0,0 +1,277 @@
@@ -70,7 +70,7 @@ index 00000000..8146bdea
 + *****************************************************************************
 + * Copyright (C) 2026 x264 project
 + *
-+ * Authors: x1xhlol
++ * Authors: x1xhlol <lucknitelol@proton.me>
 + *
 + * This program is free software; you can redistribute it and/or modify
 + * it under the terms of the GNU General Public License as published by
@@ -344,7 +344,7 @@ index 00000000..8146bdea
 +}
 diff --git a/common/wasm/dct.h b/common/wasm/dct.h
 new file mode 100644
-index 00000000..575e7a2e
+index 00000000..d26c278c
 --- /dev/null
 +++ b/common/wasm/dct.h
 @@ -0,0 +1,32 @@
@@ -353,7 +353,7 @@ index 00000000..575e7a2e
 + *****************************************************************************
 + * Copyright (C) 2026 x264 project
 + *
-+ * Authors: x1xhlol
++ * Authors: x1xhlol <lucknitelol@proton.me>
 + *
 + * This program is free software; you can redistribute it and/or modify
 + * it under the terms of the GNU General Public License as published by
@@ -381,7 +381,7 @@ index 00000000..575e7a2e
 +
 +#endif
 diff --git a/common/wasm/wasmcommon.h b/common/wasm/wasmcommon.h
-index 016fdd04..6b415108 100644
+index 32709ee7..ad079ec9 100644
 --- a/common/wasm/wasmcommon.h
 +++ b/common/wasm/wasmcommon.h
 @@ -34,4 +34,27 @@ static ALWAYS_INLINE v128_t absdiff_u8x16( v128_t a, v128_t b )

@@ -1,4 +1,4 @@
-From b5c5b6dcdcede09a984c5b4afd65c33a619f88a0 Mon Sep 17 00:00:00 2001
+From bd9d6cbd3358aa5b14006f116fde4d962d3e05f0 Mon Sep 17 00:00:00 2001
 From: x1xhlol <lucknitelol@proton.me>
 Date: Sat, 26 Sep 2026 21:23:22 +0000
 Subject: [PATCH 4/7] wasm: Add SIMD128 motion compensation functions
@@ -20,7 +20,7 @@ offset is added, which keeps the result identical to the C version.
  create mode 100644 common/wasm/mc.h
 
 diff --git a/Makefile b/Makefile
-index 3fae3c56..fd64cf8f 100644
+index aaf49f2b..5e581480 100644
 --- a/Makefile
 +++ b/Makefile
 @@ -255,7 +255,8 @@ endif
@@ -60,7 +60,7 @@ index ae81ce4b..ba559e0f 100644
      {
 diff --git a/common/wasm/mc.c b/common/wasm/mc.c
 new file mode 100644
-index 00000000..7383a49f
+index 00000000..fef9f3c4
 --- /dev/null
 +++ b/common/wasm/mc.c
 @@ -0,0 +1,638 @@
@@ -69,7 +69,7 @@ index 00000000..7383a49f
 + *****************************************************************************
 + * Copyright (C) 2026 x264 project
 + *
-+ * Authors: x1xhlol
++ * Authors: x1xhlol <lucknitelol@proton.me>
 + *
 + * This program is free software; you can redistribute it and/or modify
 + * it under the terms of the GNU General Public License as published by
@@ -704,7 +704,7 @@ index 00000000..7383a49f
 +}
 diff --git a/common/wasm/mc.h b/common/wasm/mc.h
 new file mode 100644
-index 00000000..2ad0bfba
+index 00000000..508fdb8b
 --- /dev/null
 +++ b/common/wasm/mc.h
 @@ -0,0 +1,32 @@
@@ -713,7 +713,7 @@ index 00000000..2ad0bfba
 + *****************************************************************************
 + * Copyright (C) 2026 x264 project
 + *
-+ * Authors: x1xhlol
++ * Authors: x1xhlol <lucknitelol@proton.me>
 + *
 + * This program is free software; you can redistribute it and/or modify
 + * it under the terms of the GNU General Public License as published by

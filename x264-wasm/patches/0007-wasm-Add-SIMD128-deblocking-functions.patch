@@ -1,4 +1,4 @@
-From fd279d0e9b70973269241f70bb89845ee8e46160 Mon Sep 17 00:00:00 2001
+From da288900c1e615b92be301ad6a4354a8191fbbbb Mon Sep 17 00:00:00 2001
 From: x1xhlol <lucknitelol@proton.me>
 Date: Sat, 26 Sep 2026 21:27:11 +0000
 Subject: [PATCH 7/7] wasm: Add SIMD128 deblocking functions
@@ -19,7 +19,7 @@ the other architectures.
  create mode 100644 common/wasm/deblock.h
 
 diff --git a/Makefile b/Makefile
-index 4c2fea89..b3d89154 100644
+index 2b3c5ff0..3bef6efb 100644
 --- a/Makefile
 +++ b/Makefile
 @@ -256,6 +256,7 @@ endif
@@ -58,7 +58,7 @@ index acd94590..0d201dc3 100644
      /* These functions are equivalent, so don't duplicate them. */
 diff --git a/common/wasm/deblock.c b/common/wasm/deblock.c
 new file mode 100644
-index 00000000..b58ee3d4
+index 00000000..7344348a
 --- /dev/null
 +++ b/common/wasm/deblock.c
 @@ -0,0 +1,203 @@
@@ -67,7 +67,7 @@ index 00000000..b58ee3d4
 + *****************************************************************************
 + * Copyright (C) 2026 x264 project
 + *
-+ * Authors: x1xhlol
++ * Authors: x1xhlol <lucknitelol@proton.me>
 + *
 + * This program is free software; you can redistribute it and/or modify
 + * it under the terms of the GNU General Public License as published by
@@ -267,7 +267,7 @@ index 00000000..b58ee3d4
 +}
 diff --git a/common/wasm/deblock.h b/common/wasm/deblock.h
 new file mode 100644
-index 00000000..ff9bc811
+index 00000000..86ea9ea0
 --- /dev/null
 +++ b/common/wasm/deblock.h
 @@ -0,0 +1,32 @@
@@ -276,7 +276,7 @@ index 00000000..ff9bc811
 + *****************************************************************************
 + * Copyright (C) 2026 x264 project
 + *
-+ * Authors: x1xhlol
++ * Authors: x1xhlol <lucknitelol@proton.me>
 + *
 + * This program is free software; you can redistribute it and/or modify
 + * it under the terms of the GNU General Public License as published by
