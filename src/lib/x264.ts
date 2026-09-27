@@ -343,6 +343,9 @@ async function openTrack(file: Blob) {
   return { input, track }
 }
 
+/** Seconds since the page loaded, for the log: phases can be lined up across plan, test and encode. */
+const at = () => `@${(performance.now() / 1000).toFixed(1)} s`
+
 type Timeline = {
   /** Presentation timestamps of every video frame being encoded, in order. */
   times: number[]
@@ -1140,6 +1143,7 @@ export function encode(probe: Probe, settings: Settings, start: EncodeStart, onP
       const init = { file: probe.file, options, width: size.width, height: size.height, fpsNum: Math.round(fps * 1000), fpsDen: 1000,
         direct: copiesFrames(probe) }
       pool = await createPool(profile, active, threads, init)
+      console.info(`[pare] encode ${at()}: ${active} ${profile === AV1 ? 'SVT-AV1' : 'x264'} workers ready, ${chunks.length} chunks`)
       let poolThreads = pool.threads
       if (canceled) throw new Canceled()
       const goal = videoGoal(probe, settings)
@@ -1237,6 +1241,12 @@ export function encode(probe: Probe, settings: Settings, start: EncodeStart, onP
       // UNDER_GOAL: at 78% of it, tree's AV1 encode went again for +0.5 VMAF NEG in 40% more time. Either way the
       // second pass aims just under the limit rather than back at the first pass's aim.
       let total = encoded.reduce((t, c) => t + chunkBytes(c), 0)
+      // How the first pass compares with the plan's estimate at its rate factor: what the estimates' calibration answers to.
+      if (start.points?.length && crfs.length) {
+        const mean = encoded.reduce((t, c) => t + crfs[c.index] * chunkBytes(c), 0) / Math.max(1, total)
+        console.info(`[pare] first pass ${at()}: ${(total / 1e6).toFixed(3)} MB at crf ${mean.toFixed(2)}, plan said ` +
+          `${(bytesAt(start.points, mean, profile) / 1e6).toFixed(3)} MB; goal ${(goal / 1e6).toFixed(3)} MB`)
+      }
       /**
        * The whole video's size at each mean rate factor encoded so far. Once there's one on the side a refit is
        * heading, the slope to it beats the plan's estimates: on Big Buck Bunny under 1 MB at 720p, the plan's slope
@@ -1292,7 +1302,7 @@ export function encode(probe: Probe, settings: Settings, start: EncodeStart, onP
       if (canceled) throw new Canceled()
       const wall = performance.now() - started
       const sum = (k: 'decode' | 'load' | 'encode') => encoded.reduce((t, c) => t + c.timing[k], 0)
-      console.info(`[pare] ${active} workers × ${threads} threads asked, ${chunks.length} chunks, wall ${(wall / 1000).toFixed(1)} s; per-worker average: ` +
+      console.info(`[pare] ${at()} ${active} workers × ${threads} threads asked, ${chunks.length} chunks, wall ${(wall / 1000).toFixed(1)} s; per-worker average: ` +
         `decode ${(sum('decode') / active / 1000).toFixed(1)} s, copy ${(sum('load') / active / 1000).toFixed(1)} s, ` +
         `encode ${(sum('encode') / active / 1000).toFixed(1)} s; video ${(total / 1e6).toFixed(2)} MB; rate factors ${passes.join(' | ')}`)
       onProgress({ fraction: 0.99, processed: probe.duration, elapsed: (performance.now() - started) / 1000,
@@ -1533,7 +1543,7 @@ function fitAt(probe: Probe, settings: Settings, points: PlanPoint[]): SizePlan 
   // and logSize follows it.
   if (crf > top && reach <= profile.max) crf = top + (crf - top) / 2
   const video = measured < -0.03 ? extend(profile, a, b, crf) : a.bytes * Math.exp(slope * (crf - a.crf))
-  console.info(`[pare] plan: crf ${crf.toFixed(1)} → ${(video / 1e6).toFixed(2)} MB video, slope ${slope.toFixed(3)}`)
+  console.info(`[pare] plan ${at()}: crf ${crf.toFixed(1)} → ${(video / 1e6).toFixed(2)} MB video, slope ${slope.toFixed(3)}`)
   // The encode steers to the goal, so that's the size to expect, unless even the highest rate factor misses it.
   const atMax = measured < -0.03 ? extend(profile, a, b, highest) : a.bytes * Math.exp(slope * (highest - a.crf))
   const expected = atMax > goal ? atMax : Math.min(video, goal)
@@ -1647,6 +1657,11 @@ export async function plan(probe: Probe, settings: Settings, signal: AbortSignal
       const keyframes = fixed + (sceneCuts / Math.max(1, frames)) * times.length
       const perKey = keyCount ? keyBytes / keyCount : 0
       const perFrame = restCount ? restBytes / restCount : perKey
+      // For calibrating how keyframes are priced (the encode's own layout can have fewer chunks than counted here).
+      if (tests.length === windows.length)
+        console.info(`[pare] windows: ${tests.length}×${per} frames, keyframe ${(perKey / 1e3).toFixed(1)} KB, other ` +
+          `${(perFrame / 1e3).toFixed(2)} KB, cuts ${sceneCuts}; keyframes counted ${fixed}, encode layout ` +
+          `${planChunks(line, encodeWith, profile.decodeShare).length} chunks for ${times.length} frames`)
       // Short windows see less of the lookahead's bit redistribution and ran 3-11% low against full encodes.
       return ESTIMATE_BIAS * (perKey * keyframes + perFrame * Math.max(0, times.length - keyframes))
     }
@@ -1720,7 +1735,7 @@ export async function plan(probe: Probe, settings: Settings, signal: AbortSignal
       points.push(...(await videoAt([Math.round(Math.min(maxCrf(profile, settings), planned.crf) * 2) / 2])))
       planned = fit(probe, settings, points)
     }
-    console.info(`[pare] plan: ${(performance.now() - began) / 1000 | 0} s, ${windows.length}×${per} frames, ` +
+    console.info(`[pare] plan ${at()}: ${(performance.now() - began) / 1000 | 0} s, ${windows.length}×${per} frames, ` +
       points.map((p) => `crf ${p.crf} → ${(p.bytes / 1e6).toFixed(1)} MB`).join(', '))
     succeeded = true
     // H.264 fitting at the rate factor it starts from: those test windows are that encode's output already.
@@ -1866,7 +1881,16 @@ export async function planAvc(probe: Probe, settings: Settings, signal: AbortSig
       if (!predicts && !edge && (first.slope ?? 0) > AUTO_STEEP) {
         // Far past the higher test H.264 is compressing hard; if its windows already score far from 1:1 there, AV1
         // is the choice (noisy: 79.5 against AV1's 87.2).
-        if (first.crf <= top + MID_TEST) return
+        if (first.crf <= top + MID_TEST) {
+          // Past the rate factor a quick start takes, AV1's test runs once H.264's windows are scored (testsAv1) unless
+          // they score high: start it on H.264's sizes now instead, as settle would. This round's rate factor is the
+          // plan's last (a third round needs a steeper curve or a rate factor further out), so the test is the same.
+          if (first.crf > AUTO_QUICK_CRF) {
+            console.info(`[pare] auto ${at()}: AV1's test starts with H.264's sizes (crf ${first.crf})`)
+            early = testAv1(probe, settings, first, stop.signal)
+          }
+          return
+        }
         await first.scored
         predicts = (vmafAt(first.points, videoGoal(probe, settings)) ?? 100) < AUTO_FAR
         if (!predicts) return
@@ -2035,7 +2059,7 @@ export async function settle(probe: Probe, settings: Settings, avc: SizePlan, si
     // Compare like with like: both encoders on the same two windows, at the size those windows' share of the target is.
     const same = avc.points!.map((p) => ({ crf: p.crf, bytes: p.subset?.bytes ?? p.bytes, vmaf: p.subset?.vmaf ?? p.vmaf }))
     const vmaf = { avc: vmafAt(same, goal / scale) ?? avcScore, av1: vmafAt(tested.points, goal / scale) }
-    console.info(`[pare] auto: VMAF NEG at ${(goal / 1e6).toFixed(1)} MB, H.264 ${vmaf.avc.toFixed(2)}, AV1 ${vmaf.av1?.toFixed(2)}; ` +
+    console.info(`[pare] auto ${at()}: VMAF NEG at ${(goal / 1e6).toFixed(1)} MB, H.264 ${vmaf.avc.toFixed(2)}, AV1 ${vmaf.av1?.toFixed(2)}; ` +
       `rate factors ${avc.crf} / ${av1.crf}`)
     // x264 at its highest rate factor still over the target: only AV1 can keep the size promise.
     if (!reaches && bytesAt(av1.points, maxCrf(AV1, settings), AV1) <= goal) return { codec: 'av1', plan: av1, vmaf, reason: 'size' }
