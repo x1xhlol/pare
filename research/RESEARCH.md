@@ -1236,6 +1236,51 @@ In Chrome all of it passed. The failures, all fixed:
   finds nothing; those files now check as usual (SSIM 0.990 in Chrome, 0.986 in WebKit). A fix for Mediabunny itself
   is drafted.
 
+## Trimming
+
+A part of a video is compressed as its own video: `narrow()` (`src/lib/shared.ts`) turns the probe into one for the part,
+with its start, length, bitrate, and its share of the file's bytes (its frames' bytes from the container's index, its
+length of audio, the container in proportion), so the size plan, "half the size", Fit under, the audio budget, the
+preview and the quality check need no changes of their own. The probe now keeps every frame's timestamp, size and key
+flag from probing, which also saves the rescan each plan used to make. The part starts on the frame shown at its start
+and ends before the first frame at or after its end; Pare's encoders decode from the keyframe before it and end the
+last chunk at its end, and audio is cut to it (copied: the straddling first packet, and before it what the decoder
+needs to warm up, go below 0 and the MP4 edit list hides them; encoded: cut sample-exactly).
+
+Checked on synthetic clips (a moving test pattern, a 50 ms beep each second, keyframes every 2 s, B-frames) by
+comparing each copy with the source frame by frame and finding the beeps (`/tmp/trimtest`-style: frame alignment by PSNR
+at shifts of -2 to +2 frames, frame count, onset of every beep):
+
+| Case | First frame | Frames | Audio |
+| --- | --- | --- | --- |
+| H.264 + AAC, part from between keyframes, x264 | exact | 124 / 124 | 0.0 ms |
+| VP9 + Opus WebM, copied Opus | exact | 145 / 145 | 1.0 ms |
+| VP9 + Opus WebM, Opus re-encoded (Fit under), Chrome / WebKit | exact | 144 / 144 | 1.0 / 1.0 ms |
+| H.264 + PCM MOV, audio encoded | exact | 75 / 75 | 0.0 ms |
+| AAC part starting on a frame boundary | exact | 60 / 60 | 0.0 ms |
+| Exact copy | bit-identical | 124 / 124 | 0.0 ms |
+| Chrome MediaRecorder WebM (VP8, variable frame rate) | exact | 226 | |
+
+The 1 ms left on WebM is its millisecond timestamps. Three things came up on the way:
+
+- **Mediabunny doesn't subtract a Matroska track's CodecDelay** (the Opus encoder's pre-skip, 6.5 ms) from its
+  timestamps, as the Matroska spec says to. A whole file is unaffected, since a decoder drops the pre-skip at its
+  start, but a part cut from the middle came out 7.5 ms late. For copied audio Pare now shifts by the pre-skip; for
+  decoded audio it depends on the browser: Chromium's and Firefox's Opus decoders drop a pre-skip at the start of every
+  decode, which puts their output on the true clock already, and WebKit's don't, so Pare tells them apart by the first
+  decoded frame's length. The browser's encoder and Exact copy go through Mediabunny's own conversion and keep the
+  7.5 ms, far under the 45 ms at which late audio is noticed.
+- **A decoder needs what came before the part.** Starting at the packet playing at the start left the first 20-60 ms
+  silent or garbled (AAC's overlapping transform, Opus's 80 ms of pre-roll); the packets before it now go in too,
+  hidden by the edit list.
+- **An Exact copy of a part starts at the keyframe before it** (Mediabunny's copy trim expands to one), so it can be far
+  bigger than the part's share: a one-second part with 10-second keyframes stored 271 frames for 30. The estimate
+  counts them now (2,523,430 bytes estimated and written for the case above).
+
+The player's clock differs by browser for a file whose timestamps don't start at 0: Chrome and WebKit play it on its own
+timestamps, Firefox from 0. Start here and End here read where a seek to 0 lands before using the player's time, and
+take the frame on screen from `requestVideoFrameCallback` when it agrees with the playhead.
+
 ## End to end in the browser
 
 Same headless Chrome, same files, production builds:

@@ -123,6 +123,8 @@ it took town from 90.3 to 93.9 and noisy from 80.9 to 87.5.
   bit-identical).
 - Size: at least 50% smaller (the default), under a size you choose (10, 25, 50 or 100 MB, or any other), or no
   limit. The same plan, per-chunk budget and final weigh hold either target.
+- Length: the whole video or a part of it, typed as times or taken from the player (Start here, End here). The part
+  snaps to frames, and the size target, estimate and preview are for the part.
 - More options: the encoder (Pare's own, or the browser's WebCodecs encoder, which is faster but less efficient), the
   format (Auto, H.264 or AV1, and HEVC with the browser's encoder), resolution, audio, and the place a phone
   recorded the video at. That one is left out unless you keep it, since a compressed copy is often for sharing.
@@ -187,6 +189,12 @@ runs `checkasm` to check every SIMD kernel against the C reference, and links th
   so is audio that would take most of the size budget (lossless tracks). When the browser can't decode or encode it,
   the settings say so before Compress and the copy has no audio. When the audio alone is more than half the file, it
   can't be made half the size, and the video is compressed at the chosen quality instead.
+- An Exact copy of a part starts at the keyframe before it: an edit list hides the frames before the part, so it plays
+  from the frame chosen, but the file carries them. With a 10-second keyframe interval that can be several times the
+  part's own size, which the estimate shows.
+- Mediabunny reads a WebM or MKV track's Opus audio without subtracting its codec delay (6.5 ms). A whole file plays in
+  sync regardless; for a part, Pare's own encoders correct it, while the browser's encoder and Exact copy come out up
+  to 7.5 ms late, well under what anyone hears.
 - Needs a browser with WebCodecs and WebAssembly SIMD. Tested in Chrome, in Firefox 155, and in WebKit 26.6 (Safari's
   engine) on Linux, where it works but plans about three times slower and can't decode AV1. Safari on a Mac hasn't
   been tried. Firefox decodes to RGB frames, so there an HDR video becomes SDR and frames take longer to bring in.
