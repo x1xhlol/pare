@@ -868,6 +868,8 @@ function Ready(props: {
     previewing.current?.abort()
     setPreview(null)
   }, [previewKey])
+  // Compressing leaves this screen; a preview still encoding would take cores from it.
+  useEffect(() => () => previewing.current?.abort(), [])
   useEffect(() => () => preview?.frames?.forEach((f) => (f.original.close(), f.compressed.close())), [preview])
   const runPreview = async () => {
     if (!result?.crf) return
