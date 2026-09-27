@@ -241,6 +241,35 @@ ones are marked).
 
 The machine was shared and busy during these runs, so encode times aren't compared here.
 
+## Against other in-browser compressors
+
+Four compressors that also run on the user's device, each checked for uploads during a compression (request bodies,
+WebSockets, and bytes written to sockets in Chrome's NetLog: at most 26.7 KB per run, analytics included; none sent
+the video): usyless 8mb (its default browser-encoder path, and "Force FFmpeg.wasm"), videocompress.dev, 8mbify, and
+compress.lol (a self-hosted build of its open source; the live site blocks headless browsers). Each got the same byte
+budget, in headless Chrome on the benchmark machine, whose WebCodecs H.264 encoder is software here. VMAF NEG (1st
+percentile), against the source at its size, downscaled outputs scaled back up:
+
+| Clip, budget | Pare | Pare, H.264 only | Browser encoder (videocompress.dev; Pare's Fast engine the same) | usyless, FFmpeg.wasm | usyless, default | 8mbify | compress.lol |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Big Buck Bunny, 5 MB | AV1: 90.45 (86.48) | 86.90 (80.67) | 64.06 (44.23) | 480p: 70.80 (63.14) | 480p: 53.27 (44.08) | 69.57 (51.45) | 576p, 24 fps: 55.35 (38.05) |
+| town, 3 MB | AV1: 90.11 (86.30) | | 87.00 (78.79), but 4.49 MB: 50% over | 720p: 84.38 (73.16) | 480p: 64.26 (48.55) | 84.13 (63.08) | 576p, 24 fps: 59.19 (29.02) |
+| Screen recording, 2 MB | H.264: 98.73 (94.64) | | 89.46 (80.74) | 360p: 43.97 (34.75) | 360p: 31.96 (24.01) | 92.81 (77.89), but 9% over | 576p, 24 fps: 39.56 |
+
+- At each tool's own settings Pare is the best by a wide margin, and on every clip at the 1st percentile. Most of the
+  others reach the size by lowering the resolution or frame rate.
+- Part of the lead is AV1. Held to H.264, Pare scored 86.90 on Big Buck Bunny. usyless with its resolution limit turned
+  off (a non-default checkbox, x264 `faster` in ffmpeg.wasm) kept 1080p and scored 86.33 at 4.33 MB, and native x264
+  `faster` 86.60 at 4.25 MB: per byte, Pare's H.264 is about even with x264 set up the same way.
+- Chrome's software H.264 encoder overshoots at low rates: videocompress.dev and Pare's Fast engine both came out about
+  50% over on town. Pare warns about it and suggests Thorough; videocompress.dev doesn't.
+- Pare is slower. In the same batch the browser-encoder tools took 10-21 s from choosing the file to the result, and
+  Pare 44-139 s, 4-7 times as long. About half of Pare's Big Buck Bunny time was Auto test-encoding AV1 against H.264;
+  held to H.264 it took 60 s, against 80 s for usyless's 1080p ffmpeg.wasm. On machines that encode H.264 in hardware
+  the browser-encoder tools are faster still.
+- 8mbify can't compress a video without audio (it was measured on copies with a silent track added);
+  videocompress.dev loads ad and analytics scripts; Pare makes no cross-origin requests.
+
 ## Speed in context
 
 Big Buck Bunny (10 s, 30.7 MB) on the same machine and browser, each file scored the same way:
@@ -254,7 +283,7 @@ Big Buck Bunny (10 s, 30.7 MB) on the same machine and browser, each file scored
 | Native ffmpeg, as a desktop app would run it, Pare's x264 settings at CRF 19.1 | 6.4 s | 13.5 MB (−56%) | 93.3 (89.5) |
 
 The ffmpeg.wasm runs were handed a rate factor; Pare finds its own for the size target, and that's in its time.
-At the same quality it's 6.4 times as fast as the single-threaded ffmpeg.wasm most in-browser compressors use, and
+At the same quality it's 6.4 times as fast as the single-threaded ffmpeg.wasm in-browser compressors fall back to, and
 1.7 times as fast as the multithreaded one (whose `veryfast` crashed). Its encode alone took 12.9 s, twice native x264
 on the same cores. One continuous encode is also about 9% smaller than Pare's four chunks at the same VMAF NEG, which
 is what splitting the video for speed costs on a clip this short.

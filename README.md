@@ -1,16 +1,20 @@
 # Pare
 
-Pare makes a video at least half its size and keeps it looking like the original. It runs in the browser tab, so the
-file never leaves your computer and there's nothing to install.
+Pare makes a video at least half its size and keeps it looking like the original, or shows how close it came. It
+runs in the browser tab, so the file never leaves your computer and there's nothing to install.
 
 **Try it:** https://pare-eight.vercel.app
 
-![A finished compression: 30.7 MB to 13.9 MB, visually identical, with a side-by-side frame comparison](docs/result.jpg)
+![A finished compression: 30.7 MB to 13.4 MB, visually identical, with a side-by-side frame comparison and the SSIM of every frame](docs/result.jpg)
 
 ## Why it's different
 
-Most in-browser video compressors run ffmpeg.wasm. That's x264 with its assembly stripped out, on one thread, and it
-works, slowly. Pare started there too, and it took 105 seconds to compress a 20-second phone clip. On a 10-second
+In-browser video compressors use the browser's own encoder or ffmpeg.wasm. The browser's encoder is quick where the
+device encodes in hardware, but at a size target it gives up the most quality: under 5 MB, Big Buck Bunny scored
+VMAF NEG 64 from Chrome's software encoder, against 90 from Pare (86.9 with Pare held to H.264; `research/BENCHMARKS.md`,
+"Against other in-browser compressors"). ffmpeg.wasm is
+x264 with its assembly stripped out, on one thread, and it works, slowly. Pare started there too, and it took 105
+seconds to compress a 20-second phone clip. On a 10-second
 clip at the same quality, stock ffmpeg.wasm takes 159 s on one thread and 42 s multithreaded. Pare takes 25 s,
 including the test encodes that find the setting for half the size. Native x264 on the same machine takes 6 s. Pare
 is within a factor of four of that; one-thread ffmpeg.wasm is 25 times slower.
@@ -173,8 +177,8 @@ runs `checkasm` to check every SIMD kernel against the C reference, and links th
 - The x264 build is 8-bit: HDR sources encoded as H.264 keep their HDR tags but lose two bits, so smooth gradients can
   band. With AV1 they stay 10-bit, resized or not. Phone HDR is HEVC, which the test machine can't decode, so that
   path is untested.
-- Each 1080p encoder needs about 400 MB, and Pare uses at most 40% of the memory the device reports, so memory caps
-  the encoder count. At 4K that's 2 encoders.
+- Each 1080p encoder needs about 400 MB, and Pare uses at most 40% of the memory the device reports (of 8 GB where the
+  browser doesn't say, as Safari and Firefox don't), so memory caps the encoder count. At 4K that's 2 encoders.
 - A refit, when the first pass misses the target, encodes the biggest chunks again on every core. It still adds time,
   about 7 s on a 20-second clip.
 - Noisy footage that's already tightly compressed can't be halved at about 1:1 by x264 or SVT-AV1. Two of the test

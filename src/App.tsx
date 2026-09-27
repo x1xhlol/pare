@@ -119,12 +119,12 @@ const SIZE_HINT: Record<SizeMode, string> = {
   any: 'Always encodes at the chosen quality, even if the file barely shrinks.',
 }
 
-/** Common upload limits, in MB: Discord's free tier, email attachments, and two larger ones. */
-const FIT_PRESETS = [10, 25, 50, 100]
+/** Common upload limits, in MB: Discord's free tier (20 since August 2026, 10 before), email attachments, and larger ones. */
+const FIT_PRESETS = [10, 20, 25, 50, 100]
 
-/** Where "Fit under" starts: 10 MB, or a quarter of a smaller file (1 MB for files of 2-4 MB), rounded. */
+/** Where "Fit under" starts: 20 MB (Discord's free limit), or a quarter of a smaller file (1 MB for 2-4 MB), rounded. */
 const defaultFit = (size: number) =>
-  size > 20e6 ? 10e6
+  size > 80e6 ? 20e6
     : size > 4e6 ? Math.round(size / 4 / 1e5) * 1e5
     : size > 2e6 ? 1e6
     : Math.round(Number((size / 4 / 1e6).toPrecision(2)) * 1e6)
@@ -145,7 +145,7 @@ const ENGINES: Option<Engine>[] = [
 const ENGINE_HINT: Record<Engine, string> = {
   thorough:
     'Encoders compiled to WebAssembly, running on every CPU core: x264, the one inside HandBrake and ffmpeg, or SVT-AV1. The smallest files for the quality.',
-  fast: "Your browser's built-in encoder, often hardware-accelerated. Several times quicker, but files come out larger at the same quality.",
+  fast: "Your browser's built-in encoder. Quick where the device encodes video in hardware, as most phones and laptops do, and slower than Thorough where it doesn't; files come out larger at the same quality either way.",
 }
 
 const CODEC_HINT: Record<OutputCodec, string> = {
@@ -221,7 +221,10 @@ export default function App() {
       const probe = await (await media()).probeFile(file)
       if (!probe.canDecode) {
         const codec = probe.videoCodec ? CODEC_LABEL[probe.videoCodec] ?? probe.videoCodec : 'this codec'
-        throw new Error(`This browser can’t decode ${codec} video. Try Chrome or Edge.`)
+        // Chrome and Edge decode HEVC and ProRes only where the system does: there, another browser won't help.
+        const chromium = (navigator as Navigator & { userAgentData?: { brands: { brand: string }[] } }).userAgentData?.brands
+          .some((b) => b.brand === 'Chromium')
+        throw new Error(`This browser can’t decode ${codec} video${chromium ? ' on this device' : '. Try Chrome or Edge'}.`)
       }
       // The browser's own encoders need browser support; Pare's WebAssembly ones work everywhere.
       setSettings((s) => ({
@@ -688,8 +691,8 @@ function Empty(props: { dragging: boolean; probing: string | null; error?: strin
       <div className="intro-head">
         <h1 className="display" tabIndex={-1}>Make a video smaller without making it worse.</h1>
         <p className="lede">
-          Pare cuts a video to half its size or less and keeps it looking like the original. It encodes across your
-          computer’s cores, in this tab, and the file never leaves your device.
+          Pare cuts a video to half its size or less and keeps it looking like the original, or shows how close it
+          came. It encodes across your computer’s cores, in this tab, and the file never leaves your device.
         </p>
       </div>
       <div className="drop" data-active={props.dragging || undefined} onClick={props.onPick}>

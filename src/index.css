@@ -1406,6 +1406,17 @@ label {
   gap: 8px;
 }
 
+/* Eight frames (the result's) in even rows: one of eight where they fit, two of four where they don't. */
+.strip[data-count='8'] {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+@media (min-width: 900px) {
+  .strip[data-count='8'] {
+    grid-template-columns: repeat(8, minmax(0, 1fr));
+  }
+}
+
 .strip-item {
   display: grid;
   gap: 6px;

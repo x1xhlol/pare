@@ -154,7 +154,7 @@ export function Compare({ frames, timeline, title = 'Compare frames', note }: {
 
       {timeline && timeline.length > 1 && <Timeline points={timeline} frames={frames} index={index} onPick={setIndex} />}
 
-      <div className="strip" role="group" aria-label="Sampled frames">
+      <div className="strip" data-count={frames.length} role="group" aria-label="Sampled frames">
         {frames.map((f, i) => (
           <button
             key={f.time}
