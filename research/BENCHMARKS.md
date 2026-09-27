@@ -212,6 +212,35 @@ bits than the source spends (noisy would need 1.6 to 2.9 times its own size). At
 Auto sends them. (Noisy's row uses Pare's current x264 settings; the others its previous ones, which have the same
 quality per byte.)
 
+## Against native encoders at the same size
+
+Pare's default output (at least 50% smaller, format Auto) for three clips, against native encoders given exactly the
+size of Pare's video stream (2-pass for x264 and x265, a rate factor search for SVT-AV1; `research/native_gap.py`, the
+same ffmpeg build and scoring as `research/score.py`). VMAF NEG, mean and 1st percentile. "Bytes for Pare's quality" is
+how much of Pare's size each encoder needs to score what Pare scored, interpolated between its encodes (extrapolated
+ones are marked).
+
+| Clip | Pare | Same encoder, native | x264 `veryslow` | x265 `slow` | SVT-AV1 preset 4 |
+| --- | --- | --- | --- | --- | --- |
+| town, 15.8 MB | AV1, 7.12 MB: 94.06 (91.4) | SVT-AV1 preset 8: 94.29 (92.0), 0.91x | 91.86 (87.3), 2.05x | 94.30 (91.4), 0.90x | 94.74 (92.9), about 0.71x (extrapolated) |
+| Big Buck Bunny, 30.7 MB | H.264, 13.42 MB: 93.05 (89.4) | x264, Pare's settings: 93.16 (90.9), 0.96x | 94.87 (93.3), about 0.63x (extrapolated) | 95.14 (93.7), 0.51x | 95.27 (94.4) |
+| Screen recording, 10.8 MB | H.264, 3.49 MB: 98.96 (95.6) | x264, Pare's settings: 99.01 (95.8), 0.91x | 99.00 (95.7) | | 97.96 (88.6) |
+
+- **Splitting the encode across workers costs 4-9% of the bytes** against the same encoder run once, natively, at the
+  same settings: 0.1-0.2 VMAF NEG at the same size. That is the price of the chunks' keyframes and of steering each
+  chunk's rate factor.
+- **Where Auto picks AV1, Pare is level with the best H.265 encoder** (x265 `slow`, 0.90x) and needs about half what
+  the slowest H.264 does (x264 `veryslow` needs 2.05x Pare's bytes for town's quality). SVT-AV1 at preset 4 would save
+  more, at several times the encode time.
+- **Where Auto keeps H.264, AV1 would have made a smaller file.** On Big Buck Bunny, SVT-AV1 at Pare's own preset needs
+  0.55x the bytes for the same quality (13.37 MB scored 94.43). Auto keeps H.264 when it already reaches the target
+  near 1:1, for speed and because every device plays it, so the default leaves that saving unused. On the screen
+  recording AV1 is worse (98.58 and a 1st percentile of 92.6 at preset 8), which is what Auto measures for.
+- For scale, ffmpeg's defaults (libx264 `medium` CRF 23, AAC) made files 3.62 MB (town, 90.89), 7.47 MB (Big Buck
+  Bunny, 91.32) and 1.12 MB (screen, 98.53): smaller than Pare's, at a quality Pare's default doesn't go down to.
+
+The machine was shared and busy during these runs, so encode times aren't compared here.
+
 ## Speed in context
 
 Big Buck Bunny (10 s, 30.7 MB) on the same machine and browser, each file scored the same way:
