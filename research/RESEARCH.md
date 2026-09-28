@@ -1366,7 +1366,18 @@ first pass went over the limit, and the second AV1 pass left it at 90.30 instead
 under 25 MB went to AV1 at 85.38 against H.264's 84.06, but 42 s slower (AV1's encode of 1,000 frames took twice x264's)
 and 2.4 points lower at the 1st percentile. Park under 11.5 MB was the one clear gain: AV1 at 89.46 against 87.25,
 where the measured path had kept H.264 because its windows scored 93.74 against AV1's 88.75. That last one says the
-windows can mislead on park at this size, which is worth a look of its own; the rule itself isn't shipped.
+windows can mislead on park at this size; the rule itself isn't shipped.
+
+Why they misled (open): logging every test point, H.264's two windows (1 and 3, two frames each) scored 95.0 at rate
+factor 25 and 100.0 at 15, and AV1's 99.4 at 33 and 88.2 at 45. The 10.8 MB goal lay inside AV1's bracket but past
+H.264's highest test, so H.264's score there came from the straight line from 15 to 25 carried on: 93.7. Two things
+make that optimistic. The whole clip scores about 91.5 at x264 CRF 25 natively (93.9 at 24, 89.0 at 26), so the four
+frames scored ran about 3.5 points high on park; the corpus simulation had x264's windows 0.6 to 4.1 points low on park
+at CRF 16-24, so this is sampling, not a steady bias. And past 25 x264 loses about 2.5 points per rate factor step
+there, twice the line's slope. A fix needs its own simulation (more frames or windows scored for H.264, or a third
+H.264 point when the goal is past its tests), checked like the current rule against whole-clip picks.
+
+## End to end in the browser
 
 ## End to end in the browser
 

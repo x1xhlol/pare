@@ -2106,7 +2106,9 @@ export async function settle(probe: Probe, settings: Settings, avc: SizePlan, si
     const same = avc.points!.map((p) => ({ crf: p.crf, bytes: p.subset?.bytes ?? p.bytes, vmaf: p.subset?.vmaf ?? p.vmaf }))
     const vmaf = { avc: vmafAt(same, goal / scale) ?? avcScore, av1: vmafAt(tested.points, goal / scale) }
     console.info(`[pare] auto ${at()}: VMAF NEG at ${(goal / 1e6).toFixed(1)} MB, H.264 ${vmaf.avc.toFixed(2)}, AV1 ${vmaf.av1?.toFixed(2)}; ` +
-      `rate factors ${avc.crf} / ${av1.crf}`)
+      `rate factors ${avc.crf} / ${av1.crf}; windows H.264 ` +
+      same.map((p) => `${p.crf}: ${(p.bytes * scale / 1e6).toFixed(1)} MB ${p.vmaf?.toFixed(1)}`).join(', ') + '; AV1 ' +
+      tested.points!.map((p) => `${p.crf}: ${(p.bytes * scale / 1e6).toFixed(1)} MB ${p.vmaf?.toFixed(1)}`).join(', '))
     // x264 at its highest rate factor still over the target: only AV1 can keep the size promise.
     if (!reaches && bytesAt(av1.points, maxCrf(AV1, settings), AV1) <= goal) return { codec: 'av1', plan: av1, vmaf, reason: 'size' }
     // At the edge of its range H.264 has no headroom, and a first pass over the size ends at its highest rate factor
