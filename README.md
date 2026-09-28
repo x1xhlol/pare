@@ -5,7 +5,7 @@ runs in the browser tab, so the file never leaves your computer and there's noth
 
 **Try it:** https://pare-eight.vercel.app
 
-![A finished compression: 30.7 MB to 13.4 MB, visually identical, with a side-by-side frame comparison and the SSIM of every frame](docs/result.jpg)
+![A finished compression: 30.7 MB to 14.3 MB, visually identical, with a side-by-side frame comparison and the SSIM of every frame](docs/result.jpg)
 
 ## Why it's different
 
