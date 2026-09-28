@@ -1343,6 +1343,31 @@ under 5 MB went to the same AV1 file, video stream identical in three runs each,
 gentler curve H.264 usually wins, and starting the test only competed with its scoring (the screen recording under
 1.6 MB took 0.6 and 7.9 s longer), so the gentle case waits as before.
 
+### Choosing AV1 without its test under a tight size (not shipped)
+
+Under Fit under, x264 past rate factor 25 is far from 1:1, and AV1 led it everywhere on whole clips of the corpus at the
+same size (`research/tight_fit.py`, native, x264 at CRF 26 and 28 against SVT-AV1 preset 8 matched to its size):
+
+| Clip | AV1's lead, VMAF NEG, at x264 CRF 26 / 28 | 1st percentile, x264 against AV1, at 26 |
+| --- | --- | --- |
+| Big Buck Bunny | +4.71 / +6.59 | 82.4 / 89.9 |
+| town | +3.68 / +6.12 | 80.7 / 86.3 |
+| tree | +3.92 / +6.07 | 77.4 / 84.5 |
+| park | +2.10 / +3.98 | 80.9 / 82.2 |
+| ducks | +1.21 / +4.19 | 71.3 / 73.8 |
+| noisy | +6.69 / +6.95 | 74.3 / 82.1 |
+| Screen recording | +1.02 / +1.70 | 92.5 / 96.3 |
+| Phone clips | +1.73 / +4.48 | 76.2 / 70.5 |
+
+So Auto was made to pick AV1 from H.264's first round there, on all but gentle curves (slope above -0.1), skipping
+AV1's preset-8 quality test for the preset-10 size plan. In the browser it wasn't faster. Big Buck Bunny under 5 MB
+planned 13 s sooner, but preset 10's windows put it 9% low (the tested path's preset-8 windows were within 1%), the
+first pass went over the limit, and the second AV1 pass left it at 90.30 instead of 90.45, 33 s later. The phone clips
+under 25 MB went to AV1 at 85.38 against H.264's 84.06, but 42 s slower (AV1's encode of 1,000 frames took twice x264's)
+and 2.4 points lower at the 1st percentile. Park under 11.5 MB was the one clear gain: AV1 at 89.46 against 87.25,
+where the measured path had kept H.264 because its windows scored 93.74 against AV1's 88.75. That last one says the
+windows can mislead on park at this size, which is worth a look of its own; the rule itself isn't shipped.
+
 ## End to end in the browser
 
 Same headless Chrome, same files, production builds:
