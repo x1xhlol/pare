@@ -1257,7 +1257,7 @@ export function encode(probe: Probe, settings: Settings, start: EncodeStart, onP
         for (let round = 0; budget && round < 3; round++) {
           if (canceled) throw new Canceled()
           const over = total > limit
-          if (!over && !(total < goal * UNDER_GOAL && crfs.some((c) => c > floor + 0.25))) break
+          if (!over && !(total < goal * UNDER_GOAL[profile.codec] && crfs.some((c) => c > floor + 0.25))) break
           const mean = encoded.reduce((t, c) => t + crfs[c.index] * chunkBytes(c), 0) / total
           const planned = localSlope(start.points ?? [], mean, total, over, slopeAt(profile, slope, mean + (over ? 1.5 : -1.5)))
           const local = localSlope(tried, mean, total, over, planned)
@@ -1347,8 +1347,12 @@ export function encode(probe: Probe, settings: Settings, start: EncodeStart, onP
   return { promise, cancel }
 }
 
-/** A first pass landing under this share of the goal is encoded again at a lower rate factor. */
-const UNDER_GOAL = 0.75
+/**
+ * A first pass landing under this share of the goal is encoded again at a lower rate factor. x264's second pass is
+ * quick, and with its estimates closer to the first pass (SHORT_KEYFRAME_SHARE) a big shortfall means the plan's curve
+ * was off, as on noisy footage past its tests.
+ */
+const UNDER_GOAL = { avc: 0.85, av1: 0.75 }
 /**
  * Where a second pass aims, as a share of the real limit. The first pass aims 6% lower to absorb the plan's error; a
  * second pass re-encodes chunks it has measured, and across 11 logged refits landed 9% under to 1.1% over its target.
@@ -1358,6 +1362,16 @@ const REFIT_AIM = 0.985
 const WINDOW_FRAMES = 24
 /** Test-window estimates came in 3-11% under the finished files (median ~7%); scale them to match. */
 const ESTIMATE_BIAS = 1.08
+/**
+ * A short video's x264 encode runs as fewer chunks than the plan counts keyframes for (workerCount: 4 for 240-479
+ * frames), and the counted estimate, which Auto's thresholds were tuned on, came in a median 11% over the first pass
+ * (23 runs of 7 clips, to 35% on the screen recording, whose keyframes cost 20 frames each). The size the encode aims
+ * with prices each keyframe its layout drops at this share of what a keyframe costs over another frame: on 19 of those
+ * runs the mean overestimate fell from 13.7% to 7.7%, and none came in more than 1% under. Scaling further (0.97 took it to 5.2%)
+ * sent town under 4.74 MB 1.7% over in the browser, since a rate factor 0.4 lower made 20% more there, and the second
+ * pass that fixed it cost 0.09 VMAF NEG. Auto still decides on the counted estimate.
+ */
+const SHORT_KEYFRAME_SHARE = 0.35
 /**
  * x264's superfast preset at the same rate factor takes about half the CPU time for about the same VMAF NEG (-0.1 to
  * -0.9 on the corpus at CRF 15) in a file 1.0-1.5x as big; rippling water lost 5.7. So when the quality ceiling fits
@@ -1429,6 +1443,13 @@ const AUTO_EDGE = 3
  * 720p, the phone clips planned H.264 at 26.3 and came out at VMAF NEG 66, where AV1 made 75.6 at 1080p.
  */
 const AUTO_QUICK_CRF = 25
+/**
+ * ...past which AV1's test starts on H.264's first-round sizes, without waiting for their scores, where size still falls
+ * this steeply: Big Buck Bunny under 5 MB (-0.15) went to AV1 4.6 s sooner. On a gentler curve H.264 usually scores
+ * high and wins, and the early test only competes with its scoring: the screen recording under 1.6 MB (-0.07) took
+ * 0.6 and 7.9 s longer.
+ */
+const AUTO_EARLY_SLOPE = -0.1
 /** ...and the rate factor from which a steep curve alone makes AV1 the choice (predictsAv1). */
 const AUTO_PREDICT_CRF = 19
 /**
@@ -1462,7 +1483,9 @@ export type SizePlan = {
    * Predicted video bytes at the tested rate factors, and VMAF NEG of the test windows when measured. `subset` is
    * the same from only the windows AV1's test uses.
    */
-  points?: { crf: number; bytes: number; vmaf?: number; subset?: { bytes: number; vmaf?: number } }[]
+  points?: { crf: number; bytes: number; vmaf?: number; subset?: { bytes: number; vmaf?: number }; encodeBytes?: number }[]
+  /** The same plan from the sizes priced for the encode's own layout (SHORT_KEYFRAME_SHARE), for the encode to use. */
+  encode?: SizePlan
   /** AV1 past its `max`: the encode makes fewer, longer chunks (TAIL_CHUNK_FRAMES). */
   long?: boolean
   /** The size target binds: the lower test didn't fit, so the rate factor was raised to make it fit. */
@@ -1601,6 +1624,9 @@ export async function plan(probe: Probe, settings: Settings, signal: AbortSignal
   // window's keyframe overstates what one saves (4 chunks instead of 8 made Big Buck Bunny 3% smaller, not 12%).
   const encodeWith = workerCount(probe, settings, times.length).encoders
   const fixedKeyframes = planChunks(line, encoders, profile.decodeShare).length + Math.floor(times.length / 250)
+  // The keyframes the x264 encode's own layout makes, where that's fewer (see SHORT_KEYFRAME_SHARE).
+  const layoutChunks = planChunks(line, encodeWith, profile.decodeShare).length
+  const layoutKeyframes = profile === X264 ? Math.max(layoutChunks, Math.ceil(times.length / 250)) : fixedKeyframes
   if (signal.aborted) throw new Canceled()
   const fps = probe.fps || 30
   const pool = await createPool(profile, count, threads, {
@@ -1657,13 +1683,19 @@ export async function plan(probe: Probe, settings: Settings, signal: AbortSignal
       const keyframes = fixed + (sceneCuts / Math.max(1, frames)) * times.length
       const perKey = keyCount ? keyBytes / keyCount : 0
       const perFrame = restCount ? restBytes / restCount : perKey
+      const bytes = (count: number) => perKey * count + perFrame * Math.max(0, times.length - count)
       // For calibrating how keyframes are priced (the encode's own layout can have fewer chunks than counted here).
       if (tests.length === windows.length)
         console.info(`[pare] windows: ${tests.length}×${per} frames, keyframe ${(perKey / 1e3).toFixed(1)} KB, other ` +
           `${(perFrame / 1e3).toFixed(2)} KB, cuts ${sceneCuts}; keyframes counted ${fixed}, encode layout ` +
           `${planChunks(line, encodeWith, profile.decodeShare).length} chunks for ${times.length} frames`)
       // Short windows see less of the lookahead's bit redistribution and ran 3-11% low against full encodes.
-      return ESTIMATE_BIAS * (perKey * keyframes + perFrame * Math.max(0, times.length - keyframes))
+      const counted = ESTIMATE_BIAS * bytes(keyframes)
+      // Priced for the encode's layout: not where the encode keeps windows as chunks (`fixed` is that layout's count).
+      const short = fixed === fixedKeyframes && layoutKeyframes < fixed
+        ? ESTIMATE_BIAS * bytes(keyframes - SHORT_KEYFRAME_SHARE * (fixed - layoutKeyframes))
+        : undefined
+      return { counted, short }
     }
     const mean = (scores: number[]) => {
       const valid = scores.filter((v) => v >= 0)
@@ -1673,10 +1705,12 @@ export async function plan(probe: Probe, settings: Settings, signal: AbortSignal
       const tests = windows.map((_, i) => encoded[base + c * windows.length + i])
       tested.set(crf, tests)
       const some = tests.filter((_, i) => subset.includes(i))
+      const { counted, short } = estimate(tests)
       const point: PlanPoint = {
         crf,
-        bytes: estimate(tests),
-        subset: measure && !picked ? { bytes: estimate(some) } : undefined,
+        bytes: counted,
+        encodeBytes: short,
+        subset: measure && !picked ? { bytes: estimate(some).counted } : undefined,
       }
       if (scored && score)
         scoring.push(Promise.all(tests.map((t) => pool.score(t.index))).then((all) => {
@@ -1741,7 +1775,10 @@ export async function plan(probe: Probe, settings: Settings, signal: AbortSignal
     // H.264 fitting at the rate factor it starts from: those test windows are that encode's output already.
     const same = profile === X264 && options === full && !planned.bound && tested.has(planned.crf)
     const reuse = same ? windows.map((w, i) => ({ ...w, chunk: tested.get(planned.crf)![i] })) : undefined
-    return { ...planned, reuse, scored: scoring.length ? Promise.all(scoring).then(() => undefined) : undefined }
+    const encode = points.some((p) => p.encodeBytes !== undefined)
+      ? fit(probe, settings, points.map((p) => ({ ...p, bytes: p.encodeBytes ?? p.bytes })))
+      : undefined
+    return { ...planned, encode, reuse, scored: scoring.length ? Promise.all(scoring).then(() => undefined) : undefined }
   } finally {
     // The workers are still scoring when the sizes are in; they stop once the scores are, or on cancel.
     const done = () => {
@@ -1885,7 +1922,7 @@ export async function planAvc(probe: Probe, settings: Settings, signal: AbortSig
           // Past the rate factor a quick start takes, AV1's test runs once H.264's windows are scored (testsAv1) unless
           // they score high: start it on H.264's sizes now instead, as settle would. This round's rate factor is the
           // plan's last (a third round needs a steeper curve or a rate factor further out), so the test is the same.
-          if (first.crf > AUTO_QUICK_CRF) {
+          if (first.crf > AUTO_QUICK_CRF && (first.slope ?? 0) <= AUTO_EARLY_SLOPE) {
             console.info(`[pare] auto ${at()}: AV1's test starts with H.264's sizes (crf ${first.crf})`)
             early = testAv1(probe, settings, first, stop.signal)
           }

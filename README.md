@@ -107,7 +107,7 @@ with native libvmaf over every frame. Around 93 to 95, a re-encode stops looking
 | --- | --- | --- | --- | --- |
 | Camera footage, 1080p30, 10 s | 77.9 MB | 23.9 MB (−69%) | 11 s | 97.8 (95.6) |
 | Screen recording, 1080p30, 8 s | 10.8 MB | 3.5 MB (−68%) | 9 s | 99.0 (95.6) |
-| Big Buck Bunny, 1080p30, 10 s | 30.7 MB | 13.4 MB (−56%) | 24 s | 93.1 (88.9) |
+| Big Buck Bunny, 1080p30, 10 s | 30.7 MB | 14.3 MB (−53%) | 24 s | 93.3 (89.5) |
 | Phone clips, 1080p50, 20 s | 65.5 MB | 30.2 MB (−54%) | 42 s | 87.9 (71.9) |
 | Phone clips, 1080p50, 2 min | 392 MB | 189 MB (−52%) | 3 min 17 s | 88.5 (67.1) |
 

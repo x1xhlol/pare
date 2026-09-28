@@ -305,8 +305,13 @@ export default function App() {
     const onRound = (round: number) => {
       if (currentKey.current === key) setTuning({ key, round })
     }
-    const fromPlan = ({ size, crf, raised, fitted, slope, points, reuse, fast, long }: SizePlan): Calibration =>
-      ({ bitrate: 0, size, ssim: 0, target: 0, reached: true, crf, raised, fitted, slope, points, reuse, fast, long })
+    // The encode aims with the sizes priced for its own layout, where the plan has them (x264.ts, SHORT_KEYFRAME_SHARE);
+    // Auto decided on the counted ones.
+    const fromPlan = (chosen: SizePlan): Calibration => {
+      const { size, crf, raised, fitted, slope, points } = chosen.encode ?? chosen
+      const { reuse, fast, long } = chosen
+      return { bitrate: 0, size, ssim: 0, target: 0, reached: true, crf, raised, fitted, slope, points, reuse, fast, long }
+    }
     // A size target out of reach at the source's resolution even at the highest rate factor plans again smaller, down
     // to 360p, rather than encode a file that misses it. Only from Original: a resolution picked by hand stays.
     const shrink = async <T,>(m: X264Module, result: T, of: (r: T) => [SizePlan, 'avc' | 'av1'],

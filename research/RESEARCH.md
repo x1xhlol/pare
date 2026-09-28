@@ -1282,6 +1282,61 @@ The player's clock differs by browser for a file whose timestamps don't start at
 timestamps, Firefox from 0. Start here and End here read where a seek to 0 lands before using the player's time, and
 take the frame on screen from `requestVideoFrameCallback` when it agrees with the playhead.
 
+## Short videos land closer to their size
+
+An evaluation against other tools (`research/BENCHMARKS.md`) found Fit under results landing 5-28% under the size chosen.
+Logging each first pass against the plan's estimate at its rate factor showed why, on H.264 at least: across 23 runs of
+7 clips (half, 40% and 30% of each, and the screen recording under 2 and 2.7 MB) the estimate came in a median 11%
+over the first pass, 35% on the screen recording. The plan prices keyframes for 8 chunks plus one per 250 frames, but
+a video of 240-479 frames encodes as 4 chunks (fewer, longer chunks are faster there), and a test window's keyframe
+overstates what a dropped one saves: pricing the 4 chunks outright made Big Buck Bunny's estimate 12% smaller where
+the file was 3% smaller. On the screen recording, though, a keyframe costs 20 frames and the saving is real.
+
+The size the encode aims with now prices each keyframe its layout drops at 35% of what a keyframe costs over another
+frame (fitted: the mean overestimate fell from 13.7% to 7.7%, and no estimate came in more than 1% under the first
+pass). Scaling further, to a 5.2% mean, sent town under 30% of its size 1.7% over the limit in the browser: there a
+rate factor 0.4 lower made 20% more, and the second pass that fixed it cost 0.09 VMAF NEG. Auto still decides on the
+counted estimate, so its picks don't move. With first passes closer, one that lands far short means the curve was off,
+and x264's second pass is quick, so x264 now encodes again under 85% of the goal (AV1 stays at 75%). Against the build
+before, H.264 forced, each run scored over every frame with native libvmaf (target used, VMAF NEG):
+
+| Clip, target | Target used | VMAF NEG |
+| --- | --- | --- |
+| Big Buck Bunny, half | 87% → 93% | 93.05 → 93.30 |
+| Big Buck Bunny, 40% | 86% → 93% | 92.02 → 92.38 |
+| Big Buck Bunny, 30% | 85% → 93% | 90.49 → 91.01 |
+| town, half | 85% → 89% | 90.96 → 91.08 |
+| town, 40% | 76% → 85% | 90.27 → 90.47 |
+| town, 30% | 85% → 97% | 89.83 → 90.14 |
+| tree, half | 77% → 84% | 88.78 → 89.02 |
+| tree, 40% | 77% → 83% | 87.91 → 88.18 |
+| tree, 30% | 84% → 92% | 86.97 → 87.45 |
+| park, half | 89% → 92% | 78.17 → 78.90 |
+| park, 40% | 93% → 94% | 66.63 → 66.84 |
+| park, 30% | 91% → 94% | 61.51 → 62.05 |
+| ducks, half | 86% → 87% | 62.92 → 63.45 |
+| ducks, 40% | 89% → 90% | 60.91 → 61.19 |
+| ducks, 30% | 88% → 89% | 54.89 → 55.18 |
+| noisy, half | 85% → 89% | 80.58 → 80.83 |
+| noisy, 40% | 100% → 94% | 80.24 → 79.77 |
+| noisy, 30% | 94% → 96% | 78.57 → 78.65 |
+| Screen recording, half | 65% → 65% | 98.96 → 98.96 |
+| Screen recording, 40% | 81% → 81% | 98.96 → 98.96 |
+| Screen recording, 30% | 75% → 83% | 98.95 → 99.00 |
+| Screen recording, 2 MB | 90% → 94% | 98.73 → 98.77 |
+| Screen recording, 2.7 MB | 72% → 81% | 98.79 → 98.89 |
+
+Nothing went over its target and Auto chose the same format on all 11 Auto runs (Big Buck Bunny at half: 93.05 → 93.30,
+14.31 MB instead of 13.42). The one loss, noisy under 40%, is a second pass landing at 94% of the limit where the old
+build's landed at 99.6%, both after first passes far under: its curve bends past the plan's tests (11.7 MB at rate
+factor 25, 1.9 MB at 30). With H.264 not forced, noisy footage goes to AV1.
+
+Also from the logs: past rate factor 25 on a curve steeper than -0.1, AV1's quality test now starts on H.264's
+first-round sizes instead of after H.264's windows are scored (the round's rate factor is final there). Big Buck Bunny
+under 5 MB went to the same AV1 file, video stream identical in three runs each, in 45.0 s instead of 49.6 s. On a
+gentler curve H.264 usually wins, and starting the test only competed with its scoring (the screen recording under
+1.6 MB took 0.6 and 7.9 s longer), so the gentle case waits as before.
+
 ## End to end in the browser
 
 Same headless Chrome, same files, production builds:

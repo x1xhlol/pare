@@ -6,6 +6,6 @@ export const BENCHMARK_SETUP =
 export const BENCHMARKS: { name: string; detail: string; before: number; after: number; seconds: number; ssim: number }[] = [
   { name: 'Camera footage', detail: '1080p30, 10 s, H.264 at 62 Mbps', before: 77_919_498, after: 23_886_802, seconds: 11, ssim: 0.9944 },
   { name: 'Phone clips', detail: '1080p50, 20 s, H.264 at 26 Mbps', before: 65_458_226, after: 30_229_761, seconds: 42, ssim: 0.9505 },
-  { name: 'Animation', detail: 'Big Buck Bunny, 1080p30, 10 s', before: 30_704_510, after: 13_416_804, seconds: 24, ssim: 0.9825 },
+  { name: 'Animation', detail: 'Big Buck Bunny, 1080p30, 10 s', before: 30_704_510, after: 14_306_256, seconds: 24, ssim: 0.9834 },
   { name: 'Screen recording', detail: '1080p30, 8 s, scrolling text', before: 10_814_518, after: 3_493_238, seconds: 9, ssim: 0.9995 },
 ]
