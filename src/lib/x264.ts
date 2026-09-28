@@ -1965,8 +1965,17 @@ async function planAv1(probe: Probe, settings: Settings, avc: SizePlan, signal: 
   const low = Math.round(Math.min(maxCrf(AV1, settings) - AV1_BRACKET * 2, Math.max(AV1.ceiling, edge ? guess : guess - AV1_BRACKET)))
   const av1 = { ...settings, codec: 'av1' as const }
   const tested = await plan(probe, av1, signal, false, AV1_TEST_WINDOWS, [low, low + AV1_BRACKET * 2])
-  return fit(probe, av1, tested.points!.map((p) => ({ ...p, bytes: p.bytes * subsetScale(avc) })))
+  const scale = subsetScale(avc) / PRESET10_BIAS
+  return fit(probe, av1, tested.points!.map((p) => ({ ...p, bytes: p.bytes * scale })))
 }
+
+/**
+ * Preset 10's windows come out a little bigger than the preset-8 encode's (1-6%, "Planning AV1"): this path's first
+ * passes landed at 83-101% of the plan (median 90%, town, tree, park, ducks and town under 3 MB), where AV1's tested
+ * path, at preset 8, landed at 101%. Kept small, since an AV1 first pass over the limit costs a second one: park's
+ * 101% becomes 104% of the plan's aim, 97.5% of the limit.
+ */
+const PRESET10_BIAS = 1.03
 
 /** How much bigger the whole video is than AV1's two test windows suggest, going by H.264's test of all four. */
 function subsetScale(avc: SizePlan) {

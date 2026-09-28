@@ -1331,6 +1331,12 @@ Nothing went over its target and Auto chose the same format on all 11 Auto runs 
 build's landed at 99.6%, both after first passes far under: its curve bends past the plan's tests (11.7 MB at rate
 factor 25, 1.9 MB at 30). With H.264 not forced, noisy footage goes to AV1.
 
+AV1's size plan when Auto has already chosen it runs at preset 10, a little bigger than the preset-8 encode: those
+first passes landed at 83-101% of the plan (median 90%), where the tested path's preset-8 plan landed at 101%. Dividing
+its sizes by 1.03 took town from 94.06 to 94.19 VMAF NEG at half, tree 92.24 → 92.32, park 84.35 → 84.70, ducks
+71.06 → 71.49 and town under 3 MB 90.11 → 90.26, none over its target (park, the closest, at 96.7%) and none needing a
+second pass. It stays small because an AV1 first pass over the limit costs a whole second one.
+
 Also from the logs: past rate factor 25 on a curve steeper than -0.1, AV1's quality test now starts on H.264's
 first-round sizes instead of after H.264's windows are scored (the round's rate factor is final there). Big Buck Bunny
 under 5 MB went to the same AV1 file, video stream identical in three runs each, in 45.0 s instead of 49.6 s. On a
